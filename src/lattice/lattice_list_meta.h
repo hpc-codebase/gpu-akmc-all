@@ -6,7 +6,7 @@
 #define MISA_KMC_LATTICE_LIST_META_H
 
 #include <type_define.h>
-
+#include <iostream>
 /**
  * \brief meta data of lattice list in current process,
  * which is a part of domain
@@ -101,6 +101,7 @@ public:
    * simulation area and ghost area.
    */
   inline _type_lattice_id getLId(_type_lattice_coord x, _type_lattice_coord y, _type_lattice_coord z) const {
+    // if(x == 4 && y == 71 && z == 21) std::cout << " real_id is : " << x + size_x * (y + z * size_y) << std::endl;
     return x + size_x * (y + z * size_y);
   }
 
@@ -109,10 +110,13 @@ public:
    */
   inline void getCoordByLId(_type_lattice_id lid, _type_lattice_coord *x, _type_lattice_coord *y,
                             _type_lattice_coord *z) const {
+    _type_lattice_id lid2 = lid;
     *x = lid % size_x;
     lid = lid / size_x;
     *y = lid % size_y;
     *z = lid / size_y;
+    // if(lid2 == 208884 || lid2 == 243544) std::cout << " x is : " << *x << " y is : " << *y << " z is : " << *z << " real_id is : " << *x + size_x * (*y + *z * size_y) << std::endl;
+    // if(lid2 == 208884 || lid2 == 243544) std::cout << " size_x is : " << size_x << " size_y is : " << size_y << std::endl;
   }
 
   /**
@@ -120,12 +124,25 @@ public:
    * \return return true if it is a ghost lattice, false for otherwise.
    */
   inline bool isGhostLat(_type_lattice_id lid) const {
+    // ghost_x = 4, ghost_y = 2, ghost_z = 2
+    // box_x = (2 * 当前进程在x维度分到的 sub_box 的大小 ), box_y = (当前进程在y维度分到的 sub_box 的大小 ), box_z = (当前进程在z维度分到的 sub_box 的大小 )
     _type_lattice_coord x = 0, y = 0, z = 0;
     getCoordByLId(lid, &x, &y, &z);
     x -= ghost_x;
     y -= ghost_y;
     z -= ghost_z;
     return x < 0 || y < 0 || z < 0 || x >= box_x || y >= box_y || z >= box_z;
+  }
+
+  inline bool isSurfaceLat(_type_lattice_id lid) const {
+    // ghost_x = 4, ghost_y = 2, ghost_z = 2
+    // box_x = (2 * 当前进程在x维度分到的 sub_box 的大小 ), box_y = (当前进程在y维度分到的 sub_box 的大小 ), box_z = (当前进程在z维度分到的 sub_box 的大小 )
+    _type_lattice_coord x = 0, y = 0, z = 0;
+    getCoordByLId(lid, &x, &y, &z);
+    x -= ghost_x;
+    y -= ghost_y;
+    z -= ghost_z;
+    return (0 <= x && x < ghost_x) ||(0 <= y && y < ghost_y) || (0 <= z && z < ghost_z) || (x >= (box_x - ghost_x) && x < box_x) || (y >= (box_y - ghost_y) && y < box_y) || (z >= (box_z - ghost_z) && z < box_z);
   }
 
   /**

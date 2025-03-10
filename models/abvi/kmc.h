@@ -5,16 +5,30 @@
 #ifndef MISA_KMC_KMC_H
 #define MISA_KMC_KMC_H
 
+#include <vector>
+#include <array>
+#include "lattice/lattice.h"
 #include "box.h"
 #include "event.h"
 #include "plugin/event_listener.h"
 #include "type_define.h"
 #include <models/model_adapter.h>
+#include <comm/domain/colored_domain.h>
+#include <unordered_map>
+#include "abvi/defect/vac_hash.h"
+#include <comm/preset/sector_forwarding_region.h>
+#include "utils/simulation_domain.h"
+#include <comm/comm.hpp>
+#include <cmath>
 
+// #include "../../src/algorithms/sl/sublattice.h"
+
+// #include "../gpu/gpu_simulate.h"
 /*!
  * \brief the model routine of KMC simulation, including rate calculation, event selecting
  * and execution implementation.
  */
+
 class ABVIModel : public ModelAdapter<event::SelectedEvent> {
 
 public:
@@ -39,13 +53,16 @@ public:
    */
   _type_rate calcRates(const lat_region region) override; // todo
 
-  /**
-   * \brief select an event randomly from rates list in a given region.
+  _type_rate calcRatesGPU(const lat_region region, int sect) override;
+  // _type_rate calcRatesGPU(const lat_region region, bool *sector_first) override; // todo
+
+  /*
+   * \brief select an event randomly from rates list in a given region.  从给定区域的机率列表中随机选择一个事件。
    *
-   * \param excepted_rate which equals to total rate* random number between 0-1.
-   * \param total_rates the sum rates
-   * \note the x lattice size is not doubled in \param region parameter
-   * \return the selected event.
+   * \param excepted_rate which equals to total rate* random number between 0-1. 等于总机率*0-1之间的随机数。
+   * \param total_rates the sum rates 机率之和
+   * \note the x lattice size is not doubled in \param region parameter \param region参数中的x晶格大小没有加倍
+   * \return the selected event.  返回所选事件。
    */
   event::SelectedEvent select(const lat_region region, const _type_rate excepted_rate,
                               const _type_rate sum_rates) override;
@@ -54,7 +71,13 @@ public:
    * \brief perform the selected KMC event.
    *
    */
-  void perform(const event::SelectedEvent event) override;
+  void perform(const event::SelectedEvent event, const lat_region region, int rank, _type_lattice_count step, int sect, const unsigned int sector_id, const unsigned int next_sector_id) override;
+
+  void selectAndPerformOnGPU(const _type_rate rate, int rank, _type_lattice_count step, int sect, const unsigned int sector_id, const unsigned int next_sector_id) override;
+
+  void recb_checki(const lat_region region, const unsigned int sector_id) override;
+
+  void recb_solver(_type_lattice_id id, const lat_region& region, const unsigned int& sector_id) override;
 
   void reindex(const lat_region region) override;
 
@@ -64,23 +87,33 @@ public:
    */
   void setEventListener(EventListener *p_listener);
 
+  void setColoredDomain(comm::ColoredDomain *_p_domain);
+
+  void addExchange_ghost(const _type_lattice_id& latticeId, const unsigned int sector_id);
+
+  void addExchange_surface(_type_lattice_id surface_id);
+
+  void clear_exchange_ghost() override;
+
+  void clear_exchange_surface(const unsigned int  next_sect) override;
+
   unsigned long defectSize() override;
 
+  void set_ghost_region() override;
+  
 protected:
   double time = 0;
 
-private:
+public:
   Box *box = nullptr; // todo init box pointer
-
   /**
    * \brief attempt frequency.
    */
   const double v;
-
   /**
    * \brief temperature
    */
-  const double T;
+  const double T; 
 
   /**
    * \brief pointer to event listener.
@@ -93,6 +126,10 @@ private:
    * \return
    */
   _type_rate defectGenRate();
+
+  // const comm::ColoredDomain *p_domain = nullptr;
+
+
 };
 
 #endif // MISA_KMC_KMC_H
