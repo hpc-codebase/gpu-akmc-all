@@ -14,13 +14,9 @@
 #include <logs/logs.h>
 #include "../gpu/gpu_simulate.h"
 #include "utils/simulation_domain.h"
-#include "../../gpu/DeviceVacRatesSolver.h"
 #include <map>
-#include <unordered_map>
 #include <vector>
 #include <algorithm>
-#include "../../profiles/config/lattice_types_string.h"
-
 ABVIModel::ABVIModel(Box *box, double v, double T) : box(box), v(v), T(T) {}
 
 // 这个函数的主要作用是计算指定仿真区域内的某种类型的迁移速率（transition rates）。
@@ -60,7 +56,7 @@ _type_rate ABVIModel::calcRates(const comm::Region<comm::_type_lattice_size> reg
         // for (int i = 0; i < 8; i++) {
         //   kiwi::logs::v(" ", " nn_index is : {} nn_id is : {} nn_type is : {} . \n", i, lat_list[i].id, lat_list[i].type._type);
         // }
-        _type_neighbour_status nei_status = box->lattice_list->get1nnStatus(x, y, z);//获取空位状态
+        _type_neighbour_status nei_status = box->lattice_list->get1nnStatus(x, y, z);
         vacancyhash.beforeRatesUpdate2(lat_list, nei_status);
         Lattice source_latti;
         source_latti.id = latti_id;
@@ -79,7 +75,7 @@ _type_rate ABVIModel::calcRates(const comm::Region<comm::_type_lattice_size> reg
       }
     }
   }
-  sum_rates += defectGenRate();//0
+  sum_rates += defectGenRate();
   return sum_rates;
 }
 
@@ -258,9 +254,7 @@ void ABVIModel::perform(const event::SelectedEvent selected, const lat_region re
 
 void ABVIModel::recb_checki(const lat_region region, const unsigned int sector_id) {
   // kiwi::logs::v(" ", " Before {} , momo_count : {} , more_count : {}, rere_count : {}.\n", sector_id, box->lattice_list->momo_hash.size(), box->lattice_list->more_hash.size(), box->lattice_list->rere_hash.size());
-  // kiwi::logs::v(" ", "start MoRe GPU Version");
-  std::vector<int> arr;
-  int arr_index = 0;
+  std::vector<long int> arr;
 
   for (const auto& it : box->lattice_list->momo_hash) {
     _type_lattice_size x = it % box->lattice_list->meta.size_x;
@@ -288,428 +282,105 @@ void ABVIModel::recb_checki(const lat_region region, const unsigned int sector_i
       arr.emplace_back(it);
     }
   }
-  /*
-    本部分用于图着色
-   */
-  int n = arr.size();
-  // std::vector<int> colors(n , -1);//colors 用于保存目前的着色情况
-  std::unordered_map<_type_lattice_id, int> color_hash;
-  for(int i=0;i<n;i++){
-    color_hash[arr[i]] = -1;
+    // std::cout<<"orgion more size "<<box->lattice_list->more_hash.size()<<std::endl;
+    // std::cout<<"orgion momo size "<<box->lattice_list->momo_hash.size()<<std::endl;
+    if(arr.size()!=0)
+      recb_solver(arr, region, sector_id);
+ 
   }
 
-  for(int i = 0;i < n; i++){
-      // if(colors[i] == -1)
-      //   colors[i] = 0;//如果未着色则着色为0
-      _type_lattice_size x = arr[i] % box->lattice_list->meta.size_x;
-      _type_lattice_size y = (arr[i] / box->lattice_list->meta.size_x) % box->lattice_list->meta.size_y;
-      _type_lattice_size z = arr[i] / (box->lattice_list->meta.size_x * box->lattice_list->meta.size_y);
+void ABVIModel::recb_solver(std::vector<_type_lattice_id>id, const lat_region& region, const unsigned int& sector_id) {
+    dev_meta h_meta;
+    long int *h_MoRe_Hash;
+    long int *h_MoMo_Hash;
+    long int *h_Re_Hash;
+    long int *h_V_Hash;
+    // HIPHashSet *Busy_Set;
+    long int *h_ghost_Hash;
+    long int *h_surface_Hash;
+    int sizes[6];
+    recb_solver_GPU(id,
+                  region.x_low,region.x_high,region.y_low,region.y_high,
+                  region.z_low,region.z_high,
+                  sector_id,
+                  h_MoRe_Hash,h_MoMo_Hash,
+                  h_Re_Hash,h_V_Hash,
+                  h_ghost_Hash,h_surface_Hash,
+                  sizes
+                );
 
-      Lattice nn_list1[LatticesList::MAX_1NN];//当前遍历的list的1nn近邻
-      Lattice nn_list2[LatticesList::MAX_2NN];//当前遍历的list的2nn近邻
-      Lattice nn_list[LatticesList::MAX_1NN + LatticesList::MAX_2NN ];
-
-
-      std::vector<bool> avail_colors(LatticesList::MAX_1NN + LatticesList::MAX_2NN,true);//当前着色区域内的可用颜色
-      // avail_colors[color_hash[arr[i]]] = false; //将目前颜色设置为否
-
-
-      box->lattice_list->get1nn2(x, y, z, nn_list1);//TODO:不知道这个函数是用于1nn近邻还是2nn
-      box->lattice_list->get2nn2(x, y, z, nn_list2);
-      //将两个数组拼接
-      for (int i=0;i<LatticesList::MAX_1NN;i++)
-        nn_list[i] = nn_list1[i];
-      for (int i=0;i<LatticesList::MAX_2NN;i++)
-        nn_list[i + LatticesList::MAX_1NN] = nn_list2[i];
-
-
-      // for(int k =0;k<LatticesList::MAX_1NN + LatticesList::MAX_2NN; k++){
-      //     kiwi::logs::v(" ","1color {} -- {}\n",k,avail_colors[k]);
-      // }
-      if(color_hash[arr[i]] != -1){
-        avail_colors[color_hash[arr[i]]] = false;
+    int nummomo=0;
+    int nummore=0;
+    box->lattice_list->more_hash.clear();
+    for(int i = 0;i<sizes[0];i++){
+      if(h_MoRe_Hash[i] != -1 && h_MoRe_Hash[i] != -2){
+        nummore++;
+        box->lattice_list->more_hash.emplace(h_MoRe_Hash[i]);
+        // std::cout<<h_MoRe_Hash[i]<<"\t";
+        // std::cout<<"more value "<<h_MoRe_Hash[i]<<std::endl;
       }
-      // for(int k =0;k<LatticesList::MAX_1NN + LatticesList::MAX_2NN; k++){
-      //     kiwi::logs::v(" ","2color {} -- {}\n",k,avail_colors[k]);
-      // }
-        for (const auto& lati : nn_list) {//遍历1nn和2nn列表，看arr[j]是否在arr[i]的2nn近邻以内
-          if(color_hash.find(lati.getId()) != color_hash.end()){//证明此位置是一个元素
-            // kiwi::logs::v(" ","atom {}----- atom{}\n",arr[i],lati.getId());
-            if(color_hash[lati.getId()] != -1){//已经被上过色
-              avail_colors[color_hash[lati.getId()]] = false;//则此颜色不可用
-            }
-          }
-        }
-      // for(int k =0;k<LatticesList::MAX_1NN + LatticesList::MAX_2NN; k++){
-      //     kiwi::logs::v(" ","3color {} -- {}\n",k,avail_colors[k]);
-      // }
-      if(color_hash[arr[i]] == -1){
-        for(int k =0; k < LatticesList::MAX_1NN + LatticesList::MAX_2NN; k++){//遍历可用色列表
-            if(avail_colors[k] == true){
-              color_hash[arr[i]] = k;
-              avail_colors[k] = false;
-              break;
-            }
-        }
+    }
+    // std::cout<<std::endl;
+    if(box->lattice_list->more_hash.size()!= nummore)
+    std::cout<<"confilct occured!\n";
+    // std::cout<<"more  size "<<box->lattice_list->more_hash.size()<<" "<<nummore<<std::endl;
+
+    box->lattice_list->momo_hash.clear();
+    for(int i = 0;i<sizes[1];i++){
+      if(h_MoMo_Hash[i] != -1 && h_MoMo_Hash[i] != -2){
+        nummomo++;
+        box->lattice_list->momo_hash.emplace(h_MoMo_Hash[i]);
+        // std::cout<<h_MoMo_Hash[i]<<"\t";
       }
-      // for(int k =0;k<LatticesList::MAX_1NN + LatticesList::MAX_2NN; k++){
-      //     kiwi::logs::v(" ","4color {} -- {}\n",k,avail_colors[k]);
-      // }
-      for (const auto& lati : nn_list){
-        if(color_hash.find(lati.getId()) != color_hash.end()){//证明此位置是一个元素
-          if(color_hash[lati.getId()] == -1){
-              for(int k =0; k < LatticesList::MAX_1NN + LatticesList::MAX_2NN; k++){//遍历可用色列表
-                if(avail_colors[k] == true){
-                  color_hash[lati.getId()] = k;
-                  avail_colors[k] = false;
-                  break;
-              }
-            }
-          }
-        }
-      }
-      // for(int k =0;k<LatticesList::MAX_1NN + LatticesList::MAX_2NN; k++){
-      //     kiwi::logs::v(" ","5color {} -- {}\n",k,avail_colors[k]);
-      // }
+      // if(!box->lattice_list->more_hash.count(h_MoRe_Hash[i]))
         
-  }
+    }
+    // std::cout<<std::endl;
+    if(box->lattice_list->momo_hash.size()!= nummomo)
+    std::cout<<"confilct occured!\n";
+    // std::cout<<"momo  size "<<box->lattice_list->momo_hash.size()<<" "<<nummomo<<std::endl;
 
-  for(int i = 0;i<LatticesList::MAX_1NN + LatticesList::MAX_2NN;i++){//遍历各个颜色的数组
-    std::vector<_type_lattice_id> color_arr;
-    std::vector<int> color_arr_id;//用于存放当前颜色的id的列表
-    std::vector<Lattice> nn_lists1;//用于存放每个原子的1nn和2nn近邻的信息
-    std::vector<Lattice> nn_lists2;//用于存放每个原子的1nn和2nn近邻的信息
-    for(int j = 0; j < arr.size();j++){
-      if(color_hash[arr[j]] == i){
-      _type_lattice_size x = arr[j] % box->lattice_list->meta.size_x;
-      _type_lattice_size y = (arr[j] / box->lattice_list->meta.size_x) % box->lattice_list->meta.size_y;
-      _type_lattice_size z = arr[j] / (box->lattice_list->meta.size_x * box->lattice_list->meta.size_y);
+    box->lattice_list->re_hash.clear();
+    for(int i = 0;i<sizes[2];i++){
+      if(h_Re_Hash[i] != -1 && h_Re_Hash[i] != -2)
+      // if(!box->lattice_list->more_hash.count(h_MoRe_Hash[i]))
+        box->lattice_list->re_hash.emplace(h_Re_Hash[i]);
+    }
 
-      Lattice nn_list1[LatticesList::MAX_1NN];//当前遍历的list的1nn近邻
-      Lattice nn_list2[LatticesList::MAX_2NN];//当前遍历的list的2nn近邻
+    // std::unordered_map<_type_lattice_id, VacancyHash> vac_hash;
 
-      box->lattice_list->get1nn2(x, y, z, nn_list1);//TODO:不知道这个函数是用于1nn近邻还是2nn
-      box->lattice_list->get2nn2(x, y, z, nn_list2);
-
-
-    //   kiwi::logs::v(" ","---------------------------------------------\n");
-      for(auto _1nn_atom:nn_list1){
-        nn_lists1.push_back(_1nn_atom);
-        // kiwi::logs::v(" ","{}-{}\n",_1nn_atom.id,_1nn_atom.type._type);
-      }
-        
-      for(auto _2nn_atom:nn_list2){
-        nn_lists1.push_back(_2nn_atom);
-        // kiwi::logs::v(" ","{}-{}\n",_2nn_atom.id,_2nn_atom.type._type);
-      }
-
-    //   nn_lists1 = nn_lists1 + nn_lists2;
-    //   kiwi::logs::v(" ","---------------------------------------------\n");
-        
-
-    // for(_type_lattice_count j =0; j < LatticesList::MAX_1NN; j++){
-    //   kiwi::logs::v(" ","{}-{}\n",atoms[i].atom1nn[j],atoms[i].atom1nn_type[j]);
+    // auto& old_key =  box->lattice_list->vac_hash.begin()->first;   // 原键的引用
+    // VacancyHash value = std::move( box->lattice_list->vac_hash.begin()->second); // 移动语义转移值
+    // _type_lattice_id new_key;
+    // for(int i = 0;i<sizes[3];i++){
+    //   if(h_V_Hash[i] != -1 && h_V_Hash[i] != -2){
+    //       new_key = h_V_Hash[i];
+    //       break;
+    //   }
     // }
-    // for(_type_lattice_count j =0; j < LatticesList::MAX_2NN; j++){
-    //   kiwi::logs::v(" ","{}-{}\n",atoms[i].atom2nn[j],atoms[i].atom2nn_type[j]);
-    // }
+    // box->lattice_list->vac_hash.erase(box->lattice_list->vac_hash.begin());          // 删除旧键
+    // box->lattice_list->vac_hash.emplace(new_key, std::move(value)); // 插入新键值对
 
-      
-
-        color_arr.push_back(arr[j]);//将第i种颜色放入数组中
-                                    //arr中存放的是每个color的hash值
-        // color_arr_id.push_back(arr[j].first);    
-      }
-          
+    for(int i = 0;i<sizes[4];i++){
+      if(h_ghost_Hash[i] != -1 && h_ghost_Hash[i] != -2)
+      // if(!box->lattice_list->more_hash.count(h_MoRe_Hash[i]))
+        addExchange_ghost((long int)h_ghost_Hash[i],sector_id);
     }
-    // kiwi::logs::v(" ","current color is {}:",i);
-    // for(auto atom:color_arr)
-    //   kiwi::logs::v(" ","{},",atom);
-    // kiwi::logs::v(" ","\n");
-    std::vector<_type_lattice_size>x_array;
-    std::vector<_type_lattice_size>y_array;
-    std::vector<_type_lattice_size>z_array;
-    std::vector< LatticeTypes::lat_type> centerTypes;
-    for(auto id:color_arr){
-        _type_lattice_size x = id % box->lattice_list->meta.size_x;
-        x_array.push_back(x);
-        _type_lattice_size y = (id / box->lattice_list->meta.size_x) % box->lattice_list->meta.size_y;
-        y_array.push_back(y);
-        _type_lattice_size z = id / (box->lattice_list->meta.size_x * box->lattice_list->meta.size_y);
-        z_array.push_back(z);
-        LatticeTypes::lat_type cur_type = box->lattice_list->getType(id);
-        centerTypes.push_back(cur_type);
-        // kiwi::logs::v(" ","cur_type:{}\n",cur_type);
-
-
-    }
-    // kiwi::logs::v(" ","current color is {}: size is {}\n",i,color_arr.size());
-    if(color_arr.size() > 0){
-      dev_atom *atoms = recb_solver_GPU(color_arr,centerTypes,color_arr.size(),nn_lists1,nn_lists2,sector_id,x_array,y_array,z_array);//TODO:设计输入参数和GPU内容
-      std::vector<int> res;
-      for(int i =0;i<color_arr.size();i++){
-         auto it = std::find(res.begin(), res.end(), atoms[i].exchange_id);
-         if(it!= res.end())
-          kiwi::logs::v(" ","conflict occured {}\n",atoms[i].exchange_id);
-         else
-          res.push_back(atoms[i].exchange_id);
-      }
-        
-      
-      // for(int k = 0;k<color_arr.size();k++){
-      //   if(atoms[k].exchange == 1)
-      //     kiwi::logs::v(" ","atom type is {},exchange type:{}\n",atoms[k].atom_id,atoms[k].exchange,atoms[k].exchange_id);
-      // }
-      for (int i = 0;i<color_arr.size();i++){
-        // kiwi::logs::v(" ","id------:{} - {}\n",atoms[i].atom_id, lat::LatTypesString(box->lattice_list->getType(atoms[i].atom_id)));
-        // kiwi::logs::v(" ","exchange:{} - {}\n",atoms[i].exchange_id, lat::LatTypesString(box->lattice_list->getType(atoms[i].exchange_id)));
-
-          if(atoms[i].exchange == 1 && atoms[i].out_sector == 0){
-            // kiwi::logs::v(" ","exchange occured\n");
-            _type_lattice_size x = atoms[i].exchange_id % box->lattice_list->meta.size_x;
-            _type_lattice_size y = (atoms[i].exchange_id  / box->lattice_list->meta.size_x) % box->lattice_list->meta.size_y;
-            _type_lattice_size z = atoms[i].exchange_id  / (box->lattice_list->meta.size_x * box->lattice_list->meta.size_y);
-            if(atoms[i].exchange_type == LatticeTypes::Mo || atoms[i].exchange_type == LatticeTypes::Re){
-              if(atoms[i].atom_type == LatticeTypes::MoMo){
-                if(atoms[i].exchange_type ==  LatticeTypes::Mo){
-                  box->lattice_list->momo_hash.erase(atoms[i].atom_id);
-                  box->lattice_list->momo_hash.emplace(atoms[i].exchange_id);
-                  // atoms[i].exchange_type = box->lattice_list->getType(atoms[i].exchange_id);
-                  // atoms[i].atom_type = LatticeTypes::Mo;
-                  // kiwi::logs::v(" ","{}-{}-{} ::change_id changed {}->{}-{}\n",atoms[i].atom_id,lat::LatTypesString(atoms[i].atom_type),lat::LatTypesString(box->lattice_list->getType(atoms[i].atom_id))
-                  //               ,atoms[i].exchange_id,lat::LatTypesString(atoms[i].exchange_type),lat::LatTypesString(box->lattice_list->getType(atoms[i].exchange_id)));
-                  
-                } 
-                else if(atoms[i].exchange_type == LatticeTypes::Re){
-                  box->lattice_list->re_hash.erase(atoms[i].exchange_id);
-                  box->lattice_list->momo_hash.erase(atoms[i].atom_id);
-                  auto res = box->lattice_list->more_hash.emplace(atoms[i].exchange_id);
-                  // kiwi::logs::v(" ","{}-{}-{} ::change_id changed {}->{}-{}\n",atoms[i].atom_id,lat::LatTypesString(atoms[i].atom_type),lat::LatTypesString(box->lattice_list->getType(atoms[i].atom_id))
-                  //               ,atoms[i].exchange_id,lat::LatTypesString(atoms[i].exchange_type),lat::LatTypesString(box->lattice_list->getType(atoms[i].exchange_id)));
-
-                  // atoms[i].exchange_type = box->lattice_list->getType(atoms[i].exchange_id);
-                  // atoms[i].atom_type = LatticeTypes::Mo;
-
-                  if (!res.second) {
-                        kiwi::logs::v(" ","key exists\n");
-                    }
-                //   atoms[i].atom_type =  LatticeTypes::MoRe;
-                }
-                if (box->lattice_list->meta.isGhostLat(atoms[i].exchange_id)) {
-                  addExchange_ghost(atoms[i].exchange_id, sector_id);
-                }
-                if (box->lattice_list->meta.isSurfaceLat(atoms[i].exchange_id)) 
-                  addExchange_surface(atoms[i].exchange_id);
-                if (box->lattice_list->meta.isSurfaceLat(atoms[i].atom_id)) 
-                  addExchange_surface(atoms[i].atom_id);
-              }
-              else if(atoms[i].atom_type = LatticeTypes::MoRe){
-                if(atoms[i].numRe == 0){
-                  if (atoms[i].exchange_type == LatticeTypes::Mo) { // 交换位置
-                    // kiwi::logs::v(" ","key  not exixt\n");
-                    // if(box->lattice_list->more_hash.count(atoms[i].atom_id)== 0)
-                    //     kiwi::logs::v(" ","{} :key  not exist\n",atoms[i].atom_id);
-                    box->lattice_list->more_hash.erase(atoms[i].atom_id);
-                    auto res = box->lattice_list->more_hash.emplace(atoms[i].exchange_id);
-                    // kiwi::logs::v(" ","{}-{}-{} ::change_id changed {}->{}-{}\n",atoms[i].atom_id,lat::LatTypesString(atoms[i].atom_type),lat::LatTypesString(box->lattice_list->getType(atoms[i].atom_id))
-                    //             ,atoms[i].exchange_id,lat::LatTypesString(atoms[i].exchange_type),lat::LatTypesString(box->lattice_list->getType(atoms[i].exchange_id)));
-                    // atoms[i].exchange_type = box->lattice_list->getType(atoms[i].exchange_id);
-                    // atoms[i].atom_type = LatticeTypes::Mo;
-                      if (!res.second) {
-                        kiwi::logs::v(" ","{}::{} :key exists - {} - {}\n",atoms[i].atom_id,atoms[i].exchange_id, lat::LatTypesString(box->lattice_list->getType(atoms[i].exchange_id)),lat::LatTypesString(box->lattice_list->getType(atoms[i].exchange_type )));
-                    }
-                  } else { // Re 也是交换位置
-                    box->lattice_list->re_hash.erase(atoms[i].exchange_id);
-                    box->lattice_list->more_hash.erase(atoms[i].atom_id);
-                    box->lattice_list->re_hash.emplace(atoms[i].atom_id);
-                    box->lattice_list->more_hash.emplace(atoms[i].exchange_id);
-                    // kiwi::logs::v(" ","{}-{}-{} ::change_id changed {}->{}-{}\n",atoms[i].atom_id,lat::LatTypesString(atoms[i].atom_type),lat::LatTypesString(box->lattice_list->getType(atoms[i].atom_id))
-                    //             ,atoms[i].exchange_id,lat::LatTypesString(atoms[i].exchange_type),lat::LatTypesString(box->lattice_list->getType(atoms[i].exchange_id)));
-                    // atoms[i].exchange_type = box->lattice_list->getType(atoms[i].exchange_id);
-                    // atoms[i].atom_type = LatticeTypes::Re;
-                  }
-                  if (box->lattice_list->meta.isGhostLat(atoms[i].exchange_id)) {
-                    addExchange_ghost(atoms[i].exchange_id,sector_id);
-                  }
-                  if (box->lattice_list->meta.isSurfaceLat(atoms[i].exchange_id)) 
-                    addExchange_surface(atoms[i].exchange_id);
-                  if (box->lattice_list->meta.isSurfaceLat(atoms[i].atom_id)) 
-                    addExchange_surface(atoms[i].atom_id);
-                }
-                else if(atoms[i].numRe > 0 && atoms[i].numRe < LatticesList::MAX_1NN ){
-                  if(atoms[i].ranmov > (static_cast<double>(atoms[i].numRe) / LatticesList::MAX_1NN)){
-                  if (atoms[i].exchange_type == LatticeTypes::Mo) {  // 交换位置
-                    box->lattice_list->more_hash.erase(atoms[i].atom_id);
-                    box->lattice_list->more_hash.emplace(atoms[i].exchange_id);
-
-                    atoms[i].exchange_type = box->lattice_list->getType(atoms[i].exchange_id);
-                    atoms[i].atom_type = LatticeTypes::Mo;
-                    // kiwi::logs::v(" ","{}-{}-{} ::change_id changed {}->{}-{}\n",atoms[i].atom_id,lat::LatTypesString(atoms[i].atom_type),lat::LatTypesString(box->lattice_list->getType(atoms[i].atom_id))
-                    //             ,atoms[i].exchange_id,lat::LatTypesString(atoms[i].exchange_type),lat::LatTypesString(box->lattice_list->getType(atoms[i].exchange_id)));
-                  } else if(atoms[i].exchange_type == LatticeTypes::Re) { // Re 也是交换位置
-                    box->lattice_list->re_hash.erase(atoms[i].exchange_id);
-                    box->lattice_list->more_hash.erase(atoms[i].atom_id);
-                    box->lattice_list->re_hash.emplace(atoms[i].atom_id);
-                    box->lattice_list->more_hash.emplace(atoms[i].exchange_id);
-
-                    // atoms[i].exchange_type = box->lattice_list->getType(atoms[i].exchange_id);
-                    // atoms[i].atom_type = LatticeTypes::Re;
-                    // kiwi::logs::v(" ","{}-{}-{} ::change_id changed {}->{}-{}\n",atoms[i].atom_id,lat::LatTypesString(atoms[i].atom_type),lat::LatTypesString(box->lattice_list->getType(atoms[i].atom_id))
-                    //             ,atoms[i].exchange_id,lat::LatTypesString(atoms[i].exchange_type),lat::LatTypesString(box->lattice_list->getType(atoms[i].exchange_id)));
-                  }
-                  if (box->lattice_list->meta.isGhostLat(atoms[i].exchange_id)) {
-                    addExchange_ghost(atoms[i].exchange_id, sector_id);
-                  }
-                  if (box->lattice_list->meta.isSurfaceLat(atoms[i].exchange_id)) addExchange_surface(atoms[i].exchange_id);
-                  if (box->lattice_list->meta.isSurfaceLat(atoms[i].atom_id)) addExchange_surface(atoms[i].atom_id);
-              }
-            }
-            // else return;
-          }
-        }
-
-        if(2 * region.x_low <= x && x < 2 * region.x_high && region.y_low <= y && y < region.y_high && region.z_low <= z && z < region.z_high){
-            atoms[i].out_sector = 1;
-            // kiwi::logs::v(" ","id{} - out sector\n",atoms[i].exchange_id);
-        }
-        
-        atoms[i].exchange_type = box->lattice_list->getType(atoms[i].exchange_id);
-        atoms[i].atom_type =  box->lattice_list->getType(atoms[i].atom_id);
-      
-      }
-        //   else continue;
-      }
-    }
-  }
-
-  //图着色结束以后根据着色的结果进行并行化，各组颜色执行完以后为一组，然后重新着色，进行下一次迭代
-  //但是仍然需要注意移出区域后的判断
-  // for (const auto& it : arr) {
-  //   recb_solver(it, region, sector_id);
-  // }
-  //这是之前的非GPU版本的
-
-  // kiwi::logs::v(" ", " After {} , momo_count : {} , more_count : {}, rere_count : {}.\n", sector_id, box->lattice_list->momo_hash.size(), box->lattice_list->more_hash.size(), box->lattice_list->rere_hash.size());
-}
-
-void ABVIModel::recb_solver(_type_lattice_id id, const lat_region& region, const unsigned int& sector_id) {
-  
-  LatticeTypes::lat_type cur_type = box->lattice_list->getType(id); 
-  _type_lattice_size x = id % box->lattice_list->meta.size_x;
-  _type_lattice_size y = (id / box->lattice_list->meta.size_x) % box->lattice_list->meta.size_y;
-  _type_lattice_size z = id / (box->lattice_list->meta.size_x * box->lattice_list->meta.size_y);
-
-  // bool trapped = false;
-  // bool trapped_by_solute = false;
-  int numSIA;
-  int numRe;
-  Lattice nn_list[LatticesList::MAX_1NN];
-  _type_lattice_size temp_x, temp_y, temp_z;
-  Lattice randomLattice;
-
-  //这个while会产生团簇
-  while (2 * region.x_low <= x && x < 2 * region.x_high && region.y_low <= y && y < region.y_high && region.z_low <= z && z < region.z_high) {
-    id = box->lattice_list->getId(x, y, z);
-    assert(cur_type == box->lattice_list->getType(x, y, z));
-
-    numSIA = 0;
-    box->lattice_list->get1nn2(x, y, z, nn_list);
-    for (const auto& lati : nn_list) {
-      if (lati.type._type == LatticeTypes::MoMo || lati.type._type == LatticeTypes::MoRe) numSIA++;
-    }
-    if (numSIA >= 2) return;
-
-    numRe = 0;
-    if (cur_type == LatticeTypes::MoRe) {
-      for (const auto& lati : nn_list) {
-        if (lati.type._type == LatticeTypes::Re) numRe++;
-      }
-      if (numRe >= 5) return;
-    }
-
-    // 2nn 内随机运动
-    int randomNumber = static_cast<int>(rand() * 14);
-    assert(randomNumber >= 0 && randomNumber < 14);
-    box->lattice_list->getRandomLattice(x, y, z, temp_x, temp_y, temp_z, randomNumber);
-
-    // 当前扇区内随机运动
-    // temp_x = static_cast<_type_lattice_size>(rand() * 2 * (region.x_high - regin.x_low) + 2 * region.x_low);
-    // temp_y = static_cast<_type_lattice_size>(rand() * (region.y_high - region.y_low) + region.y_low);
-    // temp_z = static_cast<_type_lattice_size>(rand() * (region.z_high - region.z_low) + region.z_low);
-
-    randomLattice.id = box->lattice_list->getId(temp_x, temp_y, temp_z);
-    randomLattice.type._type = box->lattice_list->getType(randomLattice.id);
     
-    // kiwi::logs::v(" ", " temp_x is : {} temp_y is : {} temp_z is : {} type is : {}.\n", temp_x, temp_y, temp_z, randomLattice.type._type);
-    if (randomLattice.type._type == LatticeTypes::Mo || randomLattice.type._type == LatticeTypes::Re) {
-      if (cur_type == LatticeTypes::MoMo) {
-        if (randomLattice.type._type == LatticeTypes::Mo) { // 交换位置
-          box->lattice_list->momo_hash.erase(id);
-          box->lattice_list->momo_hash.emplace(randomLattice.id);
-        } else if(randomLattice.type._type == LatticeTypes::Re) { // Re (momo 变成 mo，re 变成 more)
-          box->lattice_list->re_hash.erase(randomLattice.id);
-          box->lattice_list->momo_hash.erase(id);
-          box->lattice_list->more_hash.emplace(randomLattice.id);
-          cur_type = LatticeTypes::MoRe;
-        }
-        x = temp_x;
-        y = temp_y;
-        z = temp_z;
-        if (box->lattice_list->meta.isGhostLat(randomLattice.id)) {
-          addExchange_ghost(randomLattice.id, sector_id);
-        }
-        if (box->lattice_list->meta.isSurfaceLat(randomLattice.id))
-          addExchange_surface(randomLattice.id);
-        if (box->lattice_list->meta.isSurfaceLat(id)) 
-          addExchange_surface(id);
-      } else if (cur_type == LatticeTypes::MoRe) {
-        if (numRe == 0) {
-          if (randomLattice.type._type == LatticeTypes::Mo) { // 交换位置
-            box->lattice_list->more_hash.erase(id);
-            box->lattice_list->more_hash.emplace(randomLattice.id);
-          } else { // Re 也是交换位置
-            box->lattice_list->re_hash.erase(randomLattice.id);
-            box->lattice_list->more_hash.erase(id);
-            box->lattice_list->re_hash.emplace(id);
-            box->lattice_list->more_hash.emplace(randomLattice.id);
-          }
-          x = temp_x;
-          y = temp_y;
-          z = temp_z;
 
-          if (box->lattice_list->meta.isGhostLat(randomLattice.id)) {
-            addExchange_ghost(randomLattice.id, sector_id);
-          }
-          if (box->lattice_list->meta.isSurfaceLat(randomLattice.id)) 
-            addExchange_surface(randomLattice.id);
-          if (box->lattice_list->meta.isSurfaceLat(id)) addExchange_surface(id);
-        } else if (numRe > 0 && numRe < LatticesList::MAX_1NN) {
-          double ranmov = rand();
-          if(ranmov > (static_cast<double>(numRe) / LatticesList::MAX_1NN)) {
-            if (randomLattice.type._type == LatticeTypes::Mo) {  // 交换位置
-              box->lattice_list->more_hash.erase(id);
-              box->lattice_list->more_hash.emplace(randomLattice.id);
-            } else if(randomLattice.type._type == LatticeTypes::Re) { // Re 也是交换位置
-              box->lattice_list->re_hash.erase(randomLattice.id);
-              box->lattice_list->more_hash.erase(id);
-              box->lattice_list->re_hash.emplace(id);
-              // box->lattice_list->more_hash.emplace(randomLattice.id);
-            }
-            x = temp_x;
-            y = temp_y;
-            z = temp_z;
-
-            if (box->lattice_list->meta.isGhostLat(randomLattice.id)) {
-              addExchange_ghost(randomLattice.id, sector_id);
-            }
-            if (box->lattice_list->meta.isSurfaceLat(randomLattice.id)) addExchange_surface(randomLattice.id);
-            if (box->lattice_list->meta.isSurfaceLat(id)) addExchange_surface(id);
-          }
-        } else return; // if (numRed >= LatticesList::MAX_1NN)
-      }
-    } else continue;
-
-  }
+    for(int i = 0;i<sizes[5];i++){
+      if(h_surface_Hash[i] != -1 && h_surface_Hash[i] != -2)
+      // if(!box->lattice_list->more_hash.count(h_MoRe_Hash[i]))
+        addExchange_surface((long int)h_surface_Hash[i]);
+    }
+    
+    hipHostFree(h_MoRe_Hash);
+    hipHostFree(h_MoMo_Hash);
+    hipHostFree(h_Re_Hash);
+    hipHostFree(h_V_Hash);
+    hipHostFree(h_ghost_Hash);
+    hipHostFree(h_surface_Hash);
+    
 }
 
 void ABVIModel::reindex(const lat_region region) {

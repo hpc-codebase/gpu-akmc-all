@@ -121,14 +121,14 @@ void creation::createRandom(int64_t seed_create_types, int64_t seed_create_vacan
   _type_lattice_count rere_local =
       types_ratio[10] / SimulationDomain::comm_sim_pro.all_ranks +
       (SimulationDomain::comm_sim_pro.own_rank < (types_ratio[10] % SimulationDomain::comm_sim_pro.all_ranks) ? 1 : 0);
-  lats->vac_hash.reserve(static_cast<size_t>(va_local * 1.2));
-  lats->re_hash.reserve(static_cast<size_t>(re_local * 1.2));
-  lats->mn_hash.reserve(static_cast<size_t>(mn_local * 1.2));
-  lats->ni_hash.reserve(static_cast<size_t>(ni_local * 1.2));
-  lats->si_hash.reserve(static_cast<size_t>(si_local * 1.2));
-  lats->momo_hash.reserve(static_cast<size_t>(momo_local * 1.2));
-  lats->more_hash.reserve(static_cast<size_t>(more_local * 1.2));
-  lats->rere_hash.reserve(static_cast<size_t>(rere_local * 1.2));
+  // lats->vac_hash.reserve(static_cast<size_t>(va_local * 1.2));
+  // lats->re_hash.reserve(static_cast<size_t>(re_local * 1.2));
+  // lats->mn_hash.reserve(static_cast<size_t>(mn_local * 1.2));
+  // lats->ni_hash.reserve(static_cast<size_t>(ni_local * 1.2));
+  // lats->si_hash.reserve(static_cast<size_t>(si_local * 1.2));
+  // lats->momo_hash.reserve(static_cast<size_t>(momo_local * 1.2));
+  // lats->more_hash.reserve(static_cast<size_t>(more_local * 1.2));
+  // lats->rere_hash.reserve(static_cast<size_t>(rere_local * 1.2));
   // create lattice types
   // createAtomsRandom(seed_create_types, lats, types, types_ratio, p_domain);
 

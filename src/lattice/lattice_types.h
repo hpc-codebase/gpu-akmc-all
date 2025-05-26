@@ -14,8 +14,7 @@ struct LatticeTypes {
    * 1. inter lattice must be two atom lattices, two types are combined by:
    *    (type1 << big_endian_shift) | type2
    * 2. In inter lattice, the smaller atom type will be put at higher bit,
-   * the larger atom type will be put at lower bit.
-   * // todo make CuFu different to FeCu.
+   * t/ todo make CuFu different to FeCu.
    */
   typedef enum {
     V = 0,
@@ -40,6 +39,8 @@ struct LatticeTypes {
     NiSi = 0x0810,
     SiSi = 0x1010,
   } lat_type;
+  //he larger atom type will be put at lower bit.
+   //* /
 
   lat_type _type;
 

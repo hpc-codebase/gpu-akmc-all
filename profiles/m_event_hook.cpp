@@ -59,8 +59,8 @@ void MEventHook::onStepFinished(unsigned long step) {
   //   //}
   // }
   std::time_t timestamp = std::time(nullptr);
-  if(step%1000 == 0)
-  kiwi::logs::d("", "{}: finish step: {}\n", timestamp,step);
+  if(step%10000 == 0)
+  kiwi::logs::d("", "    finish step: {}\n",step);
   // if(step%40 == 0)
   // kiwi::logs::d("", "\n");
   if (output_config.dump_interval != 0) {
@@ -68,7 +68,7 @@ void MEventHook::onStepFinished(unsigned long step) {
     //if (step == 0 || step == 99) {
     if (step == 0 ||step == 99||step == 999||step == 9999||step == 19999||step == 29999||step == 39999||step == 49999||step == 59999
     ||step == 99999||step == 999999
-    ||step == 499999 || step == 999999 || step == 1999999 || step == 2999999 || step == 3999999 || step == 4999999 || step == 9999999) {
+    ||step == 499999 || step == 999999 || step == 1999999 || step == 2999999 || step == 3999999 || step == 4999999 || step == 9999999||step%5000000== 0) {
       std::string dump_file_path = fmt::format(output_config.dump_file_path, step);
       const kiwi::mpi_process process = SimulationDomain::kiwi_sim_pro;
       if (process.all_ranks != 1) {

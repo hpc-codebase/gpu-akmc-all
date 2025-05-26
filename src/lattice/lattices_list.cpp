@@ -148,73 +148,88 @@ Lattice *LatticesList::walk(_type_lattice_id id, const _type_lattice_offset offs
   }
   return nullptr;
 }
-void LatticesList::initGpuInfo_exchange(std::vector<_type_lattice_id> idArray,std::vector< LatticeTypes::lat_type> typeArray,const _type_lattice_count count,std::vector<Lattice> nn_lists1,std::vector<Lattice> nn_lists2,dev_atom *atoms){
-  std::vector<_type_lattice_id> used_id;
-  for(_type_lattice_count i=0; i < count; i++){
-    atoms[i].atom_id = idArray[i];
-    atoms[i].atom_type =  getType(idArray[i]);
-    for(_type_lattice_count j =0; j < LatticesList::MAX_1NN+LatticesList::MAX_2NN; j++){
-        atoms[i].atom12nn[j] = nn_lists1[i * (LatticesList::MAX_1NN+LatticesList::MAX_2NN)  + j].id;
-        // atoms[i].atom12nn_type[j] = nn_lists1[i * (LatticesList::MAX_1NN+LatticesList::MAX_2NN) + j].type._type;
-    }
+void LatticesList::initGpuInfo_exchange(std::vector<long int> pair_atoms,
+                                       int x_low,int x_high,int y_low,int y_high,int z_low,int z_high,  
+                                       const unsigned int& sector_id,dev_meta &Meta,
+                                       long int *Pair_Atoms,
+                                       HIPHashSet *&MoRe_Hash,HIPHashSet *&MoMo_Hash,
+                                       HIPHashSet *&Re_Hash,HIPHashSet *&V_Hash,
+                                       HIPHashSet *&Busy_Set
+                                       ){
+  Meta.size_x = meta.size_x;
+  Meta.size_y = meta.size_y;
+  Meta.size_z = meta.size_z;
 
-    std::random_device rd;  // 作为真正的随机种子
-    std::mt19937 gen(rd()); // 以 Mersenne Twister 生成器生成随机数
-    std::uniform_int_distribution<int> dist(0, 14); // 生成 [1, 100] 之间的随机整数
+  Meta.box_x = meta.box_x;
+  Meta.box_y = meta.box_y;
+  Meta.box_z = meta.box_z;
 
-     std::random_device rd1;  // 作为真正的随机种子
-    std::mt19937 gen1(rd1()); // 以 Mersenne Twister 生成器生成随机数
-    std::uniform_int_distribution<int> dist1(0, 32767); // 生成 [1, 100] 之间的随机整数
-    
+  Meta.g_box_x = meta.g_box_x;
+  Meta.g_box_y = meta.g_box_y;
+  Meta.g_box_z = meta.g_box_z;
 
+  Meta.g_base_x = meta.g_base_x;
+  Meta.g_base_y = meta.g_base_y;
+  Meta.g_base_z = meta.g_base_z;
 
+  Meta.ghost_x = meta.ghost_x;
+  Meta.ghost_y = meta.ghost_y;
+  Meta.ghost_z = meta.ghost_z;
 
-    int randomNumber = dist(gen);
-    // assert(randomNumber >= 0 && randomNumber < 14);
-    double ranmov = dist1(gen1);
+  Meta._max_id = meta._max_id;
 
-    atoms[i].random_num1 = randomNumber%14;
-    atoms[i].ranmov = ranmov;
+  Meta.local_base_id = meta.local_base_id;
 
-    atoms[i].exchange = 0;
-    atoms[i].exchange_id = 0;
+  Meta.x_low = x_low;
+  Meta.y_low = y_low;
+  Meta.z_low = z_low;
 
-    atoms[i].numSIA = 0;
-    atoms[i].numRe = 0;
+  Meta.x_high = x_high;
+  Meta.y_high = y_high;
+  Meta.z_high = z_high;
 
-    atoms[i].out_sector = 0;
-
-    auto it = std::find(used_id.begin(), used_id.end(),  atoms[i].atom12nn[atoms[i].random_num1]);
-    if(it != used_id.end()){
-       kiwi::logs::v(" ","conflict detected {}\n",atoms[i].atom12nn[atoms[i].random_num1]);
-      atoms[i].exchange = -1;
-      for(int i = 1;i<7;i++){
-        if(atoms[i].random_num1 + i<14){
-          auto it1 = std::find(used_id.begin(), used_id.end(),  atoms[i].atom12nn[atoms[i].random_num1]);
-          if(it1!=used_id.end()){
-            atoms[i].random_num1 = atoms[i].random_num1 + i;
-            atoms[i].exchange =0;
-          }
-        }
-        if(atoms[i].random_num1 - i>=0){
-          auto it1 = std::find(used_id.begin(), used_id.end(),  atoms[i].atom12nn[atoms[i].random_num1]);
-          if(it1!=used_id.end()){
-            atoms[i].random_num1 = atoms[i].random_num1 - i;
-            atoms[i].exchange = 0;
-          }
-        }
-      }
-    }
-    if(atoms[i].exchange == 0){
-      used_id.push_back(atoms[i].atom12nn[atoms[i].random_num1]);
-      atoms[i].exchange_id = atoms[i].atom12nn[atoms[i].random_num1];
-      atoms[i].exchange_type = getType(atoms[i].exchange_id);
-    }
-    
+  // kiwi::logs::v(" ", "size_x {}\n", Meta.size_x);
+  // kiwi::logs::v(" ", "size_y {}\n", Meta.size_y);
+  // kiwi::logs::v(" ", "size_z {}\n", Meta.size_z);
 
 
+  // kiwi::logs::v(" ", "box_x {}\n", Meta.box_x);
+  // kiwi::logs::v(" ", "box_y {}\n", Meta.box_y);
+  // kiwi::logs::v(" ", "box_z {}\n", Meta.box_z);
+
+  // kiwi::logs::v(" ", "g_box_x {}\n", Meta.g_box_x);
+  // kiwi::logs::v(" ", "g_box_y {}\n", Meta.g_box_y);
+  // kiwi::logs::v(" ", "g_box_z {}\n", Meta.g_box_z);
+
+  // kiwi::logs::v(" ", "ghost_x {}\n", Meta.ghost_x);
+  // kiwi::logs::v(" ", "ghost_y {}\n", Meta.ghost_y);
+  // kiwi::logs::v(" ", "ghost_z {}\n", Meta.ghost_z);
+
+  // kiwi::logs::v(" ", "x_low {}\n", Meta.x_low);
+  // kiwi::logs::v(" ", "y_low {}\n", Meta.y_low);
+  // kiwi::logs::v(" ", "z_low {}\n", Meta.z_low);
+
+  // kiwi::logs::v(" ", "x_high {}\n", Meta.x_high);
+  // kiwi::logs::v(" ", "y_high {}\n", Meta.y_high);
+  // kiwi::logs::v(" ", "z_high {}\n", Meta.z_high);
+
+
+  for(int i=0;i<pair_atoms.size();i++){
+    Pair_Atoms[i] = pair_atoms[i];
   }
+
+  std::unordered_set<_type_lattice_id> vac_set;//vac_hash是map其它的是set
+
+  for (const auto& pair : vac_hash) {
+        vac_set.insert(pair.first); // 提取键并插入集合
+  }
+  MoRe_Hash = new HIPHashSet(more_hash,more_hash.size()+momo_hash.size());
+  MoMo_Hash = new HIPHashSet(momo_hash,more_hash.size()+momo_hash.size());
+  Re_Hash = new HIPHashSet(re_hash);
+  V_Hash = new HIPHashSet(vac_set);
+  Busy_Set = new HIPHashSet(pair_atoms.size());
 }
+
 
 void LatticesList::initGpuInfo(const _type_lattice_count& total, _type_lattice_id *vac_idArray, 
                                dev_Vacancy *h_vacancy, dev_nnLattice *h_nnneighbour) {

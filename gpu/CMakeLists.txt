@@ -8,6 +8,7 @@ add_library(${KMC_GPU_LIB_NAME} STATIC
         gpuError.hip
         gpuError.h
         DeviceVacRatesSolver.h
+        DeviceVacRatesSolver.cpp
         )
 
 target_compile_options(${KMC_GPU_LIB_NAME} PRIVATE -D__HIP_PLATFORM_HCC__= -DTHRUST_DEVICE_SYSTEM=THRUST_DEVICE_SYSTEM_HIP  -D__HIP__ -D__HIP_PLATFORM_AMD__= -I"${ROCM_PATH}/hip/include" -I"${ROCM_PATH}/llvm/lib/clang/14.0.0" -I${ROCM_PATH}/hsa/include)

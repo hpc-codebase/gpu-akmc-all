@@ -203,7 +203,7 @@ void PKMC::onStart() {
 
   //  set up ghost.
   if(SimulationDomain::comm_sim_pro.own_rank == 0) kiwi::logs::v(" ", " prepareForStart starting !!!.\n");
-  sim->prepareForStart();
+  // sim->prepareForStart();
   sim->get_neighbour_local_sub_box();
   if(SimulationDomain::comm_sim_pro.own_rank == 0) kiwi::logs::v(" ", " prepareForStart ending !!!.\n");
 

@@ -77,7 +77,8 @@ public:
 
   void recb_checki(const lat_region region, const unsigned int sector_id) override;
 
-  void recb_solver(_type_lattice_id id, const lat_region& region, const unsigned int& sector_id) override;
+  void recb_solver(std::vector<_type_lattice_id>id, const lat_region& region, const unsigned int& sector_id) override;
+  // void recb_solver1(dev_atom atoms,_type_lattice_id id, const lat_region& region, const unsigned int& sector_id);
 
   void reindex(const lat_region region) override;
 

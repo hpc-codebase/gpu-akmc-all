@@ -13,6 +13,7 @@
 #include "lattice/lattice.h"
 #include <unordered_set>
 #include <comm/preset/sector_forwarding_region.h>
+#include "../../gpu/DeviceVacRatesSolver.h"
 
 /**
  * \brief this is kmc model adapter
@@ -71,7 +72,7 @@ public:
 
   virtual void recb_checki(const lat_region region, const unsigned int sector_id) = 0;
 
-  virtual void recb_solver(_type_lattice_id id, const lat_region& region, const unsigned int& sector_id) = 0;
+  virtual void recb_solver(std::vector<_type_lattice_id>id, const lat_region& region, const unsigned int& sector_id) = 0;
 
   /**
    * \brief select an event and perform the event.

@@ -23,9 +23,14 @@
 #include "../src/lattice/lattice_types.h"
 #include "../src/lattice/lattice_list_meta.h"
 
-dev_atom* recb_solver_GPU(std::vector<_type_lattice_id> idArray,std::vector< LatticeTypes::lat_type> typeArray,const _type_lattice_count count,std::vector<Lattice> nn_lists1,std::vector<Lattice> nn_lists2,const unsigned int sector_id,
-                    std::vector<_type_lattice_size>x_array,std::vector<_type_lattice_size>y_array,std::vector<_type_lattice_size>z_array);
-
+void recb_solver_GPU(std::vector<long int> pair_atoms,
+    int x_low,int x_high,int y_low,int y_high,int z_low,int z_high,  
+    const unsigned int& sector_id,
+    long int *&h_MoRe_Hash,long int *&h_MoMo_Hash,
+    long int *&h_Re_Hash,long int *&h_V_Hash,
+    long int *&h_ghost_Hash,long int *&h_surface_Hash,
+    int *sizes
+  );
 double calculate_GPU(_type_lattice_id *vac_idArray,  const _type_lattice_count& vac_count);
 
 void selectAndPerformEventGPU(double excepted_rand, int rank, _type_lattice_count step, int sect,
@@ -49,4 +54,47 @@ void add_surface(_type_lattice_id& surface_id,
                  std::array<std::unordered_set<_type_lattice_id>, 8>& exchange_surface_z);
                  
 void output_time();
+
+// __global__ void calcExchangePairs(dev_meta meta,long int *Pair_Atoms,
+//                             HIPHashSet *MoRe_Hash,HIPHashSet *MoMo_Hash,
+//                             HIPHashSet *Re_Hash,HIPHashSet *V_Hash,
+//                             HIPHashSet *Busy_Set,
+//                             HIPHashSet *ghost_Hash,HIPHashSet *surface_Hash
+// );
+
+// __device__ int isSurfaceLat(_type_lattice_id lid);
+
+// __device__ int isGhostLat(_type_lattice_id lid);
+
+// __device__ void getCoordByLId(_type_lattice_id lid, _type_lattice_coord *x, _type_lattice_coord *y,
+//                             _type_lattice_coord *z);
+
+// __device__ float randomFloat(unsigned long long seed);
+
+// __device__ void getRandomLattice(const _type_lattice_coord& x, const _type_lattice_coord& y, const _type_lattice_coord& z,
+//                                 _type_lattice_coord& temp_x, _type_lattice_coord& temp_y, _type_lattice_coord& temp_z, const int& randomValue){
+
+// __device__ int randomInt(unsigned long long seed,int min,int max);
+
+// __device__ void get2nn(_type_lattice_coord x, _type_lattice_coord y, _type_lattice_coord z,
+//                               dev_nnLattice *_2nn_list);
+
+// __device__ void get1nn(_type_lattice_coord x, _type_lattice_coord y, _type_lattice_coord z,
+//                   dev_nnLattice *_1nn_list);
+
+// __device__ void getnnlattice(_type_lattice_id latti_id, dev_nnLattice *_1nn_list_lattice);
+
+// __device__ _type_lattice_id getId(_type_lattice_size x,_type_lattice_size y,_type_lattice_size z);
+
+// __device__ LatticeTypes::lat_type getType(const _type_lattice_id& id);
+
+// __global__ void setGlobalPointer(dev_meta meta,
+//                             HIPHashSet *MoRe_Hash,HIPHashSet *MoMo_Hash,
+//                             HIPHashSet *Re_Hash,HIPHashSet *V_Hash,HIPHashSet *Busy_Set);
+
+// __device__ int hash_set_contains(const int* table, _type_lattice_id key);
+
+// __device__ int hash_set_insert(int* table, _type_lattice_id key);
+
+// __device__ int hash_set_remove(int* table, _type_lattice_id key);
 #endif /*GPU_SIMULATE_H*/

@@ -118,7 +118,6 @@ public:
     // if(lid2 == 208884 || lid2 == 243544) std::cout << " x is : " << *x << " y is : " << *y << " z is : " << *z << " real_id is : " << *x + size_x * (*y + *z * size_y) << std::endl;
     // if(lid2 == 208884 || lid2 == 243544) std::cout << " size_x is : " << size_x << " size_y is : " << size_y << std::endl;
   }
-
   /**
    * \brief return true if it is a ghost lattice
    * \return return true if it is a ghost lattice, false for otherwise.
