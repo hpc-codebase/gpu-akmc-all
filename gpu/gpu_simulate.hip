@@ -43,6 +43,24 @@ namespace gpuSimulate {
     LatticesList *lattice_list;
     comm::ColoredDomain *p_domain;
 
+
+    //下面的是recb的命名空间
+
+    dev_meta meta;
+    HIPHashSet *MoRe_Hash;
+    HIPHashSet *MoMo_Hash;
+    HIPHashSet *Re_Hash;
+    HIPHashSet *V_Hash;
+    HIPHashSet *Busy_Set;
+    HIPHashSet *ghost_Hash;
+    HIPHashSet *surface_Hash;
+
+    long int *Pair_Atoms;
+    long int *d_Pair_Atoms;
+    dev_meta *d_meta;
+
+
+
 }
 
 __device__ double _1nnMapToSwitch(bonds::PairBond::bond_type bondType){
@@ -267,7 +285,83 @@ __device__ int hash_set_remove(GPUHashSet* table,long int key) {
   return 0;
 }
 
-__global__ void calcExchangeAtoms(dev_atom * atoms, const _type_lattice_count count){
+__device__ long atomicExch(long* address, long val) {
+    unsigned long long* addr_as_ull = reinterpret_cast<unsigned long long*>(address);
+    unsigned long long val_as_ull = static_cast<unsigned long long>(val);
+    
+    unsigned long long old_val = atomicExch(addr_as_ull, val_as_ull);
+    return static_cast<long>(old_val);
+}
+
+// 辅助函数
+__device__ unsigned long long int_as_longlong(unsigned int low, unsigned int high) {
+    return ((unsigned long long)high << 32) | low;
+}
+
+// 替代CUDA的__longlong_as_int函数
+// 原子加载操作 - 支持long类型
+__device__ long atomicLoad(long* address) {
+    unsigned long long* addr_as_ull = reinterpret_cast<unsigned long long*>(address);
+    
+    // 使用两个32位原子操作模拟64位原子加载
+    unsigned int* addr_as_int = reinterpret_cast<unsigned int*>(addr_as_ull);
+    unsigned int low = atomicExch(&addr_as_int[0], addr_as_int[0]);
+    unsigned int high = atomicExch(&addr_as_int[1], addr_as_int[1]);
+    
+    return static_cast<long>(int_as_longlong(low, high));
+}
+
+// 原子交换操作 - 支持long类型
+
+__device__ int hash_set_remove_atom_op(GPUHashSet* table, long key) {
+    unsigned long long index = key % table->capacity;
+    unsigned long long original_index = index;
+    
+    do {
+        // 使用适配long类型的原子加载
+        long current = atomicLoad(&table->keys[index]);
+        
+        if (current == table->empty_flag) {
+            return 0;
+        }
+        
+        if (current == key) {
+            // 使用适配long类型的原子交换
+            atomicExch(&table->keys[index], table->tombstone_flag);
+            return 1;
+        }
+        
+        index = (index + 1) % table->capacity;
+    } while (index != original_index);
+    
+    return 0;
+}
+
+__device__ int hash_set_insert_atom_op(GPUHashSet* set, long int key) {
+  unsigned long long pos = key % set->capacity;  // 保持修正后的哈希计算
+  unsigned long long start_pos = pos;
+  
+  do {
+      // long int current = set->keys[pos];  // 直接内存访问
+      long current = atomicLoad(&set->keys[pos]);
+      
+      if (current == key) {
+          return 0; // 已存在相同key
+      }
+      
+      if (current == set->empty_flag || current == set->tombstone_flag) {
+          // set->keys[pos] = key; // 直接赋值
+           atomicExch(&set->keys[pos], key);
+          return 1;
+      }
+      
+      pos = (pos + 1) % set->capacity;
+  } while (pos != start_pos);
+  
+  return 0; // 哈希表已满
+}
+
+__global__ void calcExchangeAtoms(dev_atom *atoms, const _type_lattice_count count){
     const _type_lattice_count tid = blockIdx.x * blockDim.x + threadIdx.x;//用这个来标志dev_atom中的原子数
     if(atoms == nullptr) return;
     if(tid < count){
@@ -989,7 +1083,7 @@ __global__ void calcExchangePairs_test(long int *Pair_Atoms,int count,
     _type_lattice_id id = Pair_Atoms[tid];
       // 1. 插入测试
       int test_key = tid; // 用线程ID作为测试的键
-      int insert_result = hash_set_insert(Busy_Set, test_key);
+      int insert_result = hash_set_insert_atom_op(Busy_Set, test_key);
       if (insert_result == 1) {
           printf("Thread %d: Successfully inserted key %d into Busy_Set.\n", tid, test_key);
       } else {
@@ -1005,7 +1099,7 @@ __global__ void calcExchangePairs_test(long int *Pair_Atoms,int count,
       }
 
       // 3. 删除测试
-      int remove_result = hash_set_remove(Busy_Set, test_key);
+      int remove_result = hash_set_remove_atom_op(Busy_Set, test_key);
       if (remove_result == 1) {
           printf("Thread %d: Successfully removed key %d from Busy_Set.\n", tid, test_key);
       } else {
@@ -1035,8 +1129,8 @@ __global__ void calcExchangePairs(long int *Pair_Atoms,int count,
   //   ghost_Hash->capacity,surface_Hash->capacity,Busy_Set->capacity
   // );
   _type_lattice_count tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if(tid >= 1)
-    return;
+  // if(tid >= 1)
+  //   return;
   
   _type_lattice_id id = Pair_Atoms[tid];
   LatticeTypes::lat_type cur_type = getType(id);
@@ -1298,61 +1392,10 @@ void recb_solver_GPU(std::vector<long int> pair_atoms,
                     int *sizes
                   ){
     using namespace gpuSimulate;
-    dev_meta meta;
-    HIPHashSet *MoRe_Hash;
-    HIPHashSet *MoMo_Hash;
-    HIPHashSet *Re_Hash;
-    HIPHashSet *V_Hash;
-    HIPHashSet *Busy_Set;
-    HIPHashSet *ghost_Hash;
-    HIPHashSet *surface_Hash;
-    // long int *Pair_Atoms = new long int[pair_atoms.size()];
-    long int *Pair_Atoms;
-    hipHostMalloc((void**)&Pair_Atoms,pair_atoms.size()*sizeof(long int));
-    long int *d_Pair_Atoms;
-    HANDLE_HIP(hipMalloc((void**)&d_Pair_Atoms,pair_atoms.size()*sizeof(long int)));
 
-    
-    // HANDLE_HIP(hipMemcpy(deviceVacancyInfo, hostVacancyInfo, vac_count * sizeof(dev_Vacancy), hipMemcpyHostToDevice));
-    
-    // long int *ghost_list = new long int[100];
-    // long int *surface_list = new long int[100];
-
-    //在此处首先对传入的参数分配内存和赋值
-    lattice_list->initGpuInfo_exchange(pair_atoms,x_low,x_high,y_low,y_high,z_low,z_high,
-                                      sector_id,meta,Pair_Atoms,
-                                      MoRe_Hash,MoMo_Hash,Re_Hash,V_Hash,Busy_Set
-                                      );
-
-    HANDLE_HIP(hipMemcpy(d_Pair_Atoms, Pair_Atoms,pair_atoms.size()*sizeof(long int), hipMemcpyHostToDevice));
-
-    int ghost_size = (meta.x_high + meta.ghost_x - meta.x_low)*(meta.y_high + meta.ghost_y - meta.y_low) * (meta.z_high + meta.ghost_z - meta.z_low)
-                     - (meta.x_high - meta.x_low)*(meta.y_high - meta.y_low) * (meta.z_high - meta.z_low)
-                     + (meta.x_high-meta.x_low)*meta.ghost_y*meta.ghost_z
-                     + meta.ghost_x*(meta.y_high-meta.y_low)*meta.ghost_z
-                     + meta.ghost_x*(meta.z_high-meta.z_low)*meta.ghost_y;
-    int surface_size = (meta.x_high - meta.x_low)*(meta.y_high - meta.y_low) * (meta.z_high - meta.z_low)
-                       - (meta.x_high - meta.ghost_x - meta.x_low)*(meta.y_high - meta.ghost_y - meta.y_low) * (meta.z_high - meta.ghost_z - meta.z_low);
-    
-    // kiwi::logs::v(" ", "ghost_size: {} surface_size:{} \n", ghost_size,surface_size);
-    ghost_Hash = new HIPHashSet(ghost_size);
-    surface_Hash = new HIPHashSet(surface_size);
-
-    dev_meta *d_meta;
-    HANDLE_HIP(hipMalloc((void**)&d_meta,sizeof(dev_meta)));
-    HANDLE_HIP(hipMemcpy(d_meta, &meta,sizeof(dev_meta), hipMemcpyHostToDevice));
-    // 在此处调用gpu的核函数
-    hipLaunchKernelGGL(setGlobalPointer, 1, 1, 0, 0, 
-      d_meta,
-      MoRe_Hash->device_ptr(),MoMo_Hash->device_ptr(),Re_Hash->device_ptr(),V_Hash->device_ptr(),Busy_Set->device_ptr()
-    );
-    hipDeviceSynchronize();
     blockSize = 128;
     numBlocks = pair_atoms.size() / blockSize + 1;
-    // std::cout << "Host Debug: Re_Hash Address = " << Re_Hash 
-    //       << ", Keys Address = " << Re_Hash->device_ptr()->keys 
-    //       << ", Capacity = " << Re_Hash->device_ptr()->capacity << std::endl;
-    hipLaunchKernelGGL(calcExchangePairs, blockSize, numBlocks, 0, 0, 
+     hipLaunchKernelGGL(calcExchangePairs_test, blockSize, numBlocks, 0, 0, 
       d_Pair_Atoms,pair_atoms.size(),
       d_meta,
       MoRe_Hash->device_ptr(),MoMo_Hash->device_ptr(),Re_Hash->device_ptr(),V_Hash->device_ptr(),
@@ -1360,25 +1403,9 @@ void recb_solver_GPU(std::vector<long int> pair_atoms,
     );
     hipDeviceSynchronize();
 
-    // int *h_busy_set;
-    // hipHostMalloc((void**)&h_busy_set,Busy_Set->device_ptr()->capacity*sizeof(int));
-    // HANDLE_HIP(hipMemcpy(h_busy_set, Busy_Set->device_ptr()->keys, Busy_Set->device_ptr()->capacity*sizeof(int), hipMemcpyDeviceToHost));
-    // int busy = 0;
-    // for(int i=0;i<pair_atoms.size()*2;i++){
-    //   if(h_busy_set[i] !=-1 && h_busy_set[i]!=-2)
-    //     busy++;
-    // }
-    // std::cout<<"busy : "<<busy<<std::endl;
 
-
-    hipHostMalloc((void**)&h_MoRe_Hash,MoRe_Hash->device_ptr()->capacity*sizeof(long int));
-    hipHostMalloc((void**)&h_MoMo_Hash,MoMo_Hash->device_ptr()->capacity*sizeof(long int));
-    hipHostMalloc((void**)&h_Re_Hash,Re_Hash->device_ptr()->capacity*sizeof(long int));
-    hipHostMalloc((void**)&h_V_Hash,V_Hash->device_ptr()->capacity*sizeof(long int));
-
-    hipHostMalloc((void**)&h_ghost_Hash,ghost_Hash->device_ptr()->capacity*sizeof(long int));
-    hipHostMalloc((void**)&h_surface_Hash,surface_Hash->device_ptr()->capacity*sizeof(long int));
-
+    //这是计算后传回的部分
+    //现在的修改是否需要传回？
 
     HANDLE_HIP(hipMemcpy(h_MoRe_Hash, MoRe_Hash->device_ptr()->keys, MoRe_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
     HANDLE_HIP(hipMemcpy(h_MoMo_Hash, MoMo_Hash->device_ptr()->keys, MoMo_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
@@ -1395,20 +1422,6 @@ void recb_solver_GPU(std::vector<long int> pair_atoms,
     sizes[4]= ghost_Hash->device_ptr()->capacity;
     sizes[5]= surface_Hash->device_ptr()->capacity;
 
-
-
-
-    //在此处删除所有此前分配的内存
-    delete MoRe_Hash;
-    delete MoMo_Hash;
-    delete Re_Hash;
-    delete V_Hash;
-    hipFree(d_Pair_Atoms);
-    hipHostFree(Pair_Atoms);
-    delete ghost_Hash;
-    delete surface_Hash;
-    delete Busy_Set;
-    hipFree(d_meta);
 }
 
 double calculate_GPU(_type_lattice_id *vac_idArray,  const _type_lattice_count& vac_count) {
@@ -1495,6 +1508,47 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
   hipHostMalloc((void**)&ret_atoms, HostAtomCapacity * sizeof(dev_atom));
   HANDLE_HIP(hipMalloc((void**)&d_atoms, HostAtomCapacity * sizeof(dev_atom)));
 
+  //以下是对recbGPU的空间分配
+  //在这里直接把GPU中的哈希表分配掉了，然后在空位交换的时候更新哈希表
+
+
+
+  
+  hipHostMalloc((void**)&Pair_Atoms,pair_atoms.size()*sizeof(long int));
+  HANDLE_HIP(hipMalloc((void**)&d_Pair_Atoms,pair_atoms.size()*sizeof(long int)));
+  lattice_list->initGpuInfo_exchange(pair_atoms,x_low,x_high,y_low,y_high,z_low,z_high,
+                                      sector_id,meta,Pair_Atoms,
+                                      MoRe_Hash,MoMo_Hash,Re_Hash,V_Hash,Busy_Set
+                                      );
+
+  HANDLE_HIP(hipMemcpy(d_Pair_Atoms, Pair_Atoms,pair_atoms.size()*sizeof(long int), hipMemcpyHostToDevice));
+
+  int ghost_size = (meta.x_high + meta.ghost_x - meta.x_low)*(meta.y_high + meta.ghost_y - meta.y_low) * (meta.z_high + meta.ghost_z - meta.z_low)
+                    - (meta.x_high - meta.x_low)*(meta.y_high - meta.y_low) * (meta.z_high - meta.z_low)
+                    + (meta.x_high-meta.x_low)*meta.ghost_y*meta.ghost_z
+                    + meta.ghost_x*(meta.y_high-meta.y_low)*meta.ghost_z
+                    + meta.ghost_x*(meta.z_high-meta.z_low)*meta.ghost_y;
+  int surface_size = (meta.x_high - meta.x_low)*(meta.y_high - meta.y_low) * (meta.z_high - meta.z_low)
+                      - (meta.x_high - meta.ghost_x - meta.x_low)*(meta.y_high - meta.ghost_y - meta.y_low) * (meta.z_high - meta.ghost_z - meta.z_low);
+
+  
+
+  HANDLE_HIP(hipMalloc((void**)&d_meta,sizeof(dev_meta)));
+  HANDLE_HIP(hipMemcpy(d_meta, &meta,sizeof(dev_meta), hipMemcpyHostToDevice));
+
+  hipLaunchKernelGGL(setGlobalPointer, 1, 1, 0, 0, 
+      d_meta,
+      MoRe_Hash->device_ptr(),MoMo_Hash->device_ptr(),Re_Hash->device_ptr(),V_Hash->device_ptr(),Busy_Set->device_ptr()
+    );
+
+  
+    hipHostMalloc((void**)&h_MoRe_Hash,MoRe_Hash->device_ptr()->capacity*sizeof(long int));
+    hipHostMalloc((void**)&h_MoMo_Hash,MoMo_Hash->device_ptr()->capacity*sizeof(long int));
+    hipHostMalloc((void**)&h_Re_Hash,Re_Hash->device_ptr()->capacity*sizeof(long int));
+    hipHostMalloc((void**)&h_V_Hash,V_Hash->device_ptr()->capacity*sizeof(long int));
+
+    hipHostMalloc((void**)&h_ghost_Hash,ghost_Hash->device_ptr()->capacity*sizeof(long int));
+    hipHostMalloc((void**)&h_surface_Hash,surface_Hash->device_ptr()->capacity*sizeof(long int));
 
 }
 
@@ -1513,6 +1567,19 @@ void gpu_final(){
 
   hipHostFree(hostVacancyInfo);
   hipHostFree(hostNeighbourInfo);
+
+
+  //z这里是recb的部分
+  delete MoRe_Hash;
+  delete MoMo_Hash;
+  delete Re_Hash;
+  delete V_Hash;
+  hipFree(d_Pair_Atoms);
+  hipHostFree(Pair_Atoms);
+  delete ghost_Hash;
+  delete surface_Hash;
+  delete Busy_Set;
+  hipFree(d_meta);
 }
 
 void exchange_lattices(dev_event* h_event){
