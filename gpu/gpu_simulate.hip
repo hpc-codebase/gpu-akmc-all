@@ -1113,7 +1113,6 @@ __global__ void calcExchangePairs_test(long int *Pair_Atoms,int count,
       } else {
           printf("Thread %d: Key %d NOT found in Busy_Set after removal.\n", tid, test_key);
       }
-   
   }
 __global__ void calcExchangePairs(long int *Pair_Atoms,int count,
                             dev_meta *meta,
@@ -1395,7 +1394,7 @@ void recb_solver_GPU(std::vector<long int> pair_atoms,
 
     blockSize = 128;
     numBlocks = pair_atoms.size() / blockSize + 1;
-     hipLaunchKernelGGL(calcExchangePairs_test, blockSize, numBlocks, 0, 0, 
+    hipLaunchKernelGGL(calcExchangePairs_test, blockSize, numBlocks, 0, 0, 
       d_Pair_Atoms,pair_atoms.size(),
       d_meta,
       MoRe_Hash->device_ptr(),MoMo_Hash->device_ptr(),Re_Hash->device_ptr(),V_Hash->device_ptr(),
@@ -1414,6 +1413,7 @@ void recb_solver_GPU(std::vector<long int> pair_atoms,
 
     HANDLE_HIP(hipMemcpy(h_ghost_Hash, ghost_Hash->device_ptr()->keys, ghost_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
     HANDLE_HIP(hipMemcpy(h_surface_Hash, surface_Hash->device_ptr()->keys, surface_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
+    
 
     sizes[0]= MoRe_Hash->device_ptr()->capacity;
     sizes[1]= MoMo_Hash->device_ptr()->capacity;
@@ -1508,12 +1508,21 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
   hipHostMalloc((void**)&ret_atoms, HostAtomCapacity * sizeof(dev_atom));
   HANDLE_HIP(hipMalloc((void**)&d_atoms, HostAtomCapacity * sizeof(dev_atom)));
 
-  //以下是对recbGPU的空间分配
+  //以下是对recb_solver_GPU的空间分配
   //在这里直接把GPU中的哈希表分配掉了，然后在空位交换的时候更新哈希表
-
-
-
-  
+  /*
+    变量名           位置         解释
+    Pair_Atoms      host      间隙对的列表
+    d_Pair_Atoms    device    间隙对的列表（GPU）
+    meta            host      box中环境变量的集合
+    d_meta          device    box中环境变量的集合
+    ghost_size      host      ghost区的大小（现在按最大的情况来）
+    surface_size    host      surface区的大小（现在按最大的情况来）
+    MoRe_Hash       device    GPU中哈希表的位置
+    h_MoRe_Hash     host      计算完毕后传回给CPU的空间
+    MoMo_Hash等等同理
+    busy_set        host      忙碌队列
+  */
   hipHostMalloc((void**)&Pair_Atoms,pair_atoms.size()*sizeof(long int));
   HANDLE_HIP(hipMalloc((void**)&d_Pair_Atoms,pair_atoms.size()*sizeof(long int)));
   lattice_list->initGpuInfo_exchange(pair_atoms,x_low,x_high,y_low,y_high,z_low,z_high,
@@ -1536,12 +1545,13 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
   HANDLE_HIP(hipMalloc((void**)&d_meta,sizeof(dev_meta)));
   HANDLE_HIP(hipMemcpy(d_meta, &meta,sizeof(dev_meta), hipMemcpyHostToDevice));
 
+  //set hash pointer to gpu global pointer
   hipLaunchKernelGGL(setGlobalPointer, 1, 1, 0, 0, 
       d_meta,
       MoRe_Hash->device_ptr(),MoMo_Hash->device_ptr(),Re_Hash->device_ptr(),V_Hash->device_ptr(),Busy_Set->device_ptr()
     );
 
-  
+  //这些是对返回CPU的空间
     hipHostMalloc((void**)&h_MoRe_Hash,MoRe_Hash->device_ptr()->capacity*sizeof(long int));
     hipHostMalloc((void**)&h_MoMo_Hash,MoMo_Hash->device_ptr()->capacity*sizeof(long int));
     hipHostMalloc((void**)&h_Re_Hash,Re_Hash->device_ptr()->capacity*sizeof(long int));
@@ -1569,7 +1579,7 @@ void gpu_final(){
   hipHostFree(hostNeighbourInfo);
 
 
-  //z这里是recb的部分
+  //z这里是recb_solver_GPU的部分
   delete MoRe_Hash;
   delete MoMo_Hash;
   delete Re_Hash;

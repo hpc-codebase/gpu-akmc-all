@@ -188,32 +188,6 @@ void LatticesList::initGpuInfo_exchange(std::vector<long int> pair_atoms,
   Meta.y_high = y_high;
   Meta.z_high = z_high;
 
-  // kiwi::logs::v(" ", "size_x {}\n", Meta.size_x);
-  // kiwi::logs::v(" ", "size_y {}\n", Meta.size_y);
-  // kiwi::logs::v(" ", "size_z {}\n", Meta.size_z);
-
-
-  // kiwi::logs::v(" ", "box_x {}\n", Meta.box_x);
-  // kiwi::logs::v(" ", "box_y {}\n", Meta.box_y);
-  // kiwi::logs::v(" ", "box_z {}\n", Meta.box_z);
-
-  // kiwi::logs::v(" ", "g_box_x {}\n", Meta.g_box_x);
-  // kiwi::logs::v(" ", "g_box_y {}\n", Meta.g_box_y);
-  // kiwi::logs::v(" ", "g_box_z {}\n", Meta.g_box_z);
-
-  // kiwi::logs::v(" ", "ghost_x {}\n", Meta.ghost_x);
-  // kiwi::logs::v(" ", "ghost_y {}\n", Meta.ghost_y);
-  // kiwi::logs::v(" ", "ghost_z {}\n", Meta.ghost_z);
-
-  // kiwi::logs::v(" ", "x_low {}\n", Meta.x_low);
-  // kiwi::logs::v(" ", "y_low {}\n", Meta.y_low);
-  // kiwi::logs::v(" ", "z_low {}\n", Meta.z_low);
-
-  // kiwi::logs::v(" ", "x_high {}\n", Meta.x_high);
-  // kiwi::logs::v(" ", "y_high {}\n", Meta.y_high);
-  // kiwi::logs::v(" ", "z_high {}\n", Meta.z_high);
-
-
   for(int i=0;i<pair_atoms.size();i++){
     Pair_Atoms[i] = pair_atoms[i];
   }

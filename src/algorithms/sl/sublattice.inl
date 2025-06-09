@@ -53,6 +53,7 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
       p_model->clear_exchange_surface((*sec_meta.sector_itl).id);
       if(SimulationDomain::comm_sim_pro.own_rank == 0) kiwi::logs::v(" ", " step is : {} sect is : {} starting !!!.\n", step, sect);
       for(int ir = 0; ir < 1; ir++) {
+        //TODO:对这个地方的代码GPU化
       // while (sector_time < step_threshold_time) { // note: step_threshold_time may be less then 0.0
         // 各个方向的迁移机率，并将其累加
         // time_start = MPI_Wtime();

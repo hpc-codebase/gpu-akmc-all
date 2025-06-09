@@ -286,7 +286,6 @@ void ABVIModel::recb_checki(const lat_region region, const unsigned int sector_i
     // std::cout<<"orgion momo size "<<box->lattice_list->momo_hash.size()<<std::endl;
     if(arr.size()!=0)
       recb_solver(arr, region, sector_id);
- 
   }
 
 void ABVIModel::recb_solver(std::vector<_type_lattice_id>id, const lat_region& region, const unsigned int& sector_id) {

@@ -1,0 +1,44 @@
+对misa-akmc-more/src/algorithms/sl/sublattice.inl:55行内部的循环进行重构，把全部计算放到GPU上去执行
+调用GPU的模块：
+    1,计算迁移速率 没有涉及交换，哈希表没有改变
+    misa-akmc-more/src/algorithms/sl/sublattice.inl：60 calcRatesWrapper
+        ->misa-akmc-more/src/algorithms/sl/sublattice.inl:145 calcRatesGPU
+            ->misa-akmc-more/models/abvi/kmc.cpp:96 calculate_GPU
+                ->misa-akmc-more/gpu/gpu_simulate.hip: calcRatesGPU
+                    ->misa-akmc-more/gpu/gpu_simulate.hip:442 calcRatesGPU
+    2,空位选择一个方向进行跃迁，涉及哈希表的处理
+    misa-akmc-more/src/algorithms/sl/sublattice.inl:72 selectPerformWrapper
+        ->misa-akmc-more/src/algorithms/sl/sublattice.inl:150 selectAndPerformGPU
+            ->misa-akmc-more/src/models/model_adapter.h:118 selectAndPerformOnGPU
+                ->misa-akmc-more/models/abvi/kmc.cpp:101 selectAndPerformEventGPU
+                    ->misa-akmc-more/gpu/gpu_simulate.hip:762 selectEventGPU
+                        ->misa-akmc-more/gpu/gpu_simulate.hip:725 selectEventGPU
+    3,间隙对进行交换的过程,涉及哈希表的处理
+    misa-akmc-more/src/algorithms/sl/sublattice.inl:82 recbPerformWrapper
+        ->misa-akmc-more/src/algorithms/sl/sublattice.inl:159 recb
+            ->misa-akmc-more/src/models/model_adapter.h:113 recb_checki
+                ->misa-akmc-more/models/abvi/kmc.cpp:255 recb_checki
+                    ->misa-akmc-more/models/abvi/kmc.cpp:288 recb_solver
+                        ->misa-akmc-more/gpu/gpu_simulate.hip:1386 recb_solver_GPU
+                            ->misa-akmc-more/gpu/gpu_simulate.hip:1118 calcExchangePairs
+
+在循环前就把哈希表传输进去
+循环：
+计算顺序1->2->3
+    1开始
+    （2和3就不用传输哈希表了）
+    2更新哈希表
+    3更新哈希表
+    3之后通信然后更新哈希表（按需通信版本）
+TODO：
+    1，更改哈希表创建和传输位置
+    2，写更新哈希表的逻辑
+    3，间隙对的团簇问题
+    4，检验大数原子操作的正确性
+    5，lamda表达式写个时间检测
+
+
+
+    
+
+    
