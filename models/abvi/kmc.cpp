@@ -78,7 +78,9 @@ _type_rate ABVIModel::calcRates(const comm::Region<comm::_type_lattice_size> reg
   sum_rates += defectGenRate();
   return sum_rates;
 }
-
+int ABVModel::initGPUHashSet(const comm::Region<comm::_type_lattice_size> region, int sect){
+  //暂时没用到
+}
 _type_rate ABVIModel::calcRatesGPU(const comm::Region<comm::_type_lattice_size> region, int sect) {
   _type_lattice_id *vac_idArray;
   vac_idArray = (_type_lattice_id *)malloc(box->lattice_list->vac_hash.size() * sizeof(_type_lattice_id));
@@ -290,6 +292,7 @@ void ABVIModel::recb_checki(const lat_region region, const unsigned int sector_i
 
 void ABVIModel::recb_solver(std::vector<_type_lattice_id>id, const lat_region& region, const unsigned int& sector_id) {
     dev_meta h_meta;
+    //TODO：把这块空间复用然后
     long int *h_MoRe_Hash;
     long int *h_MoMo_Hash;
     long int *h_Re_Hash;
@@ -372,7 +375,7 @@ void ABVIModel::recb_solver(std::vector<_type_lattice_id>id, const lat_region& r
       // if(!box->lattice_list->more_hash.count(h_MoRe_Hash[i]))
         addExchange_surface((long int)h_surface_Hash[i]);
     }
-    
+    //TODO：这里的free要放到最后
     hipHostFree(h_MoRe_Hash);
     hipHostFree(h_MoMo_Hash);
     hipHostFree(h_Re_Hash);

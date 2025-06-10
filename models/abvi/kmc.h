@@ -54,6 +54,8 @@ public:
   _type_rate calcRates(const lat_region region) override; // todo
 
   _type_rate calcRatesGPU(const lat_region region, int sect) override;
+
+  void setHashTableGPU(const lat_region region, int sect);
   // _type_rate calcRatesGPU(const lat_region region, bool *sector_first) override; // todo
 
   /*

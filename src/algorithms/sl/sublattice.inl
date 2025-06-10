@@ -141,6 +141,9 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
   if(SimulationDomain::comm_sim_pro.own_rank == 0) kiwi::logs::v(" ", " communicate time is : {} s. \n", local_to_total / SimulationDomain::comm_sim_pro.all_ranks);
 }
 
+template <typename E> int SubLattice::initGPUHashSetWrapper(ModelAdapter<E> *p_model, const type_sector_id sector_id, int sect){
+  return p->model->initGPUHashSet(p_domain->local_sector_region[sector_id],sect);
+}
 template <typename E> double SubLattice::calcRatesWrapper(ModelAdapter<E> *p_model, const type_sector_id sector_id, int sect) {
   return p_model->calcRatesGPU(p_domain->local_sector_region[sector_id], sect);
   //return p_model->calcRates(p_domain->local_sector_region[sector_id]);

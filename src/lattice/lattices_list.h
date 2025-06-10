@@ -53,6 +53,15 @@ public:
   static const int MAX_NEI_BITS = 8;
   static const int MAX_2NN = 6;
 
+  long int *h_MoRe_Hash;
+  long int *h_MoMo_Hash;
+  long int *h_Re_Hash;
+  long int *h_V_Hash;
+  long int *h_ghost_Hash;
+  long int *h_surface_Hash;
+  int size[6];
+
+
   friend class GhostInitPacker;
 
   friend class GhostSyncPacker;

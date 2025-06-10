@@ -8,6 +8,7 @@ __device__ static GPUHashSet *g_Re_Hash;
 __device__ static GPUHashSet *g_V_Hash;
 __device__ static dev_meta *g_meta;
 __device__ static GPUHashSet *g_Busy_Set;
+//这些都是GPU内部的全局变量
 namespace gpuSimulate {
 
     // device variable
@@ -788,6 +789,8 @@ void selectAndPerformEventGPU(double excepted_rand, int rank, _type_lattice_coun
   }
   if (lattice_list->meta.isSurfaceLat(h_event->from_id)) add_surface(h_event->from_id, exchange_surface_x, exchange_surface_y, exchange_surface_z);
   if (lattice_list->meta.isSurfaceLat(h_event->to_id)) add_surface(h_event->to_id, exchange_surface_x, exchange_surface_y, exchange_surface_z);
+
+
 }
 __global__ void setGlobalPointer(dev_meta *meta,
                             GPUHashSet *MoRe_Hash,GPUHashSet *MoMo_Hash,
@@ -1525,6 +1528,8 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
   */
   hipHostMalloc((void**)&Pair_Atoms,pair_atoms.size()*sizeof(long int));
   HANDLE_HIP(hipMalloc((void**)&d_Pair_Atoms,pair_atoms.size()*sizeof(long int)));
+  //对环境变量以及哈希表进行初始化
+  //每组的meta需要重新赋值
   lattice_list->initGpuInfo_exchange(pair_atoms,x_low,x_high,y_low,y_high,z_low,z_high,
                                       sector_id,meta,Pair_Atoms,
                                       MoRe_Hash,MoMo_Hash,Re_Hash,V_Hash,Busy_Set
@@ -1541,7 +1546,7 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
                       - (meta.x_high - meta.ghost_x - meta.x_low)*(meta.y_high - meta.ghost_y - meta.y_low) * (meta.z_high - meta.ghost_z - meta.z_low);
 
   
-
+  //这是对meta的首次更新，以后每次都得更新
   HANDLE_HIP(hipMalloc((void**)&d_meta,sizeof(dev_meta)));
   HANDLE_HIP(hipMemcpy(d_meta, &meta,sizeof(dev_meta), hipMemcpyHostToDevice));
 
@@ -1552,13 +1557,13 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
     );
 
   //这些是对返回CPU的空间
-    hipHostMalloc((void**)&h_MoRe_Hash,MoRe_Hash->device_ptr()->capacity*sizeof(long int));
-    hipHostMalloc((void**)&h_MoMo_Hash,MoMo_Hash->device_ptr()->capacity*sizeof(long int));
-    hipHostMalloc((void**)&h_Re_Hash,Re_Hash->device_ptr()->capacity*sizeof(long int));
-    hipHostMalloc((void**)&h_V_Hash,V_Hash->device_ptr()->capacity*sizeof(long int));
+    hipHostMalloc((void**)&lattice_list->h_MoRe_Hash,MoRe_Hash->device_ptr()->capacity*sizeof(long int));
+    hipHostMalloc((void**)&lattice_list->h_MoMo_Hash,MoMo_Hash->device_ptr()->capacity*sizeof(long int));
+    hipHostMalloc((void**)&lattice_list->h_Re_Hash,Re_Hash->device_ptr()->capacity*sizeof(long int));
+    hipHostMalloc((void**)&lattice_list->h_V_Hash,V_Hash->device_ptr()->capacity*sizeof(long int));
 
-    hipHostMalloc((void**)&h_ghost_Hash,ghost_Hash->device_ptr()->capacity*sizeof(long int));
-    hipHostMalloc((void**)&h_surface_Hash,surface_Hash->device_ptr()->capacity*sizeof(long int));
+    hipHostMalloc((void**)&lattice_list->h_ghost_Hash,ghost_Hash->device_ptr()->capacity*sizeof(long int));
+    hipHostMalloc((void**)&lattice_list->h_surface_Hash,surface_Hash->device_ptr()->capacity*sizeof(long int));
 
 }
 

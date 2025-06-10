@@ -219,6 +219,7 @@ void PKMC::onStart() {
   initialize_gpu(kiwi::mpiUtils::global_process.own_rank);
 
   // hipmalloc并且分配初始化一些常量
+  //在这里对gpu内部的哈希表进行填充
   gpu_prepare(config_v.attempt_freq, config_v.temperature, sim->box->lattice_list, sim->_p_domain);
   // gpu_prepare(config_v.attempt_freq, config_v.temperature);
 
