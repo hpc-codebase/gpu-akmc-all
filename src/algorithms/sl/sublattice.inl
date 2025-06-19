@@ -494,9 +494,9 @@ template <class PKg, class Ins> void SubLattice::syncNextSectorGhostRegions(Ins 
   type_comm_lat_regions recv_regions; // receive regions in each dimension.
   for (int d = 0; d < comm::DIMENSION_SIZE; d++) {
     send_regions[d] = comm::fwCommSectorSendRegion(next_sector.id, dims[d], p_domain->lattice_size_ghost,
-                                                   p_domain->local_split_coord, p_domain->local_sub_box_lattice_region);
+                                                  p_domain->local_split_coord, p_domain->local_sub_box_lattice_region);
     recv_regions[d] = comm::fwCommSectorRecvRegion(next_sector.id, dims[d], p_domain->lattice_size_ghost,
-                                                   p_domain->local_split_coord, p_domain->local_sub_box_lattice_region);
+                                                  p_domain->local_split_coord, p_domain->local_sub_box_lattice_region);
   }
 
   // pack data
@@ -570,6 +570,10 @@ template <class PKg, class Ins> void SubLattice::syncNextSectorGhostRegions(Ins 
     MPI_Wait(&recv_requests[dim_id], &recv_statuses[dim_id]);
     packer.onReceive2(receive_buff, num_receive[dim_id], dim_id, exchange_surface_x, exchange_surface_y, exchange_surface_z,
                       p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, next_sector.id, p_domain);
+
+    //在这里把receive_buff传给GPU
+    //然后让gpu去更新gpu端的hashset
+    
     //packer.onReceive(receive_buff, recv_regions[dim_id], num_receive[dim_id], dim_id, comm::DIR_LOWER);
     // release buffer
     delete[] send_buff;

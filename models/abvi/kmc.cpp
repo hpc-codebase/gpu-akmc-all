@@ -310,7 +310,7 @@ void ABVIModel::recb_solver(std::vector<_type_lattice_id>id, const lat_region& r
                   h_ghost_Hash,h_surface_Hash,
                   sizes
                 );
-
+    //更新哈希表现在不用更新，最后一次更新就完了
     int nummomo=0;
     int nummore=0;
     box->lattice_list->more_hash.clear();
@@ -363,6 +363,7 @@ void ABVIModel::recb_solver(std::vector<_type_lattice_id>id, const lat_region& r
     // box->lattice_list->vac_hash.erase(box->lattice_list->vac_hash.begin());          // 删除旧键
     // box->lattice_list->vac_hash.emplace(new_key, std::move(value)); // 插入新键值对
 
+    //surface和ghost区每次都要更新
     for(int i = 0;i<sizes[4];i++){
       if(h_ghost_Hash[i] != -1 && h_ghost_Hash[i] != -2)
       // if(!box->lattice_list->more_hash.count(h_MoRe_Hash[i]))

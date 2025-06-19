@@ -1,6 +1,5 @@
 #include "gpu_simulate.h"
 #include <hiprand_kernel.h>
-
 // Global Variables
 __device__ static GPUHashSet *g_MoRe_Hash;
 __device__ static GPUHashSet *g_MoMo_Hash;
@@ -352,7 +351,7 @@ __device__ int hash_set_insert_atom_op(GPUHashSet* set, long int key) {
       
       if (current == set->empty_flag || current == set->tombstone_flag) {
           // set->keys[pos] = key; // 直接赋值
-           atomicExch(&set->keys[pos], key);
+          atomicExch(&set->keys[pos], key);
           return 1;
       }
       
@@ -737,9 +736,35 @@ __global__ void selectEventGPU(dev_Vacancy *deviceVacancyInfo, dev_nnLattice *de
           rate_accumulator += deviceVacancyInfo[i].rates[rate_index];
           if(rate_accumulator > excepted_rate) {
             if(tag == 1) {
-              d_event->from_id = deviceVacancyInfo[i].id;
-              d_event->to_id = deviceNeighbourInfo[i * NN_TOTAL + rate_index].id;
-              d_event->to_type._type = deviceNeighbourInfo[i * NN_TOTAL + rate_index].type._type;
+              d_event->from_id = deviceVacancyInfo[i].id;//这个肯定是空位
+              d_event->to_id = deviceNeighbourInfo[i * NN_TOTAL + rate_index].id;//这个得查找一下
+              d_event->to_type._type = deviceNeighbourInfo[i * NN_TOTAL + rate_index].type._type;//根据上面的id查找
+
+              
+              LatticeTypes::lat_type exchange_type = getType(d_event->to_id);
+              if(exchange_type == LatticeTypes::Re){
+                hash_set_remove_atom_op(g_Re_hash,d_event->to_id);
+                hash_set_remove_atom_op(g_V_hash,d_event->from_id);
+
+                hash_set_insert_atom_op(g_Re_hash,d_event->from_id);
+                hash_set_insert_atom_op(g_V_hash,d_event->to_id);
+              }
+              else if(exchange_type == LatticeTypes::MoRe){
+                hash_set_remove_atom_op(g_MoRe_hash,d_event->to_id);
+                hash_set_remove_atom_op(g_V_hash,d_event->from_id);
+
+                hash_set_insert_atom_op(g_MoRe_hash,d_event->from_id);
+                hash_set_insert_atom_op(g_V_hash,d_event->to_id);
+              }
+              }
+              else if(exchange_type == LatticeTypes::MoMo){
+                hash_set_remove_atom_op(g_MoMo_hash,d_event->to_id);
+                hash_set_remove_atom_op(g_V_hash,d_event->from_id);
+
+                hash_set_insert_atom_op(g_MoMo_hash,d_event->from_id);
+                hash_set_insert_atom_op(g_V_hash,d_event->to_id);
+              }
+              }
               tag = 0;
               break;
             }
@@ -761,10 +786,10 @@ void selectAndPerformEventGPU(double excepted_rand, int rank, _type_lattice_coun
   blockSize = 1;
   numBlocks = 1;
   hipLaunchKernelGGL(selectEventGPU, numBlocks, blockSize, 0, 0, 
-                     deviceVacancyInfo,
-                     deviceNeighbourInfo,
-                     d_event,
-                     currentVacCount,
+                    deviceVacancyInfo,
+                    deviceNeighbourInfo,
+                    d_event,
+                    currentVacCount,
                      *sum_rates * excepted_rand);
 
   CHECK_FOR_ERROR();
@@ -781,16 +806,13 @@ void selectAndPerformEventGPU(double excepted_rand, int rank, _type_lattice_coun
       if(ghost_region[sector_id * 7 + i].x_low <= to_x && to_x < ghost_region[sector_id * 7 + i].x_high && 
          ghost_region[sector_id * 7 + i].y_low <= to_y && to_y < ghost_region[sector_id * 7 + i].y_high && 
          ghost_region[sector_id * 7 + i].z_low <= to_z && to_z < ghost_region[sector_id * 7 + i].z_high) {
-          
-        if(!exchange_ghost[i].count(h_event->to_id)) exchange_ghost[i].emplace(h_event->to_id);
-        break;
+          if(!exchange_ghost[i].count(h_event->to_id)) exchange_ghost[i].emplace(h_event->to_id);
+          break;
       }
     }
   }
   if (lattice_list->meta.isSurfaceLat(h_event->from_id)) add_surface(h_event->from_id, exchange_surface_x, exchange_surface_y, exchange_surface_z);
   if (lattice_list->meta.isSurfaceLat(h_event->to_id)) add_surface(h_event->to_id, exchange_surface_x, exchange_surface_y, exchange_surface_z);
-
-
 }
 __global__ void setGlobalPointer(dev_meta *meta,
                             GPUHashSet *MoRe_Hash,GPUHashSet *MoMo_Hash,
@@ -1385,6 +1407,9 @@ __global__ void test_kernel(GPUHashSet* gpu_set) {
       }
   }
 }
+
+__global__ void update_hash_set(long int *ghost_list,long int *surface_list)
+    int a=0;
 void recb_solver_GPU(std::vector<long int> pair_atoms,
                     int x_low,int x_high,int y_low,int y_high,int z_low,int z_high,  
                     const unsigned int& sector_id,
@@ -1394,7 +1419,8 @@ void recb_solver_GPU(std::vector<long int> pair_atoms,
                     int *sizes
                   ){
     using namespace gpuSimulate;
-
+    //在这里调用一个单核核函数对hash_set进行更新
+  
     blockSize = 128;
     numBlocks = pair_atoms.size() / blockSize + 1;
     hipLaunchKernelGGL(calcExchangePairs_test, blockSize, numBlocks, 0, 0, 
@@ -1405,25 +1431,26 @@ void recb_solver_GPU(std::vector<long int> pair_atoms,
     );
     hipDeviceSynchronize();
 
+    
 
     //这是计算后传回的部分
-    //现在的修改是否需要传回？
+    //ghost和surface区需要传回
 
-    HANDLE_HIP(hipMemcpy(h_MoRe_Hash, MoRe_Hash->device_ptr()->keys, MoRe_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
-    HANDLE_HIP(hipMemcpy(h_MoMo_Hash, MoMo_Hash->device_ptr()->keys, MoMo_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
-    HANDLE_HIP(hipMemcpy(h_Re_Hash, Re_Hash->device_ptr()->keys, Re_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
-    HANDLE_HIP(hipMemcpy(h_V_Hash, V_Hash->device_ptr()->keys, V_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
+    // HANDLE_HIP(hipMemcpy(h_MoRe_Hash, MoRe_Hash->device_ptr()->keys, MoRe_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
+    // HANDLE_HIP(hipMemcpy(h_MoMo_Hash, MoMo_Hash->device_ptr()->keys, MoMo_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
+    // HANDLE_HIP(hipMemcpy(h_Re_Hash, Re_Hash->device_ptr()->keys, Re_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
+    // HANDLE_HIP(hipMemcpy(h_V_Hash, V_Hash->device_ptr()->keys, V_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
 
     HANDLE_HIP(hipMemcpy(h_ghost_Hash, ghost_Hash->device_ptr()->keys, ghost_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
     HANDLE_HIP(hipMemcpy(h_surface_Hash, surface_Hash->device_ptr()->keys, surface_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
     
 
-    sizes[0]= MoRe_Hash->device_ptr()->capacity;
-    sizes[1]= MoMo_Hash->device_ptr()->capacity;
-    sizes[2]= Re_Hash->device_ptr()->capacity;
-    sizes[3]= V_Hash->device_ptr()->capacity;
-    sizes[4]= ghost_Hash->device_ptr()->capacity;
-    sizes[5]= surface_Hash->device_ptr()->capacity;
+    // sizes[0]= MoRe_Hash->device_ptr()->capacity;
+    // sizes[1]= MoMo_Hash->device_ptr()->capacity;
+    // sizes[2]= Re_Hash->device_ptr()->capacity;
+    // sizes[3]= V_Hash->device_ptr()->capacity;
+    sizes[0]= ghost_Hash->device_ptr()->capacity;
+    sizes[1]= surface_Hash->device_ptr()->capacity;
 
 }
 
@@ -1460,12 +1487,12 @@ double calculate_GPU(_type_lattice_id *vac_idArray,  const _type_lattice_count& 
 
   // 调用GPU内核函数
   hipLaunchKernelGGL(calcRatesGPU, numBlocks, blockSize, 0, 0, 
-                     deviceVacancyInfo,
-                     deviceNeighbourInfo,
-                     d_sum_rates,
-                     h_config[0],
-                     h_config[1], 
-                     vac_count);
+                    deviceVacancyInfo,
+                    deviceNeighbourInfo,
+                    d_sum_rates,
+                    h_config[0],
+                    h_config[1], 
+                    vac_count);
 
   free(vac_idArray);
 
@@ -1589,10 +1616,13 @@ void gpu_final(){
   delete MoMo_Hash;
   delete Re_Hash;
   delete V_Hash;
+
   hipFree(d_Pair_Atoms);
   hipHostFree(Pair_Atoms);
+
   delete ghost_Hash;
   delete surface_Hash;
+
   delete Busy_Set;
   hipFree(d_meta);
 }
@@ -1632,9 +1662,9 @@ void exchange_lattices(dev_event* h_event){
 }
 
 void add_surface(_type_lattice_id& surface_id,
-                 std::array<std::unordered_set<_type_lattice_id>, 8>& exchange_surface_x, 
-                 std::array<std::unordered_set<_type_lattice_id>, 8>& exchange_surface_y,
-                 std::array<std::unordered_set<_type_lattice_id>, 8>& exchange_surface_z) {
+                std::array<std::unordered_set<_type_lattice_id>, 8>& exchange_surface_x, 
+                std::array<std::unordered_set<_type_lattice_id>, 8>& exchange_surface_y,
+                std::array<std::unordered_set<_type_lattice_id>, 8>& exchange_surface_z) {
   using namespace gpuSimulate;
 
   _type_lattice_id surface_x = surface_id % lattice_list->meta.size_x;
@@ -1647,7 +1677,7 @@ void add_surface(_type_lattice_id& surface_id,
   for (int sect = 0; sect < 8; sect++) {
     for (int d = 0; d < comm::DIMENSION_SIZE; d++) {
       send_regions[d] = comm::fwCommSectorSendRegion(sect, dims[d], p_domain->lattice_size_ghost,
-                                                     p_domain->local_split_coord, p_domain->local_sub_box_lattice_region);
+                                                    p_domain->local_split_coord, p_domain->local_sub_box_lattice_region);
     }
     for(int d = 0; d < comm::DIMENSION_SIZE; d++) {
       for (auto &r : send_regions[d]) {
@@ -1660,7 +1690,7 @@ void add_surface(_type_lattice_id& surface_id,
     
         if(x_low <= surface_x && surface_x < x_high && y_low <= surface_y && surface_y < y_high && z_low <= surface_z && surface_z < z_high) {
           if(d == 0){
-            if(!exchange_surface_x[sect].count(surface_id)) exchange_surface_x[sect].emplace(surface_id);
+            if(!exchange_surface_x[sect].(surface_id)) exchange_surface_x[sect].emplace(surface_id);
           } else if(d == 1) {
             if(!exchange_surface_y[sect].count(surface_id)) exchange_surface_y[sect].emplace(surface_id);
           } else {
@@ -1679,4 +1709,23 @@ void output_time() {
   // kiwi::logs::v(" ", " time_event_other : {} s. \n", time_event_other);
   // kiwi::logs::v(" ", " time_update_construct : {} s. \n", time_update_construct);
   // kiwi::logs::v(" ", " time_update_trans : {} s. \n", time_update_trans);
+}
+
+void transferBufferToGPU(ChangeLattice *buffer, int receive_len, const int dimension){
+    ChangeLattice_GPU *h_buffer;
+    hipHostMalloc((void**)&h_buffer,receive_len*sizeof(receive_len));
+    init_ChangeLattice_GPU(buffer,h_buffer,receive_len);
+
+    ChangeLattice_GPU *d_buffer
+    HANDLE_HIP(hipMalloc((void**)&d_buffer,sizeof(ChangeLattice_GPU)*receive_len));
+    HANDLE_HIP(hipMemcpy(d_buffer,&d_buffer,sizeof(ChangeLattice_GPU)*receive_len,hipMemcpyHostToDevice));
+    int blockSize = 128;
+    int blockNum = (receive_len)/buffer + 1;
+    // hipLaunchKernelGGL(calcExchangePairs_test, blockSize, numBlocks, 0, 0, 
+    //   d_Pair_Atoms,pair_atoms.size(),
+    //   d_meta,
+    //   MoRe_Hash->device_ptr(),MoMo_Hash->device_ptr(),Re_Hash->device_ptr(),V_Hash->device_ptr(),
+    //   ghost_Hash->device_ptr(),surface_Hash->device_ptr(),Busy_Set->device_ptr()
+    // );
+
 }

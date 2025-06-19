@@ -171,3 +171,13 @@ HIPHashSet::~HIPHashSet() {
         hipFree(d_table);
     }
 }
+
+
+void init_ChangeLattice_GPU(ChangeLattice *buffer,ChangeLattice_GPU *h_buffer,int len){
+    for(int i=0;i<len;i++){
+        h_buffer[i].x = buffer[i].x;
+        h_buffer[i].y = buffer[i].y;
+        h_buffer[i].z = buffer[i].z;
+        h_buffer[i].type = buffer[i].type._type;
+    }
+}

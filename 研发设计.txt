@@ -27,15 +27,22 @@
 计算顺序1->2->3
     1开始
     （2和3就不用传输哈希表了）
-    2更新哈希表
-    3更新哈希表
-    3之后通信然后更新哈希表（按需通信版本）
+    2操作哈希表
+    3操作哈希表
+    3之后通信然后
+        更新哈希表（按需通信版本）
+        GPU中的哈希表也要同步更新
 TODO：
-    1，更改哈希表创建和传输位置
-    2，写更新哈希表的逻辑
+    1，更改哈希表创建和销毁位置
+        1.1 哈希表创建位置：misa-akmc-more/gpu/gpu_simulate.hip：1533 initGpuInfo_exchange
+        1.2 哈希表销毁位置：/Users/bytedance/Desktop/misa-akmc-more/gpu/gpu_simulate.hip：1588
+        1.3 哈希表现在不用传回，只需要最后一次传回就行（TODO：misa-akmc-more/models/abvi/kmc.cpp：366）
+        1.4 surface和ghost每次都要传回
+    2，写更新哈希表的逻辑：
+
     3，间隙对的团簇问题
     4，检验大数原子操作的正确性
-    5，lamda表达式写个时间检测
+    5，lamda 时间检测
 
 
 

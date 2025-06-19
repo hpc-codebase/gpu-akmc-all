@@ -8,31 +8,31 @@
 SimSyncPacker::SimSyncPacker(LatticesList *lattice_list) : lats(lattice_list){}
 
 const unsigned long SimSyncPacker::sendLength(const std::vector<comm::Region<pack_region_type>> send_regions,
-                                              const int dimension, const int direction) {
-  unsigned long size_send = 0;
-  for (auto r : send_regions) {
+                                            const int dimension, const int direction) {
+    unsigned long size_send = 0;
+    for (auto r : send_regions) {
     size_send += r.volume();
-  }
+    }
   return BCC_DBX * size_send;
 }
 
 void SimSyncPacker::onSend(Lattice *buffer, const std::vector<comm::Region<pack_region_type>> send_regions,
-                           const unsigned long send_len, const int dimension, const int direction) {
-  unsigned long len = 0;
-  for (auto &r : send_regions) {
+                            const unsigned long send_len, const int dimension, const int direction) {
+    unsigned long len = 0;
+    for (auto &r : send_regions) {
     for (int z = r.z_low; z < r.z_high; z++) {
-      for (int y = r.y_low; y < r.y_high; y++) {
+        for (int y = r.y_low; y < r.y_high; y++) {
         for (int x = r.x_low; x < r.x_high; x++) {
           buffer[len++] = lats->_lattices[z][y][BCC_DBX * x];
           buffer[len++] = lats->_lattices[z][y][BCC_DBX * x + 1];
         }
-      }
     }
-  }
+    }
+}
 }
 
 void SimSyncPacker::onReceive(Lattice *buffer, const std::vector<comm::Region<pack_region_type>> recv_regions,
-                              const unsigned long receive_len, const int dimension, const int direction) {
+                                const unsigned long receive_len, const int dimension, const int direction) {
   unsigned long len = 0;
   for (auto &r : recv_regions) {
     for (int z = r.z_low; z < r.z_high; z++) {
@@ -188,12 +188,12 @@ void SimSyncPacker::onSend2(ChangeLattice *buffer, std::array<std::unordered_set
 }
 
 void SimSyncPacker::onReceive2(ChangeLattice *buffer, std::vector<comm::Region<pack_region_type>> recv_regions,
-                               const int receive_len, const int dimension, std::array<std::unordered_set<_type_lattice_id>, 7>& exchange_ghost,
-                               const _type_lattice_count *sub_box_lattice_size, const _type_lattice_count *neighbour_local_sub_box, unsigned int id,
-                               std::array<std::unordered_set<_type_lattice_id>, 8>& exchange_surface_x,
-                               std::array<std::unordered_set<_type_lattice_id>, 8>& exchange_surface_y, 
-                               std::array<std::unordered_set<_type_lattice_id>, 8>& exchange_surface_z,
-                               const comm::ColoredDomain *p_domain) {
+                              const int receive_len, const int dimension, std::array<std::unordered_set<_type_lattice_id>, 7>& exchange_ghost,
+                              const _type_lattice_count *sub_box_lattice_size, const _type_lattice_count *neighbour_local_sub_box, unsigned int id,
+                              std::array<std::unordered_set<_type_lattice_id>, 8>& exchange_surface_x,
+                              std::array<std::unordered_set<_type_lattice_id>, 8>& exchange_surface_y, 
+                              std::array<std::unordered_set<_type_lattice_id>, 8>& exchange_surface_z,
+                              const comm::ColoredDomain *p_domain) {
   int len = 0;
 
   _type_lattice_id x, y, z;
@@ -268,13 +268,13 @@ void SimSyncPacker::onReceive2(ChangeLattice *buffer, std::vector<comm::Region<p
           break;
       }
 
-      for (int sect = 0; sect < 8; sect++) {
+    for (int sect = 0; sect < 8; sect++) {
         for (int d = 0; d < comm::DIMENSION_SIZE; d++) {
-          send_regions[d] = comm::fwCommSectorSendRegion(sect, dims[d], p_domain->lattice_size_ghost,
-                                                         p_domain->local_split_coord, p_domain->local_sub_box_lattice_region);
+            send_regions[d] = comm::fwCommSectorSendRegion(sect, dims[d], p_domain->lattice_size_ghost,
+                                                        p_domain->local_split_coord, p_domain->local_sub_box_lattice_region);
         }
         for(int d = 0; d < comm::DIMENSION_SIZE; d++) {
-          for (auto &r : send_regions[d]) {
+            for (auto &r : send_regions[d]) {
             x_low = BCC_DBX * r.x_low;
             y_low = r.y_low;
             z_low = r.z_low;
@@ -362,7 +362,7 @@ void SimSyncPacker::onReceive2(ChangeLattice *buffer, std::vector<comm::Region<p
       for (int sect = 0; sect < 8; sect++) {
         for (int d = 0; d < comm::DIMENSION_SIZE; d++) {
           send_regions[d] = comm::fwCommSectorSendRegion(sect, dims[d], p_domain->lattice_size_ghost,
-                                                         p_domain->local_split_coord, p_domain->local_sub_box_lattice_region);
+                                                        p_domain->local_split_coord, p_domain->local_sub_box_lattice_region);
         }
         for(int d = 0; d < comm::DIMENSION_SIZE; d++) {
           for (auto &r : send_regions[d]) {
@@ -453,7 +453,7 @@ void SimSyncPacker::onReceive2(ChangeLattice *buffer, std::vector<comm::Region<p
       for (int sect = 0; sect < 8; sect++) {
         for (int d = 0; d < comm::DIMENSION_SIZE; d++) {
           send_regions[d] = comm::fwCommSectorSendRegion(sect, dims[d], p_domain->lattice_size_ghost,
-                                                         p_domain->local_split_coord, p_domain->local_sub_box_lattice_region);
+                                                        p_domain->local_split_coord, p_domain->local_sub_box_lattice_region);
         }
         for(int d = 0; d < comm::DIMENSION_SIZE; d++) {
           for (auto &r : send_regions[d]) {
@@ -524,4 +524,8 @@ void SimSyncPacker::onReceive2(ChangeLattice *buffer, std::vector<comm::Region<p
     }
   }
 
+}
+
+void SimSyncPacker::transfer_buffer_to_GPU(ChangeLattice *buffer, int receive_len, const int dimension) {
+      transferBufferToGPU(buffer, receive_len, dimension);
 }

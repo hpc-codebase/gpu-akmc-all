@@ -55,6 +55,7 @@ void add_surface(_type_lattice_id& surface_id,
                  
 void output_time();
 
+__device__ LatticeTypes::lat_type getType(const long int& id);
 // __global__ void calcExchangePairs(dev_meta meta,long int *Pair_Atoms,
 //                             HIPHashSet *MoRe_Hash,HIPHashSet *MoMo_Hash,
 //                             HIPHashSet *Re_Hash,HIPHashSet *V_Hash,

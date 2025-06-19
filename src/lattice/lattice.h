@@ -105,4 +105,11 @@ public:
   }
 };
 
+class ChangeLattice_GPU {
+  public:
+    _type_lattice_id x;
+    _type_lattice_id y;
+    _type_lattice_id z;
+    int type;
+};
 #endif // MISA_KMC_LATTICE_H
