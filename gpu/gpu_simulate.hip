@@ -239,6 +239,10 @@ __device__ int hash_set_contains(GPUHashSet* table, long int key) {
   }
 }
 
+
+__device__ int hash_set_find(long int key){
+
+}
 // 设备端插入函数（线程安全）
 __device__ int hash_set_insert(GPUHashSet* set, long int key) {
   int pos = abs(key) % set->capacity;  // 保持修正后的哈希计算
@@ -1408,8 +1412,7 @@ __global__ void test_kernel(GPUHashSet* gpu_set) {
   }
 }
 
-__global__ void update_hash_set(long int *ghost_list,long int *surface_list)
-    int a=0;
+
 void recb_solver_GPU(std::vector<long int> pair_atoms,
                     int x_low,int x_high,int y_low,int y_high,int z_low,int z_high,  
                     const unsigned int& sector_id,
@@ -1711,7 +1714,8 @@ void output_time() {
   // kiwi::logs::v(" ", " time_update_trans : {} s. \n", time_update_trans);
 }
 
-void transferBufferToGPU(ChangeLattice *buffer, int receive_len, const int dimension){
+void transferBufferToGPU(ChangeLattice *buffer, int receive_len, const int dimension,
+                          const _type_lattice_count *sub_box_lattice_size, const _type_lattice_count *neighbour_local_sub_box, unsigned int id){
     ChangeLattice_GPU *h_buffer;
     hipHostMalloc((void**)&h_buffer,receive_len*sizeof(receive_len));
     init_ChangeLattice_GPU(buffer,h_buffer,receive_len);
@@ -1721,11 +1725,170 @@ void transferBufferToGPU(ChangeLattice *buffer, int receive_len, const int dimen
     HANDLE_HIP(hipMemcpy(d_buffer,&d_buffer,sizeof(ChangeLattice_GPU)*receive_len,hipMemcpyHostToDevice));
     int blockSize = 128;
     int blockNum = (receive_len)/buffer + 1;
-    // hipLaunchKernelGGL(calcExchangePairs_test, blockSize, numBlocks, 0, 0, 
-    //   d_Pair_Atoms,pair_atoms.size(),
-    //   d_meta,
-    //   MoRe_Hash->device_ptr(),MoMo_Hash->device_ptr(),Re_Hash->device_ptr(),V_Hash->device_ptr(),
-    //   ghost_Hash->device_ptr(),surface_Hash->device_ptr(),Busy_Set->device_ptr()
-    // );
+    hipLaunchKernelGGL(calcExchangePairs_test, blockSize, numBlocks, 0, 0, 
+      d_buffer,
+      receive_len,
+      dimension,
+      id,
+      sub_box_lattice_size_0,
+      sub_box_lattice_size_1,
+      sub_box_lattice_size_2,
+      neighbour_local_sub_box_0,
+      neighbour_local_sub_box_1,
+      neighbour_local_sub_box_2
+    );
 
+}
+
+__global__ void update_hash_set(ChangeLattice_GPU *d_buffer,int receive_len,const int dimension,
+                                int sector_id,
+                                int64_t sub_box_lattice_size_0,int64_t sub_box_lattice_size_1,int64_t sub_box_lattice_size_2,
+                                int64_t neighbour_local_sub_box_0,int64_t neighbour_local_sub_box_1,int64_t neighbour_local_sub_box_2,
+){
+  int BCC_DBX = 2;
+  int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if(index >= receive_len)
+    return;
+
+  int64_t x,y,z;
+  long int id;
+  if(demension == 0){
+    for(int i=index;i<receive_len;i+=blockDim.x){
+      if(sector_id % 2 == 0){
+        d_buffer[index].x += BCC_DBX * sub_box_lattice_size_0;
+      }else{
+        d_buffer[index].x -= BCC_DBX * (sub_box_lattice_size_0 + (neighbour_local_sub_box_0 - sub_box_lattice_size_0))
+      }
+      x = d_buffer[index].x;
+      y = d_buffer[index].y;
+      z = d_buffer[index].z;
+      id = getId(x,y,z);
+
+      if(hash_set_contains(g_V_hash,id)){
+        hash_set_remove(g_V_hash,id);
+      }
+      else if(hash_set_contains(g_Re_hash,id)){
+        hash_set_remove(g_Re_hash,id);
+      }
+      else if(hash_set_contains(g_MoMo_hash,id)){
+        hash_set_remove(g_MoMo_hash,id);
+      }
+      else if(hash_set_contains(g_MoRe_hash,id)){
+        hash_set_remove(g_MoRe_hash,id);
+      }
+
+      switch(d_buffer[index].type){
+        case LatticeTypes::V:
+          hash_set_insert(g_V_hash,id);
+          break;
+        case LatticeTypes::Re:
+          hash_set_insert(g_Re_hash,id);
+          break;
+        case LatticeTypes::MoMo:
+          hash_set_insert(g_MoMo_hash,id);
+          break;
+        case LatticeTypes::MoRe:
+          hash_set_insert(g_MoRe_hash,id);
+          break;
+        case Lattice::Mo:
+          break;
+        default:
+          break;
+      }
+    }
+
+  }
+  else if(dimension == 1){
+    for(int i=index;i<receive_len;i+=blockDim.x){
+      x = d_buffer[index].x;
+      if(sector_id == 0 || sector_id == 1 || sector_id == 4 || sector_id == 5) {
+        d_buffer[index].y += sub_box_lattice_size_1;
+      } else {
+        d_buffer[index].y -= sub_box_lattice_size_1 + (neighbour_local_sub_box_1 - sub_box_lattice_size_1);
+      }
+      y = d_buffer[index].y;
+      z = d_buffer[index].z;
+
+      id = getId(x,y,z);
+
+      if(hash_set_contains(g_V_hash,id)){
+        hash_set_remove(g_V_hash,id);
+      }
+      else if(hash_set_contains(g_Re_hash,id)){
+        hash_set_remove(g_Re_hash,id);
+      }
+      else if(hash_set_contains(g_MoMo_hash,id)){
+        hash_set_remove(g_MoMo_hash,id);
+      }
+      else if(hash_set_contains(g_MoRe_hash,id)){
+        hash_set_remove(g_MoRe_hash,id);
+      }
+
+      switch(d_buffer[index].type){
+        case LatticeTypes::V:
+          hash_set_insert(g_V_hash,id);
+          break;
+        case LatticeTypes::Re:
+          hash_set_insert(g_Re_hash,id);
+          break;
+        case LatticeTypes::MoMo:
+          hash_set_insert(g_MoMo_hash,id);
+          break;
+        case LatticeTypes::MoRe:
+          hash_set_insert(g_MoRe_hash,id);
+          break;
+        case Lattice::Mo:
+          break;
+        default:
+          break;
+      }
+    }
+  }
+  else if(dimension == 2){
+    for(int i=index;i<receive_len;i+=blockDim.x){
+      x = d_buffer[index].x;
+      y = d_buffer[index].y;
+      if(sector_id < 4) {
+        d_buffer[index].z += sub_box_lattice_size_2;
+      }else{
+        d_buffer[index].z -= sub_box_lattice_size_2+ (neighbour_local_sub_box_2 - sub_box_lattice_size_2);
+      }
+      z = d_buffer[index].z;
+
+      id = getId(x,y,z);
+
+      if(hash_set_contains(g_V_hash,id)){
+        hash_set_remove(g_V_hash,id);
+      }
+      else if(hash_set_contains(g_Re_hash,id)){
+        hash_set_remove(g_Re_hash,id);
+      }
+      else if(hash_set_contains(g_MoMo_hash,id)){
+        hash_set_remove(g_MoMo_hash,id);
+      }
+      else if(hash_set_contains(g_MoRe_hash,id)){
+        hash_set_remove(g_MoRe_hash,id);
+      }
+
+      switch(d_buffer[index].type){
+        case LatticeTypes::V:
+          hash_set_insert(g_V_hash,id);
+          break;
+        case LatticeTypes::Re:
+          hash_set_insert(g_Re_hash,id);
+          break;
+        case LatticeTypes::MoMo:
+          hash_set_insert(g_MoMo_hash,id);
+          break;
+        case LatticeTypes::MoRe:
+          hash_set_insert(g_MoRe_hash,id);
+          break;
+        case Lattice::Mo:
+          break;
+        default:
+          break;
+      }
+    }
+
+  }
 }
