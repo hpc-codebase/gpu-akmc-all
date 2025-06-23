@@ -142,7 +142,7 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
 }
 
 template <typename E> int SubLattice::initGPUHashSetWrapper(ModelAdapter<E> *p_model, const type_sector_id sector_id, int sect){
-  return p->model->initGPUHashSet(p_domain->local_sector_region[sector_id],sect);
+  return p_model->initGPUHashSet(p_domain->local_sector_region[sector_id],sect);
 }
 template <typename E> double SubLattice::calcRatesWrapper(ModelAdapter<E> *p_model, const type_sector_id sector_id, int sect) {
   return p_model->calcRatesGPU(p_domain->local_sector_region[sector_id], sect);

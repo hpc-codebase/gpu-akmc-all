@@ -62,7 +62,7 @@ public:
   template <typename E> 
   void recbPerformWrapper(ModelAdapter<E> *p_model, const type_sector_id sector_id);
 
-  template <typename E> int SubLattice::initGPUHashSetWrapper(ModelAdapter<E> *p_model, const type_sector_id sector_id, int sect);
+  template <typename E> int initGPUHashSetWrapper(ModelAdapter<E> *p_model, const type_sector_id sector_id, int sect);
   /**
    * \brief calculate rates in a region
    * \tparam E type of event in kmc model.

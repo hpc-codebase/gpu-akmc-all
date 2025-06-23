@@ -173,7 +173,7 @@ HIPHashSet::~HIPHashSet() {
 }
 
 
-void init_ChangeLattice_GPU(ChangeLattice *buffer,ChangeLattice_GPU *h_buffer,int len){
+int init_ChangeLattice_GPU(ChangeLattice *buffer,ChangeLattice_GPU *h_buffer,int len){
     for(int i=0;i<len;i++){
         h_buffer[i].x = buffer[i].x;
         h_buffer[i].y = buffer[i].y;

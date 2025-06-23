@@ -78,7 +78,7 @@ _type_rate ABVIModel::calcRates(const comm::Region<comm::_type_lattice_size> reg
   sum_rates += defectGenRate();
   return sum_rates;
 }
-int ABVModel::initGPUHashSet(const comm::Region<comm::_type_lattice_size> region, int sect){
+int ABVIModel::initGPUHashSet(const comm::Region<comm::_type_lattice_size> region, int sect){
   //暂时没用到
 }
 _type_rate ABVIModel::calcRatesGPU(const comm::Region<comm::_type_lattice_size> region, int sect) {

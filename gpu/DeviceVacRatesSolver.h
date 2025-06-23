@@ -4,6 +4,7 @@
 #define __HIP_PLATFORM_AMD__   
 
 #include "../src/lattice/lattice_types.h"
+#include "../src/lattice/lattice.h"
 // #include "gpu_simulate.h"
 #include <hip/hip_runtime.h>
 #include "gpuError.h"
@@ -122,5 +123,5 @@ public:
     GPUHashSet* device_ptr() { return d_table; }
 };
 
-
+int init_ChangeLattice_GPU(ChangeLattice *buffer,ChangeLattice_GPU *h_buffer,int len);
 #endif /* DEVICEVACRATESSOVLER_H */

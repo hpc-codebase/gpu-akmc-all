@@ -56,6 +56,9 @@ void add_surface(_type_lattice_id& surface_id,
 void output_time();
 
 __device__ LatticeTypes::lat_type getType(const long int& id);
+
+void transferBufferToGPU(ChangeLattice *buffer, int receive_len, const int dimension,
+  const _type_lattice_count *sub_box_lattice_size, const _type_lattice_count *neighbour_local_sub_box, unsigned int id);
 // __global__ void calcExchangePairs(dev_meta meta,long int *Pair_Atoms,
 //                             HIPHashSet *MoRe_Hash,HIPHashSet *MoMo_Hash,
 //                             HIPHashSet *Re_Hash,HIPHashSet *V_Hash,
