@@ -1409,7 +1409,7 @@ void recb_solver_GPU(
     using namespace gpuSimulate;
     //在这里调用一个单核核函数对hash_set进行更新
   
-    printf("starting recb solver with GPU sector_id:%d,arr_size:%d\n",sector_id,arr_size);
+    // printf("starting recb solver with GPU sector_id:%d,arr_size:%d\n",sector_id,arr_size);
     blockSize = 128;
     numBlocks = arr_size / blockSize + 1;
     hipLaunchKernelGGL(calcExchangePairs, blockSize, numBlocks, 0, 0, 
@@ -1582,10 +1582,10 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
 
   //这些是对返回CPU的空间
     printf("malloc CPU hashset\n");
-    hipHostMalloc((void**)&lattice_list->h_MoRe_Hash,MoRe_Hash->device_ptr()->capacity*sizeof(long int));
-    hipHostMalloc((void**)&lattice_list->h_MoMo_Hash,MoMo_Hash->device_ptr()->capacity*sizeof(long int));
-    hipHostMalloc((void**)&lattice_list->h_Re_Hash,Re_Hash->device_ptr()->capacity*sizeof(long int));
-    hipHostMalloc((void**)&lattice_list->h_V_Hash,V_Hash->device_ptr()->capacity*sizeof(long int));
+    // hipHostMalloc((void**)&lattice_list->h_MoRe_Hash,MoRe_Hash->device_ptr()->capacity*sizeof(long int));
+    // hipHostMalloc((void**)&lattice_list->h_MoMo_Hash,MoMo_Hash->device_ptr()->capacity*sizeof(long int));
+    // hipHostMalloc((void**)&lattice_list->h_Re_Hash,Re_Hash->device_ptr()->capacity*sizeof(long int));
+    // hipHostMalloc((void**)&lattice_list->h_V_Hash,V_Hash->device_ptr()->capacity*sizeof(long int));
 
     hipHostMalloc((void**)&lattice_list->h_ghost_Hash,ghost_Hash->device_ptr()->capacity*sizeof(long int));
     hipHostMalloc((void**)&lattice_list->h_surface_Hash,surface_Hash->device_ptr()->capacity*sizeof(long int));
@@ -1618,6 +1618,8 @@ void gpu_final(){
   delete V_Hash;
 
   hipFree(d_Pair_Atoms);
+
+
   // hipHostFree(Pair_Atoms);
 
   delete ghost_Hash;

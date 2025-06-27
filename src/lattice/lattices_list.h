@@ -53,10 +53,12 @@ public:
   static const int MAX_NEI_BITS = 8;
   static const int MAX_2NN = 6;
 
-  long int *h_MoRe_Hash;
-  long int *h_MoMo_Hash;
-  long int *h_Re_Hash;
-  long int *h_V_Hash;
+  HIPHashSet *MoRe_Hash=nullptr;
+  HIPHashSet *MoMo_Hash=nullptr;
+  HIPHashSet *Re_Hash=nullptr;
+  HIPHashSet *V_Hash=nullptr;
+
+  //下面这仨暂时没用到
   long int *h_ghost_Hash;
   long int *h_surface_Hash;
   int size[6];
@@ -340,6 +342,8 @@ public:
                                        HIPHashSet *&Re_Hash,HIPHashSet *&V_Hash,
                                        HIPHashSet *&Busy_Set
                                        );
+  void update_hash_CPU(
+                                    );
   void initGpuInfo(const _type_lattice_count& total, _type_lattice_id *vac_idArray, 
                    dev_Vacancy *h_vacancy, dev_nnLattice *h_nnneighbour);
 

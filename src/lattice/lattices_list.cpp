@@ -200,6 +200,11 @@ void LatticesList::initGpuInfo_exchange(std::vector<long int> pair_atoms,
   Re_Hash = new HIPHashSet(re_hash);
   V_Hash = new HIPHashSet(vac_set);
   Busy_Set = new HIPHashSet(pair_atoms.size());
+
+  this->MoRe_Hash = MoRe_Hash;
+  this->MoMo_Hash = MoMo_Hash;
+  this->Re_Hash = Re_Hash;
+  this->V_Hash = V_Hash;
 }
 
 
@@ -367,7 +372,26 @@ void LatticesList::initGpuInfo(const _type_lattice_count& total, _type_lattice_i
     }
   }
 }
+void LatticesList::update_hash_CPU(){
+    more_hash.clear();
+    momo_hash.clear();
+    re_hash.clear();
+    vac_hash.clear();
 
+    this->MoRe_Hash->copyToHost(more_hash);
+    this->MoMo_Hash->copyToHost(momo_hash);
+    this->Re_Hash->copyToHost(re_hash);
+
+    
+
+    std::unordered_set<_type_lattice_id> tmp_vac_set;
+    this->V_Hash->copyToHost(tmp_vac_set);
+
+    for (const auto &key : tmp_vac_set) {
+        vac_hash[key] = VacancyHash{};
+    }
+  
+}
 void LatticesList::updateGpuInfo(_type_lattice_id& to_x, _type_lattice_id& to_y, _type_lattice_id& to_z, dev_nnLattice *h_nnneighbour_temp) {
 
   if(to_x % 2 == 0){

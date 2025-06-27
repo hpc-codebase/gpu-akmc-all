@@ -262,36 +262,36 @@ void ABVIModel::recb_checki(const lat_region region, const unsigned int sector_i
 }
 void ABVIModel::recb_solver(std::vector<_type_lattice_id>id, const lat_region& region, const unsigned int& sector_id) {
     // HIPHashSet *Busy_Set;
-    long int *h_ghost_Hash;
-    long int *h_surface_Hash;
+    // long int *h_ghost_Hash;
+    // long int *h_surface_Hash;
     long int arr_size = box->lattice_list->more_hash.size() + box->lattice_list->momo_hash.size();
     int sizes[2];
     recb_solver_GPU(
                   sector_id,arr_size,
-                  h_ghost_Hash,h_surface_Hash,
+                  box->lattice_list->h_ghost_Hash,box->lattice_list->h_surface_Hash,
                   sizes
                 );
     //更新哈希表现在不用更新，最后一次更新就完了
 
     //surface和ghost区每次都要更新
     for(int i = 0;i<sizes[0];i++){
-      if(h_ghost_Hash[i] != -1 && h_ghost_Hash[i] != -2)
+      if(box->lattice_list->h_ghost_Hash[i] != -1 && box->lattice_list->h_ghost_Hash[i] != -2)
       // if(!box->lattice_list->more_hash.count(h_MoRe_Hash[i]))
-        addExchange_ghost((long int)h_ghost_Hash[i],sector_id);
+        addExchange_ghost((long int)box->lattice_list->h_ghost_Hash[i],sector_id);
     }
     
 
     for(int i = 0;i<sizes[1];i++){
-      if(h_surface_Hash[i] != -1 && h_surface_Hash[i] != -2)
+      if(box->lattice_list->h_surface_Hash[i] != -1 && box->lattice_list->h_surface_Hash[i] != -2)
       // if(!box->lattice_list->more_hash.count(h_MoRe_Hash[i]))
-        addExchange_surface((long int)h_surface_Hash[i]);
+        addExchange_surface((long int)box->lattice_list->h_surface_Hash[i]);
     }
     //TODO：这里的free要放到最后
     // hipHostFree(h_ghost_Hash);
     // hipHostFree(h_surface_Hash);
 
-    memset(h_ghost_Hash, 0, sizes[0]*sizeof(long int));
-    memset(h_surface_Hash, 0, sizes[1]*sizeof(long int));
+    memset(box->lattice_list->h_ghost_Hash, 0, sizes[0]*sizeof(long int));
+    memset(box->lattice_list->h_surface_Hash, 0, sizes[1]*sizeof(long int));
     
 }
 

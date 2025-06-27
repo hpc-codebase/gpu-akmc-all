@@ -211,3 +211,40 @@ void HIPHashSet::clear() {
     // 5. 更新主机端结构体（可选，因为实际操作在设备端）
     h_table.keys = temp_keys;
 }
+
+void HIPHashSet::copyToHost(std::unordered_set<_type_lattice_id> &cpu_hash){
+
+     // 创建临时向量存储GPU数据
+    std::vector<_type_lattice_id> keys(h_table.capacity);
+    
+    // 检查GPU指针有效性
+    if (!h_table.keys) {
+        std::cerr << "Error: GPU key array pointer is null!" << std::endl;
+        return;
+    }
+    
+    // 将GPU数据复制到CPU向量
+    hipError_t err = hipMemcpy(
+        keys.data(), 
+        h_table.keys, 
+        h_table.capacity * sizeof(_type_lattice_id),
+        hipMemcpyDeviceToHost
+    );
+    
+    if (err != hipSuccess) {
+        std::cerr << "hipMemcpy failed: " << hipGetErrorString(err) << std::endl;
+        return;
+    }
+    
+    // 同步确保传输完成
+    hipDeviceSynchronize();
+    
+    // 过滤有效键并插入到CPU哈希表
+    cpu_hash.clear();
+    for (const auto& key : keys) {
+        if (key != INIT_FLAG && key != TOMBSTONE) {
+            cpu_hash.emplace(key);  // 值设为true表示存在
+        }
+    }
+    // HANDLE_HIP(hipMemcpy(h_ghost_Hash, ghost_Hash->device_ptr()->keys, ghost_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
+}

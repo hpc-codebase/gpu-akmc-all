@@ -116,6 +116,7 @@ public:
     HIPHashSet(const std::unordered_set<long int>& cpu_set,int size);
     HIPHashSet(int size);
     void clear();
+    void copyToHost(std::unordered_set<_type_lattice_id> &cpu_hash);
     ~HIPHashSet();
 
     // 返回设备端指针
