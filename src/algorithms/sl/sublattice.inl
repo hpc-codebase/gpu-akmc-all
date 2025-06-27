@@ -33,7 +33,7 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
   double time_barrier_total = 0.0;
   double local_to_total = 0.0;
 
-  // p_event_hooks->onStepFinished(0);
+  p_event_hooks->onStepFinished(0);
   if(SimulationDomain::comm_sim_pro.own_rank == 0) {
     kiwi::logs::v(" ", " rank id is : {} x dimension divided is : {} y dimension divided is : {} z dimension divided is : {}.\n", 
     SimulationDomain::comm_sim_pro.own_rank, 
