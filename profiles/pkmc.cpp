@@ -220,7 +220,25 @@ void PKMC::onStart() {
 
   // hipmalloc并且分配初始化一些常量
   //在这里对gpu内部的哈希表进行填充
-  gpu_prepare(config_v.attempt_freq, config_v.temperature, sim->box->lattice_list, sim->_p_domain);
+
+  std::vector<long int> arr;
+
+  for (const auto& it : sim->box->lattice_list->momo_hash) {
+      arr.emplace_back(it);
+  }
+
+  for (const auto& it : sim->box->lattice_list->more_hash) {
+      arr.emplace_back(it);
+  }
+
+  for (const auto& it : sim->box->lattice_list->rere_hash) {
+      arr.emplace_back(it);
+  }
+
+  SectorMeta sec_meta;
+  int sector_id = (*sec_meta.sector_itl).id;
+  
+  gpu_prepare(config_v.attempt_freq, config_v.temperature, sim->box->lattice_list, sim->_p_domain,arr);
   // gpu_prepare(config_v.attempt_freq, config_v.temperature);
 
   MEventListener m_listener(m_counter, sim->box->lattice_list->meta);

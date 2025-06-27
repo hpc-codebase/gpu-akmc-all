@@ -23,11 +23,8 @@
 #include "../src/lattice/lattice_types.h"
 #include "../src/lattice/lattice_list_meta.h"
 
-void recb_solver_GPU(std::vector<long int> pair_atoms,
-    int x_low,int x_high,int y_low,int y_high,int z_low,int z_high,  
-    const unsigned int& sector_id,
-    long int *&h_MoRe_Hash,long int *&h_MoMo_Hash,
-    long int *&h_Re_Hash,long int *&h_V_Hash,
+void recb_solver_GPU(
+    const unsigned int& sector_id,long int arr_size,
     long int *&h_ghost_Hash,long int *&h_surface_Hash,
     int *sizes
   );
@@ -44,7 +41,9 @@ void initialize_gpu(int process_rank);
 
 void gpu_final();
 
-void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain *_p_domain);
+void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain *_p_domain,
+                std::vector<long int> pair_atoms
+                );
 
 void exchange_lattices(dev_event* h_event);
 
@@ -59,6 +58,8 @@ __device__ LatticeTypes::lat_type getType(const long int& id);
 
 void transferBufferToGPU(ChangeLattice *buffer, int receive_len, const int dimension,
   const _type_lattice_count *sub_box_lattice_size, const _type_lattice_count *neighbour_local_sub_box, unsigned int id);
+void transferBufferToGPU2(ChangeLattice *buffer, int receive_len, const int dimension,
+  const _type_lattice_count *sub_box_lattice_size, const _type_lattice_count *neighbour_local_sub_box, unsigned int next_id);
 // __global__ void calcExchangePairs(dev_meta meta,long int *Pair_Atoms,
 //                             HIPHashSet *MoRe_Hash,HIPHashSet *MoMo_Hash,
 //                             HIPHashSet *Re_Hash,HIPHashSet *V_Hash,

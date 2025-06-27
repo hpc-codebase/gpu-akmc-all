@@ -109,7 +109,7 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
       ++sec_meta.sector_itl;                    // update sector id. 更新扇区id。
       nextSector();                             // some post operations after moved to next sector. 在移动到下一个子域后的一些后期操作。目前是空的
     }
-    // p_event_hooks->onStepFinished(step);
+    p_event_hooks->onStepFinished(step);
   }
   time_total_end = MPI_Wtime() - time_total_start;
 
@@ -447,6 +447,8 @@ template <class PKs, class Ins> void SubLattice::syncSimRegions(Ins &pk_inst, st
     MPI_Wait(&send_requests[dim_id], &send_statuses[dim_id]);
     MPI_Wait(&recv_requests[dim_id], &recv_statuses[dim_id]);
     //将接收到的数据存到_lattices中，也就是更新全局的lattices信息
+    // int receive_len = recv_regions[dim_id];
+    packer.transfer_buffer_to_GPU(receive_buff, num_receive[dim_id], dim_id, p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, cur_sector.id);
     packer.onReceive2(receive_buff, recv_regions[dim_id], num_receive[dim_id], dim_id, exchange_ghost, 
                       p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, cur_sector.id, 
                       exchange_surface_x, exchange_surface_y, exchange_surface_z, p_domain);
@@ -568,6 +570,9 @@ template <class PKg, class Ins> void SubLattice::syncNextSectorGhostRegions(Ins 
     // data received.
     MPI_Wait(&send_requests[dim_id], &send_statuses[dim_id]);
     MPI_Wait(&recv_requests[dim_id], &recv_statuses[dim_id]);
+
+    int receive_len = num_receive[dim_id];
+    packer.transfer_buffer_to_GPU2(receive_buff, receive_len, dim_id, p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, next_sector.id);
     packer.onReceive2(receive_buff, num_receive[dim_id], dim_id, exchange_surface_x, exchange_surface_y, exchange_surface_z,
                       p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, next_sector.id, p_domain);
 

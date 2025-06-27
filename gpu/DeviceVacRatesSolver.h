@@ -94,9 +94,7 @@ struct dev_meta{
   // global id = local id + local_base_id
   int local_base_id = 0;
 
-  _type_lattice_coord x_low,x_high; 
-  _type_lattice_coord y_low,y_high; 
-  _type_lattice_coord z_low,z_high; 
+  _type_lattice_coord regions[48];
 };
 
 struct GPUHashSet {
@@ -117,10 +115,12 @@ public:
     HIPHashSet(const std::unordered_set<long int>& cpu_set);
     HIPHashSet(const std::unordered_set<long int>& cpu_set,int size);
     HIPHashSet(int size);
+    void clear();
     ~HIPHashSet();
 
     // 返回设备端指针
     GPUHashSet* device_ptr() { return d_table; }
+    
 };
 
 int init_ChangeLattice_GPU(ChangeLattice *buffer,ChangeLattice_GPU *h_buffer,int len);

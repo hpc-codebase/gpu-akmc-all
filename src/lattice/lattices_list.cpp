@@ -148,9 +148,10 @@ Lattice *LatticesList::walk(_type_lattice_id id, const _type_lattice_offset offs
   }
   return nullptr;
 }
+
 void LatticesList::initGpuInfo_exchange(std::vector<long int> pair_atoms,
-                                       int x_low,int x_high,int y_low,int y_high,int z_low,int z_high,  
-                                       const unsigned int& sector_id,dev_meta &Meta,
+                                       std::vector<long int>region_sector,
+                                       const unsigned int& sector_id,dev_meta Meta,
                                        long int *Pair_Atoms,
                                        HIPHashSet *&MoRe_Hash,HIPHashSet *&MoMo_Hash,
                                        HIPHashSet *&Re_Hash,HIPHashSet *&V_Hash,
@@ -180,13 +181,10 @@ void LatticesList::initGpuInfo_exchange(std::vector<long int> pair_atoms,
 
   Meta.local_base_id = meta.local_base_id;
 
-  Meta.x_low = x_low;
-  Meta.y_low = y_low;
-  Meta.z_low = z_low;
-
-  Meta.x_high = x_high;
-  Meta.y_high = y_high;
-  Meta.z_high = z_high;
+  for(int i=0;i<region_sector.size();i++){
+    Meta.regions[i] = region_sector[i];
+  }
+ 
 
   for(int i=0;i<pair_atoms.size();i++){
     Pair_Atoms[i] = pair_atoms[i];

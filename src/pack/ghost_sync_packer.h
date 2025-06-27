@@ -15,6 +15,7 @@
 #include <vector>
 #include <string.h>
 #include <comm/preset/sector_forwarding_region.h>
+#include "../../gpu/gpu_simulate.h"
 /**
  * \brief ghost sync means: before performing computing on the simulation area,
  *       the ghost area must be received for its neighbor processes.
@@ -50,6 +51,9 @@ public:
                   const _type_lattice_count *sub_box_lattice_size, 
                   const _type_lattice_count *neighbour_local_sub_box, unsigned int next_id,
                   const comm::ColoredDomain *p_domain);
+
+  void transfer_buffer_to_GPU2(ChangeLattice *buffer, int receive_len, const int dimension,
+                              const _type_lattice_count *sub_box_lattice_size, const _type_lattice_count *neighbour_local_sub_box, unsigned int next_id);
 
   static inline MPI_Datatype getMPI_DataType() { return mpi_types::_mpi_type_lattice_data; }
 

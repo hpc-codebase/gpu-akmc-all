@@ -195,7 +195,7 @@ void SimSyncPacker::onReceive2(ChangeLattice *buffer, std::vector<comm::Region<p
                               std::array<std::unordered_set<_type_lattice_id>, 8>& exchange_surface_z,
                               const comm::ColoredDomain *p_domain) {
   //将buffer转移到GPU并更新
-  transfer_buffer_to_GPU(buffer, receive_len, dimension, sub_box_lattice_size, neighbour_local_sub_box, id);
+  
   
   int len = 0;
 
@@ -535,3 +535,4 @@ void SimSyncPacker::transfer_buffer_to_GPU(ChangeLattice *buffer, int receive_le
 ) {
       transferBufferToGPU(buffer, receive_len, dimension,sub_box_lattice_size,neighbour_local_sub_box,id);
 }
+

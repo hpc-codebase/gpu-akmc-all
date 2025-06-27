@@ -15,7 +15,7 @@
 #include <unordered_set>
 #include "abvi/defect/vac_hash.h"
 #include <cassert>
-#include <omp.h>
+// #include <omp.h>
 #include "../gpu/DeviceVacRatesSolver.h"
 #include "utils/simulation_domain.h"
 
@@ -333,13 +333,13 @@ public:
   // void initGpuInfo_exchange(const std::vector<_type_lattice_id> idArray,std::vector< LatticeTypes::lat_type> typeArray,const _type_lattice_count count,
   //                                         std::vector<Lattice> nn_lists1,std::vector<Lattice> nn_lists2,dev_atom *atoms);
   void initGpuInfo_exchange(std::vector<long int> pair_atoms,
-                                          int x_low,int x_high,int y_low,int y_high,int z_low,int z_high,  
-                                          const unsigned int& sector_id,dev_meta &meta,
-                                          long int *Pair_Atoms,
-                                          HIPHashSet *&MoRe_Hash,HIPHashSet *&MoMo_Hash,
-                                          HIPHashSet *&Re_Hash,HIPHashSet *&V_Hash,
-                                          HIPHashSet *&Busy_Set
-                                          );
+                                       std::vector<long int>regions,
+                                       const unsigned int& sector_id,dev_meta Meta,
+                                       long int *Pair_Atoms,
+                                       HIPHashSet *&MoRe_Hash,HIPHashSet *&MoMo_Hash,
+                                       HIPHashSet *&Re_Hash,HIPHashSet *&V_Hash,
+                                       HIPHashSet *&Busy_Set
+                                       );
   void initGpuInfo(const _type_lattice_count& total, _type_lattice_id *vac_idArray, 
                    dev_Vacancy *h_vacancy, dev_nnLattice *h_nnneighbour);
 

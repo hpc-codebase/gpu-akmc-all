@@ -40,6 +40,7 @@ public:
   void transfer_buffer_to_GPU(ChangeLattice *buffer, int receive_len, const int dimension,
                               const _type_lattice_count *sub_box_lattice_size, const _type_lattice_count *neighbour_local_sub_box, unsigned int id);
 
+
   const int sendLength2(const int dimension, std::array<std::unordered_set<_type_lattice_id>, 7>& exchange_ghost,
                         std::unordered_set<_type_lattice_id>& now_exchange_surface_x, ChangeLattice *send_count);
 

@@ -262,6 +262,11 @@ void GhostSyncPacker::onReceive(pack_date_type *buffer, const std::vector<comm::
   }
 }
 
+void GhostSyncPacker::transfer_buffer_to_GPU2(ChangeLattice *buffer, int receive_len, const int dimension,
+                                          const _type_lattice_count *sub_box_lattice_size, const _type_lattice_count *neighbour_local_sub_box, unsigned int next_id
+) {
+      transferBufferToGPU2(buffer, receive_len, dimension,sub_box_lattice_size,neighbour_local_sub_box,next_id);
+}
 
 void GhostSyncPacker::onReceive2(ChangeLattice *buffer, const int receive_len, const int dimension,
                                  std::array<std::unordered_set<_type_lattice_id>, 8>& exchange_surface_x,

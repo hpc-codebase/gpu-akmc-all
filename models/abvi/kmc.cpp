@@ -257,132 +257,41 @@ void ABVIModel::perform(const event::SelectedEvent selected, const lat_region re
 void ABVIModel::recb_checki(const lat_region region, const unsigned int sector_id) {
   // kiwi::logs::v(" ", " Before {} , momo_count : {} , more_count : {}, rere_count : {}.\n", sector_id, box->lattice_list->momo_hash.size(), box->lattice_list->more_hash.size(), box->lattice_list->rere_hash.size());
   std::vector<long int> arr;
+  recb_solver(arr, region, sector_id);
 
-  for (const auto& it : box->lattice_list->momo_hash) {
-    _type_lattice_size x = it % box->lattice_list->meta.size_x;
-    _type_lattice_size y = (it / box->lattice_list->meta.size_x) % box->lattice_list->meta.size_y;
-    _type_lattice_size z = it / (box->lattice_list->meta.size_x * box->lattice_list->meta.size_y);
-    if(2 * region.x_low <= x && x < 2 * region.x_high && region.y_low <= y && y < region.y_high && region.z_low <= z && z < region.z_high) {
-      arr.emplace_back(it);
-    }
-  }
-
-  for (const auto& it : box->lattice_list->more_hash) {
-    _type_lattice_size x = it % box->lattice_list->meta.size_x;
-    _type_lattice_size y = (it / box->lattice_list->meta.size_x) % box->lattice_list->meta.size_y;
-    _type_lattice_size z = it / (box->lattice_list->meta.size_x * box->lattice_list->meta.size_y);
-    if(2 * region.x_low <= x && x < 2 * region.x_high && region.y_low <= y && y < region.y_high && region.z_low <= z && z < region.z_high) {
-      arr.emplace_back(it);
-    }
-  }
-
-  for (const auto& it : box->lattice_list->rere_hash) {
-    _type_lattice_size x = it % box->lattice_list->meta.size_x;
-    _type_lattice_size y = (it / box->lattice_list->meta.size_x) % box->lattice_list->meta.size_y;
-    _type_lattice_size z = it / (box->lattice_list->meta.size_x * box->lattice_list->meta.size_y);
-    if(2 * region.x_low <= x && x < 2 * region.x_high && region.y_low <= y && y < region.y_high && region.z_low <= z && z < region.z_high) {
-      arr.emplace_back(it);
-    }
-  }
-    // std::cout<<"orgion more size "<<box->lattice_list->more_hash.size()<<std::endl;
-    // std::cout<<"orgion momo size "<<box->lattice_list->momo_hash.size()<<std::endl;
-    if(arr.size()!=0)
-      recb_solver(arr, region, sector_id);
-  }
-
+}
 void ABVIModel::recb_solver(std::vector<_type_lattice_id>id, const lat_region& region, const unsigned int& sector_id) {
-    dev_meta h_meta;
-    //TODO：把这块空间复用然后
-    long int *h_MoRe_Hash;
-    long int *h_MoMo_Hash;
-    long int *h_Re_Hash;
-    long int *h_V_Hash;
     // HIPHashSet *Busy_Set;
     long int *h_ghost_Hash;
     long int *h_surface_Hash;
-    int sizes[6];
-    recb_solver_GPU(id,
-                  region.x_low,region.x_high,region.y_low,region.y_high,
-                  region.z_low,region.z_high,
-                  sector_id,
-                  h_MoRe_Hash,h_MoMo_Hash,
-                  h_Re_Hash,h_V_Hash,
+    long int arr_size = box->lattice_list->more_hash.size() + box->lattice_list->momo_hash.size();
+    int sizes[2];
+    recb_solver_GPU(
+                  sector_id,arr_size,
                   h_ghost_Hash,h_surface_Hash,
                   sizes
                 );
     //更新哈希表现在不用更新，最后一次更新就完了
-    int nummomo=0;
-    int nummore=0;
-    box->lattice_list->more_hash.clear();
-    for(int i = 0;i<sizes[0];i++){
-      if(h_MoRe_Hash[i] != -1 && h_MoRe_Hash[i] != -2){
-        nummore++;
-        box->lattice_list->more_hash.emplace(h_MoRe_Hash[i]);
-        // std::cout<<h_MoRe_Hash[i]<<"\t";
-        // std::cout<<"more value "<<h_MoRe_Hash[i]<<std::endl;
-      }
-    }
-    // std::cout<<std::endl;
-    if(box->lattice_list->more_hash.size()!= nummore)
-    std::cout<<"confilct occured!\n";
-    // std::cout<<"more  size "<<box->lattice_list->more_hash.size()<<" "<<nummore<<std::endl;
-
-    box->lattice_list->momo_hash.clear();
-    for(int i = 0;i<sizes[1];i++){
-      if(h_MoMo_Hash[i] != -1 && h_MoMo_Hash[i] != -2){
-        nummomo++;
-        box->lattice_list->momo_hash.emplace(h_MoMo_Hash[i]);
-        // std::cout<<h_MoMo_Hash[i]<<"\t";
-      }
-      // if(!box->lattice_list->more_hash.count(h_MoRe_Hash[i]))
-        
-    }
-    // std::cout<<std::endl;
-    if(box->lattice_list->momo_hash.size()!= nummomo)
-    std::cout<<"confilct occured!\n";
-    // std::cout<<"momo  size "<<box->lattice_list->momo_hash.size()<<" "<<nummomo<<std::endl;
-
-    box->lattice_list->re_hash.clear();
-    for(int i = 0;i<sizes[2];i++){
-      if(h_Re_Hash[i] != -1 && h_Re_Hash[i] != -2)
-      // if(!box->lattice_list->more_hash.count(h_MoRe_Hash[i]))
-        box->lattice_list->re_hash.emplace(h_Re_Hash[i]);
-    }
-
-    // std::unordered_map<_type_lattice_id, VacancyHash> vac_hash;
-
-    // auto& old_key =  box->lattice_list->vac_hash.begin()->first;   // 原键的引用
-    // VacancyHash value = std::move( box->lattice_list->vac_hash.begin()->second); // 移动语义转移值
-    // _type_lattice_id new_key;
-    // for(int i = 0;i<sizes[3];i++){
-    //   if(h_V_Hash[i] != -1 && h_V_Hash[i] != -2){
-    //       new_key = h_V_Hash[i];
-    //       break;
-    //   }
-    // }
-    // box->lattice_list->vac_hash.erase(box->lattice_list->vac_hash.begin());          // 删除旧键
-    // box->lattice_list->vac_hash.emplace(new_key, std::move(value)); // 插入新键值对
 
     //surface和ghost区每次都要更新
-    for(int i = 0;i<sizes[4];i++){
+    for(int i = 0;i<sizes[0];i++){
       if(h_ghost_Hash[i] != -1 && h_ghost_Hash[i] != -2)
       // if(!box->lattice_list->more_hash.count(h_MoRe_Hash[i]))
         addExchange_ghost((long int)h_ghost_Hash[i],sector_id);
     }
     
 
-    for(int i = 0;i<sizes[5];i++){
+    for(int i = 0;i<sizes[1];i++){
       if(h_surface_Hash[i] != -1 && h_surface_Hash[i] != -2)
       // if(!box->lattice_list->more_hash.count(h_MoRe_Hash[i]))
         addExchange_surface((long int)h_surface_Hash[i]);
     }
     //TODO：这里的free要放到最后
-    hipHostFree(h_MoRe_Hash);
-    hipHostFree(h_MoMo_Hash);
-    hipHostFree(h_Re_Hash);
-    hipHostFree(h_V_Hash);
-    hipHostFree(h_ghost_Hash);
-    hipHostFree(h_surface_Hash);
+    // hipHostFree(h_ghost_Hash);
+    // hipHostFree(h_surface_Hash);
+
+    memset(h_ghost_Hash, 0, sizes[0]*sizeof(long int));
+    memset(h_surface_Hash, 0, sizes[1]*sizeof(long int));
     
 }
 
