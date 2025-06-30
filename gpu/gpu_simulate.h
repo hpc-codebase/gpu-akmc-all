@@ -7,6 +7,7 @@
 #include "DeviceVacRatesSolver.h"
 #include <cassert>
 #include <iostream>
+#include <hiprand/hiprand_kernel.h>
 
 #include <logs/logs.h>
 #include "../models/abvi/kmc.h"

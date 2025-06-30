@@ -336,7 +336,7 @@ public:
   //                                         std::vector<Lattice> nn_lists1,std::vector<Lattice> nn_lists2,dev_atom *atoms);
   void initGpuInfo_exchange(std::vector<long int> pair_atoms,
                                        std::vector<long int>regions,
-                                       const unsigned int& sector_id,dev_meta Meta,
+                                       const unsigned int& sector_id,dev_meta &Meta,
                                        long int *Pair_Atoms,
                                        HIPHashSet *&MoRe_Hash,HIPHashSet *&MoMo_Hash,
                                        HIPHashSet *&Re_Hash,HIPHashSet *&V_Hash,

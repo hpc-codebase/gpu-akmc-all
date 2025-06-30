@@ -151,7 +151,7 @@ Lattice *LatticesList::walk(_type_lattice_id id, const _type_lattice_offset offs
 
 void LatticesList::initGpuInfo_exchange(std::vector<long int> pair_atoms,
                                        std::vector<long int>region_sector,
-                                       const unsigned int& sector_id,dev_meta Meta,
+                                       const unsigned int& sector_id,dev_meta &Meta,
                                        long int *Pair_Atoms,
                                        HIPHashSet *&MoRe_Hash,HIPHashSet *&MoMo_Hash,
                                        HIPHashSet *&Re_Hash,HIPHashSet *&V_Hash,

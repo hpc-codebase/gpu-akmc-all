@@ -1,8 +1,10 @@
+
 #include "gpu_simulate.h"
+
 // #include <hiprand_kernel.h>
 // Global Variables
 __device__ static GPUHashSet *g_MoRe_Hash;
-__device__ static GPUHashSet *g_MoMo_Hash;
+__device__ static GPUHashSet *g_MoMo_Hash = nullptr;
 __device__ static GPUHashSet *g_Re_Hash;
 __device__ static GPUHashSet *g_V_Hash;
 __device__ static dev_meta *g_meta;
@@ -66,6 +68,154 @@ namespace gpuSimulate {
 
 
 }
+__device__ void printHashTableKernel(GPUHashSet* table, int max_entries, bool verbose) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {  // 仅由第一个线程执行
+        printf("=== GPU Hash Table Info ===\n");
+        printf("Capacity: %d\n", table->capacity);
+        printf("Empty Flag: %ld\n", table->empty_flag);
+        printf("Tombstone Flag: %ld\n", table->tombstone_flag);
+        printf("---------------------------\n");
+        
+        const int display_count = min(max_entries, table->capacity);
+        int valid_count = 0;
+        
+        for (int i = 0; i < display_count; i++) {
+            long int key = table->keys[i];
+            
+            if (key == table->empty_flag) {
+                if (verbose) printf("[%3d]: EMPTY\n", i);
+            } else if (key == table->tombstone_flag) {
+                if (verbose) printf("[%3d]: TOMBSTONE\n", i);
+            } else {
+                printf("[%3d]: %ld\n", i, key);
+                valid_count++;
+            }
+        }
+        
+        if (table->capacity > display_count) {
+            printf("... and %d more entries.\n", table->capacity - display_count);
+        }
+        
+        float load_factor = (float)valid_count / table->capacity;
+        printf("Total valid entries: %d\n", valid_count);
+        printf("Load factor: %.3f\n", load_factor);
+        printf("===========================\n");
+    }
+}
+__device__ void printDevMetaKernel(const dev_meta* meta) {
+    // 仅由第一个线程执行打印，避免输出重复
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        printf("=== dev_meta Structure Information ===\n");
+        
+        // 打印晶格尺寸信息
+        printf("Lattice Sizes:\n");
+        printf("  size_x: %lld (simulation lattice size)\n", meta->size_x);
+        printf("  size_y: %lld\n", meta->size_y);
+        printf("  size_z: %lld\n", meta->size_z);
+        
+        // 打印当前进程的模拟盒尺寸
+        printf("\nCurrent Process Box Sizes:\n");
+        printf("  box_x: %lld (2x real size for BCC structure)\n", meta->box_x);
+        printf("  box_y: %lld (same as real size)\n", meta->box_y);
+        printf("  box_z: %lld (same as real size)\n", meta->box_z);
+        
+        // 打印全局模拟盒尺寸
+        printf("\nGlobal Simulation Box Sizes:\n");
+        printf("  g_box_x: %lld\n", meta->g_box_x);
+        printf("  g_box_y: %lld\n", meta->g_box_y);
+        printf("  g_box_z: %lld\n", meta->g_box_z);
+        
+        // 打印全局坐标基准
+        printf("\nGlobal Coordinate Baselines:\n");
+        printf("  g_base_x: %lld (for global lattice ID calculation)\n", meta->g_base_x);
+        printf("  g_base_y: %lld\n", meta->g_base_y);
+        printf("  g_base_z: %lld\n", meta->g_base_z);
+        
+        // 打印幽灵晶格尺寸
+        printf("\nGhost Lattice Sizes:\n");
+        printf("  ghost_x: %lld (2x real size)\n", meta->ghost_x);
+        printf("  ghost_y: %lld\n", meta->ghost_y);
+        printf("  ghost_z: %lld\n", meta->ghost_z);
+        
+        // 打印ID相关信息
+        printf("\nID Information:\n");
+        printf("  _max_id: %d (max local lattice ID)\n", meta->_max_id);
+        printf("  local_base_id: %d (global ID = local ID + this value)\n", meta->local_base_id);
+        
+        // 打印regions数组（分维度显示）
+        printf("\nRegions Array (48 elements):\n");
+        const int regions_per_dim = 8;
+        for (int dim = 0; dim < 3; ++dim) {
+            printf("  Dimension %d Regions:\n", dim);
+            for (int region = 0; region < regions_per_dim; ++region) {
+                int index = dim * regions_per_dim + region;
+                printf("    Region %d: %lld", region, meta->regions[index]);
+                if (region % 2 == 1) {
+                    printf(" (boundary: %lld to %lld)", meta->regions[index - 1], meta->regions[index]);
+                }
+                printf("\n");
+            }
+        }
+        
+        printf("=====================================\n");
+    }
+}
+void printDevMeta(const dev_meta& meta) {
+    std::cout << "=== dev_meta Structure Information ===" << std::endl;
+    
+    // 打印晶格尺寸信息
+    std::cout << "Lattice Sizes:" << std::endl;
+    std::cout << "  size_x: " << meta.size_x << " (simulation lattice size)" << std::endl;
+    std::cout << "  size_y: " << meta.size_y << std::endl;
+    std::cout << "  size_z: " << meta.size_z << std::endl;
+    
+    // 打印当前进程的模拟盒尺寸（注意box_x的特殊说明）
+    std::cout << "\nCurrent Process Box Sizes:" << std::endl;
+    std::cout << "  box_x: " << meta.box_x << " (2x real size for BCC structure)" << std::endl;
+    std::cout << "  box_y: " << meta.box_y << " (same as real size)" << std::endl;
+    std::cout << "  box_z: " << meta.box_z << " (same as real size)" << std::endl;
+    
+    // 打印全局模拟盒尺寸
+    std::cout << "\nGlobal Simulation Box Sizes:" << std::endl;
+    std::cout << "  g_box_x: " << meta.g_box_x << std::endl;
+    std::cout << "  g_box_y: " << meta.g_box_y << std::endl;
+    std::cout << "  g_box_z: " << meta.g_box_z << std::endl;
+    
+    // 打印全局坐标基准
+    std::cout << "\nGlobal Coordinate Baselines:" << std::endl;
+    std::cout << "  g_base_x: " << meta.g_base_x << " (for global lattice ID calculation)" << std::endl;
+    std::cout << "  g_base_y: " << meta.g_base_y << std::endl;
+    std::cout << "  g_base_z: " << meta.g_base_z << std::endl;
+    
+    // 打印幽灵晶格尺寸
+    std::cout << "\nGhost Lattice Sizes:" << std::endl;
+    std::cout << "  ghost_x: " << meta.ghost_x << " (2x real size)" << std::endl;
+    std::cout << "  ghost_y: " << meta.ghost_y << std::endl;
+    std::cout << "  ghost_z: " << meta.ghost_z << std::endl;
+    
+    // 打印ID相关信息
+    std::cout << "\nID Information:" << std::endl;
+    std::cout << "  _max_id: " << meta._max_id << " (max local lattice ID)" << std::endl;
+    std::cout << "  local_base_id: " << meta.local_base_id << " (global ID = local ID + this value)" << std::endl;
+    
+    // 打印regions数组（分维度显示）
+    std::cout << "\nRegions Array (48 elements):" << std::endl;
+    const int regions_per_dim = 8;  // 假设每个维度有8个区域
+    for (int dim = 0; dim < 3; ++dim) {
+        std::cout << "  Dimension " << dim << " Regions:" << std::endl;
+        for (int region = 0; region < regions_per_dim; ++region) {
+            int index = dim * regions_per_dim + region;
+            std::cout << "    Region " << region << ": " << meta.regions[index];
+            if (region % 2 == 1) {
+                std::cout << " (boundary: " << meta.regions[index - 1] << " to " << meta.regions[index] << ")";
+            }
+            std::cout << std::endl;
+        }
+    }
+    
+    std::cout << "=====================================" << std::endl;
+}
+
 
 __device__ double _1nnMapToSwitch(bonds::PairBond::bond_type bondType){
     switch (bondType) {
@@ -802,15 +952,30 @@ __global__ void setGlobalPointer(dev_meta *meta,
                             GPUHashSet *surface_Hash,GPUHashSet *ghost_Hash,
                             long int *Pair_Atoms
                             ){
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
   g_meta = meta;
   g_MoRe_Hash = MoRe_Hash;
   g_MoMo_Hash = MoMo_Hash;
+  printf("MoMo:%p\n",MoMo_Hash);
+  printf("g_MoMo:%p\n",g_MoMo_Hash);
   g_Re_Hash = Re_Hash;
   g_V_Hash = V_Hash;
   g_Busy_Set = Busy_Set_Hash;
   g_surface_Hash = surface_Hash;
   g_ghost_Hash = ghost_Hash;
   g_Pair_Atoms = Pair_Atoms;
+  
+    // printHashTableKernel(g_MoMo_Hash,200,false);
+    printDevMetaKernel(g_meta);
+
+   
+  }
+}
+__global__ void printpointer(){
+  if(g_MoMo_Hash == nullptr)
+    printf("is a null\n");
+  else
+    printf("not null\n");
 }
 __device__ LatticeTypes::lat_type getType(const long int& id){
 
@@ -1044,16 +1209,16 @@ __device__ void getRandomLattice(const _type_lattice_coord& x, const _type_latti
 
 __device__ float randomFloat(unsigned long long seed) {
     // 获取线程的唯一标识符
-    // unsigned long long seed1 = clock();
+    unsigned long long seed1 = clock();
     
-    // // 定义并初始化hiprandState
-    // hiprandState state;
-    // hiprand_init(seed + seed1, threadIdx.x, 0, &state);  // 初始化状态
+    // 定义并初始化hiprandState
+    hiprandState state;
+    hiprand_init(seed + seed1, threadIdx.x, 0, &state);  // 初始化状态
     
-    // // 生成 0 到 1 之间的浮点数
-    // float randNum = hiprand_uniform(&state);  // 使用 hiprand_uniform 生成浮点数
-    // return randNum;
-    return 0;
+    // 生成 0 到 1 之间的浮点数
+    float randNum = hiprand_uniform(&state);  // 使用 hiprand_uniform 生成浮点数
+    return randNum;
+    // return 0;
 }
 
 
@@ -1136,6 +1301,9 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
   //   Re_Hash->capacity,V_Hash->capacity,
   //   g_ghost_Hash->capacity,g_surface_Hash->capacity,g_Busy_Set->capacity
   // );
+  if( blockIdx.x == 0 && threadIdx.x==0)
+    printHashTableKernel(g_MoMo_Hash,200,0);
+  __syncthreads();
   _type_lattice_count tid = blockIdx.x * blockDim.x + threadIdx.x;
   if(tid >= arr_size)
     return;
@@ -1149,8 +1317,28 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
   _type_lattice_size z = id / (g_meta->size_x * g_meta->size_y);
 
   //if not in this domain then skip
-  if(!(2 * g_meta->regions[sector_id * 6 + 0] <= x && x < g_meta->regions[sector_id * 6 + 1] && g_meta->regions[sector_id * 6 + 2] <= y && y < g_meta->regions[sector_id * 6 + 3] && g_meta->regions[sector_id * 6 + 4] <= z && z < g_meta->regions[sector_id * 6 + 5]))
+  if(!(2 * g_meta->regions[sector_id * 6 + 0] <= x && x < g_meta->regions[sector_id * 6 + 1] && g_meta->regions[sector_id * 6 + 2] <= y && y < g_meta->regions[sector_id * 6 + 3] && g_meta->regions[sector_id * 6 + 4] <= z && z < g_meta->regions[sector_id * 6 + 5])){
+    // 定义区域边界
+    // const long int x_min = g_meta->regions[sector_id * 6 + 0];
+    // const long int x_max = g_meta->regions[sector_id * 6 + 1];
+    // const long int y_min = g_meta->regions[sector_id * 6 + 2];
+    // const long int y_max = g_meta->regions[sector_id * 6 + 3];
+    // const long int z_min = g_meta->regions[sector_id * 6 + 4];
+    // const long int z_max = g_meta->regions[sector_id * 6 + 5];
+
+    // // 检查每个维度的边界条件
+    // bool x_ok = (2 * x_min <= x && x < x_max);
+    // bool y_ok = (y_min <= y && y < y_max);
+    // bool z_ok = (z_min <= z && z < z_max);
+
+    // // 输出调试信息
+    // printf("Sector %d: x=[%ld,%ld), y=[%ld,%ld), z=[%ld,%ld)\n", 
+    //       sector_id, x_min, x_max, y_min, y_max, z_min, z_max);
+    // printf("Point (%ld,%ld,%ld): x_ok=%d, y_ok=%d, z_ok=%d\n", 
+    //       x, y, z, x_ok, y_ok, z_ok);
     return;
+  }
+    
 
 
 
@@ -1416,6 +1604,7 @@ void recb_solver_GPU(
                       sector_id,arr_size
                       );
     hipDeviceSynchronize();
+    // std::cin.get();
 
     
 
@@ -1505,6 +1694,15 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
     region_msg[index * 6 + 3] = region_sector.y_high;
     region_msg[index * 6 + 4] = region_sector.z_low;
     region_msg[index * 6 + 5] = region_sector.z_high;
+    std::cout << "Region " << index << ":\n"
+              << "  X: [" << region_sector.x_low << ", " << region_sector.x_high << ")\n"
+              << "  Y: [" << region_sector.y_low << ", " << region_sector.y_high << ")\n"
+              << "  Z: [" << region_sector.z_low << ", " << region_sector.z_high << ")\n"
+              << "  Size: (" 
+              << (region_sector.x_high - region_sector.x_low) << ", "
+              << (region_sector.y_high - region_sector.y_low) << ", "
+              << (region_sector.z_high - region_sector.z_low) << ")\n";
+
     index++;
   }
   index = 0;
@@ -1574,11 +1772,21 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
   HANDLE_HIP(hipMemcpy(d_meta, &meta,sizeof(dev_meta), hipMemcpyHostToDevice));
   printf("init global pointer\n");
   //set hash pointer to gpu global pointer
+  // printDevMeta(meta);
   hipLaunchKernelGGL(setGlobalPointer, 1, 1, 0, 0, 
       d_meta,
       MoRe_Hash->device_ptr(),MoMo_Hash->device_ptr(),Re_Hash->device_ptr(),V_Hash->device_ptr(),Busy_Set->device_ptr(),
       surface_Hash->device_ptr(),ghost_Hash->device_ptr(),d_Pair_Atoms
   );
+
+  hipDeviceSynchronize();
+  // std::cin.get();
+  // GPUHashSet* hostPtr;
+  // hipMemcpyFromSymbol(&hostPtr, g_MoMo_Hash, sizeof(GPUHashSet*));
+  // printf("Global pointer value after synchronization: %p\n", hostPtr);
+  // hipLaunchKernelGGL(printpointer, 1, 1, 0, 0,   );
+  // system("read -p 'Press Enter to continue...' var");
+
 
   //这些是对返回CPU的空间
     printf("malloc CPU hashset\n");
