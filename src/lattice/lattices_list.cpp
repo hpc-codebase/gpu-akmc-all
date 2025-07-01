@@ -199,7 +199,7 @@ void LatticesList::initGpuInfo_exchange(std::vector<long int> pair_atoms,
   MoMo_Hash = new HIPHashSet(momo_hash,more_hash.size()+momo_hash.size());
   Re_Hash = new HIPHashSet(re_hash);
   V_Hash = new HIPHashSet(vac_set);
-  Busy_Set = new HIPHashSet(pair_atoms.size());
+  Busy_Set = new HIPHashSet(pair_atoms.size()+2);
 
   this->MoRe_Hash = MoRe_Hash;
   this->MoMo_Hash = MoMo_Hash;
