@@ -186,6 +186,16 @@ __device__ void printTopN(GPUHashSet* table, int max_entries){
         printf("===========================\n");
     }
 }
+__device__ void print_g_Pair_Atoms(int arr_size){
+  printf("==========pair_atoms============\n");
+  for(int i = 0;i<arr_size;i++){
+    printf("%ld\t",g_Pair_Atoms[i]);
+    if(i%5==0)
+      printf("\n");
+  }
+  printf("\n");
+  printf("================================\n");
+}
 void printDevMeta(const dev_meta& meta) {
     std::cout << "=== dev_meta Structure Information ===" << std::endl;
     
@@ -1397,9 +1407,40 @@ __global__ void calcExchangePairs_test(int sector_id,int arr_size){
 //   getType(id);
 //   geti
 // }
+
+__global__ void update_g_Pair_Atoms(int arr_size){
+    //这个函数用于更新g_pair_atoms
+    /*
+      一共有两种情况需要更新pair_Atoms
+      1,每次calcExchangePairs计算结束后如果发生了交换，则交换的位置要被更新到此函数中
+      2,通信过程中需要更新
+      这个函数应用于第二种更新，第一种更新直接放到函数中执行就行
+    */
+    long int index =0;
+    for(int i=0;i<arr_size;i++){
+        g_Pair_Atoms[i]=-1;
+    }
+    for(int i=0;i<g_MoMo_Hash->capacity;i++){
+      if(g_MoMo_Hash->keys[i]!=g_MoMo_Hash->empty_flag && g_MoMo_Hash->keys[i]!=g_MoMo_Hash->tombstone_flag){
+        if(index>=arr_size)
+          printf("%ld index out of range!!!\n",index);
+        g_Pair_Atoms[index++]=g_MoMo_Hash->keys[i];
+       
+      }
+    }
+
+    for(int i=0;i<g_MoRe_Hash->capacity;i++){
+      if(g_MoRe_Hash->keys[i]!=g_MoRe_Hash->empty_flag && g_MoRe_Hash->keys[i]!=g_MoRe_Hash->tombstone_flag){
+        if(index>=arr_size)
+        printf("%ld index out of range!!!\n",index);
+        g_Pair_Atoms[index++]=g_MoRe_Hash->keys[i];
+      }
+    }
+
+}
 __global__ void calcExchangePairs(int sector_id,int arr_size
 ){
-
+  // print_g_Pair_Atoms(arr_size);
   // checkpointers();
   if(g_Pair_Atoms == nullptr)
     return;
@@ -1547,20 +1588,21 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
          if (randomLattice.type == LatticeTypes::Mo) { // 交换位置
           // ret = hash_set_contains_debug(g_MoMo_Hash,id);
           // printf("%ld in MoMo is %d \n",id,ret);
-          ret = hash_set_remove(g_MoMo_Hash,id);
+          ret = hash_set_remove_atom_op(g_MoMo_Hash,id);
           num_momo--;
-          ret = hash_set_insert(g_MoMo_Hash,randomLattice.id);
+          ret = hash_set_insert_atom_op(g_MoMo_Hash,randomLattice.id);
           num_momo++;
-          
+          g_Pair_Atoms[tid] = randomLattice.id;
         }
         else if(randomLattice.type == LatticeTypes::Re) { // Re (momo 变成 mo，re 变成 more)
-          printf("%ld, %ld<--->%ld MoMo<--->Re\n",id,id,randomLattice.id);
+          // printf("%ld, %ld<--->%ld MoMo<--->Re\n",id,id,randomLattice.id);
           ret = hash_set_remove_atom_op(g_Re_Hash,randomLattice.id);
           ret = hash_set_remove_atom_op(g_MoMo_Hash,id);
           num_momo--;
           ret = hash_set_insert_atom_op(g_MoRe_Hash,randomLattice.id);
           num_more++;
           cur_type = LatticeTypes::MoRe;
+          g_Pair_Atoms[tid] = randomLattice.id;
           // printf("(%d,%d) (%d->%d)  , (%d->%d)\n",tid,loop_index,id,randomLattice.id,getType(id),getType(randomLattice.id));
         }
 
@@ -1586,6 +1628,7 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
             num_more--;
             ret  = hash_set_insert_atom_op(g_MoRe_Hash,randomLattice.id);
             num_more++;
+            g_Pair_Atoms[tid]=randomLattice.id;
             // printf("(%d,%d) (%d->%d)  , (%d->%d)\n",tid,loop_index,id,randomLattice.id,getType(id),getType(randomLattice.id));
           } else { // Re 也是交换位置
             ret = hash_set_remove_atom_op(g_Re_Hash,randomLattice.id);
@@ -1594,6 +1637,7 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
             // printf("%d:%d 2more removed:  %d ret = %d\n",tid,num_more,randomLattice.id,ret);
             ret = hash_set_insert_atom_op(g_Re_Hash,id);
             ret = hash_set_insert_atom_op(g_MoRe_Hash,randomLattice.id);
+            g_Pair_Atoms[tid]=randomLattice.id;
             // printf("(%d,%d) (%d->%d)  , (%d->%d)\n",tid,loop_index,id,randomLattice.id,getType(id),getType(randomLattice.id));
             num_more++;;
           }
@@ -1620,6 +1664,7 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
 
             ret = hash_set_insert_atom_op(g_MoRe_Hash,randomLattice.id);
             num_more++;
+            g_Pair_Atoms[tid]=randomLattice.id;
             // printf("(%d,%d) (%d->%d)  , (%d->%d)\n",tid,loop_index,id,randomLattice.id,getType(id),getType(randomLattice.id));
           } else if(randomLattice.type == LatticeTypes::Re) { // Re 也是交换位置
             ret = hash_set_remove_atom_op(g_Re_Hash,randomLattice.id);
@@ -1628,6 +1673,7 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
             ret = hash_set_insert_atom_op(g_Re_Hash,id);
             ret = hash_set_insert_atom_op(g_MoRe_Hash,randomLattice.id);
             num_more++;
+            g_Pair_Atoms[tid]=randomLattice.id;
             // printf("(%d,%d) (%d->%d)  , (%d->%d)\n",tid,loop_index,id,randomLattice.id,getType(id),getType(randomLattice.id));
           }
           x = temp_x;
@@ -1695,7 +1741,10 @@ void recb_solver_GPU(
                   ){
     using namespace gpuSimulate;
     //在这里调用一个单核核函数对hash_set进行更新
-  
+    // printf("current arr size is %ld",arr_size);
+    hipLaunchKernelGGL(update_g_Pair_Atoms, 1, 1, 0, 0, 
+                      arr_size
+                      );
     // printf("starting recb solver with GPU sector_id:%d,arr_size:%d\n",sector_id,arr_size);
     blockSize = 128;
     numBlocks = arr_size / blockSize + 1;
@@ -1704,11 +1753,6 @@ void recb_solver_GPU(
                       sector_id,arr_size
                       );
     hipDeviceSynchronize();
-    hipLaunchKernelGGL(calcExchangePairs, 1, 1, 0, 0, 
-                      sector_id,arr_size
-                      );
-    // std::cin.get();
-
     
 
     //这是计算后传回的部分
@@ -2165,6 +2209,8 @@ __global__ void update_hash_set(ChangeLattice_GPU *d_buffer,int receive_len,cons
     }
 
   }
+
+  
 }
 __global__ void update_hash_set2(ChangeLattice_GPU *d_buffer,int receive_len,const int dimension,
                                 int next_id,
