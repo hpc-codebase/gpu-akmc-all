@@ -557,3 +557,38 @@ LatticeTypes::lat_type LatticesList::getType(const _type_lattice_id& latti_id) {
   else if (rere_hash.count(latti_id)) return LatticeTypes::ReRe;
   else                                return LatticeTypes::Mo;
 }
+LatticeTypes::lat_type LatticesList::setType(const _type_lattice_id& latti_id,long int new_type){
+  long int current_Type = getType(latti_id);
+  VacancyHash vachash;
+  switch(current_Type){
+    case LatticeTypes::V:
+      break;
+    case LatticeTypes::Re:
+      re_hash.erase(latti_id);
+      break;
+    case  LatticeTypes::MoMo:
+      momo_hash.erase(latti_id);
+      break;
+    case  LatticeTypes::MoRe:
+      more_hash.erase(latti_id);
+      break;
+    case LatticeTypes::Mo:
+      break;
+  }
+  switch(new_type){
+    case LatticeTypes::V:
+      break;
+    case LatticeTypes::Re:
+      re_hash.emplace(latti_id);
+      break;
+    case  LatticeTypes::MoMo:
+      momo_hash.emplace(latti_id);
+      break;
+    case  LatticeTypes::MoRe:
+      more_hash.emplace(latti_id);
+      break;
+    case LatticeTypes::Mo:
+      break;
+  }
+}
+

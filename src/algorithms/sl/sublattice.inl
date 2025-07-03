@@ -100,15 +100,18 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
 
       time_start = MPI_Wtime();
       syncSimRegions<PKs>(pk_inst, p_model->exchange_ghost, p_model->exchange_surface_x, p_model->exchange_surface_y, p_model->exchange_surface_z);
+      // printf("finish surface sync\n");
       //syncSimGohstRegionsCombine<PKs>(pk_inst, p_model->exchange_ghost, p_model->exchange_surface_x, p_model->exchange_surface_y, p_model->exchange_surface_z);
       syncNextSectorGhostRegions<PKg>(pk_inst, p_model->exchange_surface_x, p_model->exchange_surface_y, p_model->exchange_surface_z); // communicate ghost area data of next sector in
                                                 // current process. 通信当前进程中下一个扇区的重影区域数据。
+      // printf("finish ghost sync\n");
       time_end = MPI_Wtime() - time_start;
       time_commu_total += time_end;
 
       ++sec_meta.sector_itl;                    // update sector id. 更新扇区id。
       nextSector();                             // some post operations after moved to next sector. 在移动到下一个子域后的一些后期操作。目前是空的
     }
+    printf("step %d finished",step);
     p_event_hooks->onStepFinished(step);
   }
   time_total_end = MPI_Wtime() - time_total_start;
@@ -335,7 +338,7 @@ template <class PKs, class Ins> void SubLattice::syncSimRegions(Ins &pk_inst, st
   // call ssfdCommRecvDirs for send dirs and call ssfdCommSendDirs for receive
   // 调用ssfdCommRecvDirs获取发送指令，调用ssfdCommeSendDirs获取接收指令
   // dirs.
-
+  // printf("111111111\n");
   // 实际上就是把0~7的数转化为二级制的形式，如sector_id为5，则return一个{1，0，1}
   const std::array<unsigned int, comm::DIMENSION_SIZE> send_dirs = ssfdCommRecvDirs(cur_sector.id);
   // 实际上就是把7-(0~7)的数转化为二级制的形式，如sector_id为5，则return一个{0，1，0}
@@ -384,6 +387,7 @@ template <class PKs, class Ins> void SubLattice::syncSimRegions(Ins &pk_inst, st
   // comm::singleSideForwardComm<typename PKs::pack_date_type, typename PKs::pack_region_type, true>(
   //     &packer, SimulationDomain::comm_sim_pro, packer.getMPI_DataType(), send_regions, recv_regions, ranks_send,
   //     ranks_recv);
+  // printf("22222222222\n");
   ChangeLattice send_count;
   const MPI_Datatype data_type = packer.getMPI_DataTypeChange();
   int num_send[comm::DIMENSION_SIZE];
@@ -396,7 +400,7 @@ template <class PKs, class Ins> void SubLattice::syncSimRegions(Ins &pk_inst, st
   MPI_Status recv_statuses[comm::DIMENSION_SIZE];
   MPI_Request send_requests[comm::DIMENSION_SIZE];
   MPI_Request recv_requests[comm::DIMENSION_SIZE];
-
+  // printf("3333333333\n");
   for (int d = 0; d < comm::DIMENSION_SIZE; d++) {
     int dim_id = d;
     // 里的通信顺序是从Z到Y，以及X。
@@ -411,6 +415,7 @@ template <class PKs, class Ins> void SubLattice::syncSimRegions(Ins &pk_inst, st
     //if(num_send[dim_id] > 0){
     send_buff = new ChangeLattice[num_send[dim_id]];
     // 将这次要发送的数据复制到send_buff
+    // printf("d:%d 3333333333\n",d);
     packer.onSend2(send_buff, exchange_ghost, dim_id, exchange_surface_x[next_sector.id], &send_count);
 
     // send and received data.
@@ -423,6 +428,7 @@ template <class PKs, class Ins> void SubLattice::syncSimRegions(Ins &pk_inst, st
     // MPI_Barrier(SimulationDomain::comm_sim_pro.comm);
     // kiwi::logs::v(" ", "1111111111111111111111111111 .\n" );
     int numrecv = 0;
+    // printf("d:%d 44444444\n",d);
     // int flag;
     // test the status of neighbor process. 测试邻居进程的状态
     //MPI_Iprobe(ranks_recv[dim_id], SingleSideForwardingTag2, SimulationDomain::comm_sim_pro.comm, &flag, &status);
@@ -432,6 +438,7 @@ template <class PKs, class Ins> void SubLattice::syncSimRegions(Ins &pk_inst, st
     //assert(status.MPI_TAG == SingleSideForwardingTag2);
     // test the data length to be received. 获取要接收的数据的量的大小
     //if(flag){
+    // printf("d:%d 5555555555\n",d);
     MPI_Get_count(&status, data_type, &numrecv);
     // initialize receive buffer via receiving size.
     // the receiving length is get bt MPI_Probe from its neighbour process.
@@ -439,6 +446,7 @@ template <class PKs, class Ins> void SubLattice::syncSimRegions(Ins &pk_inst, st
     //kiwi::logs::v(" ", "2222222222222222222222222222222 .\n");
     //if(numrecv > 0){
     // 从recv_ranks[dim_id]进程接收数据到receive_buff中
+    // printf("d:%d 666666666\n",d);
     receive_buff = new ChangeLattice[numrecv];
     num_receive[dim_id] = numrecv;
     MPI_Irecv(receive_buff, numrecv, data_type, ranks_recv[dim_id],
@@ -448,7 +456,9 @@ template <class PKs, class Ins> void SubLattice::syncSimRegions(Ins &pk_inst, st
     MPI_Wait(&recv_requests[dim_id], &recv_statuses[dim_id]);
     //将接收到的数据存到_lattices中，也就是更新全局的lattices信息
     // int receive_len = recv_regions[dim_id];
-    packer.transfer_buffer_to_GPU(receive_buff, num_receive[dim_id], dim_id, p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, cur_sector.id);
+    // printf("start transfer\n");
+    // if(num_receive[dim_id] -1 > 0)
+    packer.transfer_buffer_to_GPU(receive_buff, num_receive[dim_id]-1, dim_id, p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, cur_sector.id);
     packer.onReceive2(receive_buff, recv_regions[dim_id], num_receive[dim_id], dim_id, exchange_ghost, 
                       p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, cur_sector.id, 
                       exchange_surface_x, exchange_surface_y, exchange_surface_z, p_domain);
@@ -572,9 +582,11 @@ template <class PKg, class Ins> void SubLattice::syncNextSectorGhostRegions(Ins 
     MPI_Wait(&recv_requests[dim_id], &recv_statuses[dim_id]);
 
     int receive_len = num_receive[dim_id];
-    packer.transfer_buffer_to_GPU2(receive_buff, receive_len, dim_id, p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, next_sector.id);
+
+      // printf("rece !!! %ld\n",num_receive[dim_id]);
+      packer.transfer_buffer_to_GPU2(receive_buff, receive_len, dim_id, p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, next_sector.id);
     packer.onReceive2(receive_buff, num_receive[dim_id], dim_id, exchange_surface_x, exchange_surface_y, exchange_surface_z,
-                      p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, next_sector.id, p_domain);
+                p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, next_sector.id, p_domain);
 
     //在这里把receive_buff传给GPU
     //然后让gpu去更新gpu端的hashset

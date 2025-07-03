@@ -61,6 +61,8 @@ public:
   //下面这仨暂时没用到
   long int *h_ghost_Hash;
   long int *h_surface_Hash;
+  long int *h_ghost_Hash_type;
+  long int *h_surface_Hash_type;
   int size[6];
 
 
@@ -350,7 +352,7 @@ public:
   void updateGpuInfo(_type_lattice_id& to_x, _type_lattice_id& to_y, _type_lattice_id& to_z, dev_nnLattice *h_nnneighbour_temp);
 
   LatticeTypes::lat_type getType(const _type_lattice_id& latti_id);
-
+  LatticeTypes::lat_type setType(const _type_lattice_id& latti_id,long int type);
 public:
   /*!
    * \brief the 3d array of all lattices.

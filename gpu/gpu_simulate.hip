@@ -12,6 +12,7 @@ __device__ static GPUHashSet *g_Busy_Set;
 __device__ static GPUHashSet *g_surface_Hash;
 __device__ static GPUHashSet *g_ghost_Hash;
 __device__ static long int  *g_Pair_Atoms;
+static long int arr_size;
 
 //这些都是GPU内部的全局变量
 namespace gpuSimulate {
@@ -102,6 +103,16 @@ __device__ void printHashTableKernel(GPUHashSet* table, int max_entries, bool ve
         printf("===========================\n");
     }
 }
+__global__ void print_pair_atoms(int arr_size){
+  printf("===========start print pair==========");
+  for(int i=0;i<arr_size * 2;i++){
+    printf("%lld\t",g_Pair_Atoms[i]);
+    if(i%10 == 0)
+      printf("\n");
+  }
+  
+  printf("===========end print pair============");
+}
 __device__ void printDevMetaKernel(const dev_meta* meta) {
     // 仅由第一个线程执行打印，避免输出重复
     if (threadIdx.x == 0 && blockIdx.x == 0) {
@@ -186,7 +197,7 @@ __device__ void printTopN(GPUHashSet* table, int max_entries){
         printf("===========================\n");
     }
 }
-__device__ void print_g_Pair_Atoms(int arr_size){
+__global__ void print_g_Pair_Atoms(int arr_size){
   printf("==========pair_atoms============\n");
   for(int i = 0;i<arr_size;i++){
     printf("%ld\t",g_Pair_Atoms[i]);
@@ -314,6 +325,57 @@ __device__ void checkpointers() {
     } else {
         printf("g_Pair_Atoms is valid, address: 0x%p\n", (void*)g_Pair_Atoms);
     }
+}
+
+__global__ void print_surface_and_ghost(){
+  int g=0,s=0;
+  long int x=0,y=0,z=0;
+ 
+
+  printf("++++++++++++s+++++++++++++++++++++\n");
+  for(int i=0;i<g_surface_Hash->capacity;i++)
+    if(g_surface_Hash->keys[i]!=-1 && g_surface_Hash->keys[i]!=-1){
+      long int id = g_surface_Hash->keys[i];
+      x = id%g_meta->size_x;
+      y = (id / g_meta->size_x) % g_meta->size_y;
+      z = id / (g_meta->size_x * g_meta->size_y);
+      printf("s(%ld,%ld)-(%ld,%ld,%ld)\t",g_surface_Hash->keys[i],getType(g_surface_Hash->keys[i]),x,y,z);
+      s++;
+      if(s%5==0)
+      printf("\n");
+    }
+  printf("\n");
+  printf("sssssssssssssss\n");
+  for(int i=0;i<g_ghost_Hash->capacity;i++)
+    if(g_ghost_Hash->keys[i]!=-1 && g_ghost_Hash->keys[i]!=-1){
+      long int id = g_ghost_Hash->keys[i];
+      x = id%g_meta->size_x;
+      y = (id / g_meta->size_x) % g_meta->size_y;
+      z = id / (g_meta->size_x * g_meta->size_y);
+      printf("g(%ld,%ld)-(%ld,%ld,%ld)\t",g_ghost_Hash->keys[i],getType(g_ghost_Hash->keys[i]),x,y,z);
+      g++;
+      if(g%5==0)
+      printf("\n");
+    }
+    printf("\n");
+}
+__global__ void print_Hash_and_Pair(int arr_size,int flag){
+  long int pair_cnt=0,momo=0,more=0;
+  for(int i=0;i<arr_size * 2;i++)
+    if(g_Pair_Atoms[i]!=-1)
+      pair_cnt++;
+  for(int i=0;i<g_MoMo_Hash->capacity;i++)
+    if(g_MoMo_Hash->keys[i]!=-1 && g_MoMo_Hash->keys[i]!=-2)
+      momo++;
+  for(int i=0;i<g_MoRe_Hash->capacity;i++)
+    if(g_MoRe_Hash->keys[i]!=-1 && g_MoRe_Hash->keys[i]!=-2)
+      more++;
+
+  printf("==current hash and pairs========\n");
+  if(flag == 1)
+    printf("after:");
+  printf("arr_size:%ld,pair: %ld\t momo %ld\t more %ld\n",arr_size,pair_cnt,momo,more);
+  printf("==============================\n");
 }
 
 __device__ double _1nnMapToSwitch(bonds::PairBond::bond_type bondType){
@@ -472,6 +534,7 @@ __device__ int hash_set_contains_debug(GPUHashSet* table, long int key) {
   return 0;
 }
 
+
 // 设备端存在性检查函数
 __device__ int hash_set_contains(GPUHashSet* table, long int key) {
   int i=0;
@@ -482,12 +545,14 @@ __device__ int hash_set_contains(GPUHashSet* table, long int key) {
   while (true) {
       long int current = keys[index];  // 使用 volatile 方式读取 key
 
-      if (current == key) {
-          return 1;  // 找到 key
-      }
       if (current == table->empty_flag) {
           return 0;  // 空槽，说明 key 不存在
       }
+
+      if (current == key) {
+          return 1;  // 找到 key
+      }
+      
 
       index = (index + 1) % table->capacity;
       if (index == original_index) {
@@ -1069,7 +1134,7 @@ __global__ void setGlobalPointer(dev_meta *meta,
   g_Pair_Atoms = Pair_Atoms;
   
     // printHashTableKernel(g_MoMo_Hash,200,false);
-    printDevMetaKernel(g_meta);
+    // printDevMetaKernel(g_meta);
 
    
   }
@@ -1408,7 +1473,7 @@ __global__ void calcExchangePairs_test(int sector_id,int arr_size){
 //   geti
 // }
 
-__global__ void update_g_Pair_Atoms(int arr_size){
+__global__ void update_Pair_Atoms(int arr_size){
     //这个函数用于更新g_pair_atoms
     /*
       一共有两种情况需要更新pair_Atoms
@@ -1416,26 +1481,25 @@ __global__ void update_g_Pair_Atoms(int arr_size){
       2,通信过程中需要更新
       这个函数应用于第二种更新，第一种更新直接放到函数中执行就行
     */
-    long int index =0;
-    for(int i=0;i<arr_size;i++){
-        g_Pair_Atoms[i]=-1;
-    }
+    //todo 更新函数有问题
+    int index = 0;
+    long int momo,more=0;
     for(int i=0;i<g_MoMo_Hash->capacity;i++){
       if(g_MoMo_Hash->keys[i]!=g_MoMo_Hash->empty_flag && g_MoMo_Hash->keys[i]!=g_MoMo_Hash->tombstone_flag){
-        if(index>=arr_size)
-          printf("%ld index out of range!!!\n",index);
         g_Pair_Atoms[index++]=g_MoMo_Hash->keys[i];
-       
+        momo++;
       }
     }
 
     for(int i=0;i<g_MoRe_Hash->capacity;i++){
       if(g_MoRe_Hash->keys[i]!=g_MoRe_Hash->empty_flag && g_MoRe_Hash->keys[i]!=g_MoRe_Hash->tombstone_flag){
-        if(index>=arr_size)
-        printf("%ld index out of range!!!\n",index);
         g_Pair_Atoms[index++]=g_MoRe_Hash->keys[i];
+        more++;
       }
     }
+    printf("momo num is :%ld\t",momo);
+    printf("more num is:%ld\n",more);
+    printf("AFTER UPDATE atom_num is:%ld\n",index);
 
 }
 __global__ void calcExchangePairs(int sector_id,int arr_size
@@ -1451,8 +1515,10 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
   //   return;
   
   _type_lattice_id id = g_Pair_Atoms[tid];
+  if(id == -1)
+    return;
   LatticeTypes::lat_type cur_type = getType(id);
-  // printf("cur_type is %d",cur_type);
+  printf("id %ld, cur_type is %d\n",id,cur_type);
   _type_lattice_size x = id%g_meta->size_x;
   _type_lattice_size y = (id / g_meta->size_x) % g_meta->size_y;
   _type_lattice_size z = id / (g_meta->size_x * g_meta->size_y);
@@ -1481,10 +1547,10 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
     return;
   }
     // printf("cal atom msg:\n");s
-    printf("Sector %d: x=[%ld,%ld), y=[%ld,%ld), z=[%ld,%ld)\t", 
-          sector_id, x_min, x_max, y_min, y_max, z_min, z_max);
-    printf("Point %ld:(%ld,%ld,%ld): \n", id,
-          x, y, z);
+    // printf("Sector %d: x=[%ld,%ld), y=[%ld,%ld), z=[%ld,%ld)\t", 
+    //       sector_id, x_min, x_max, y_min, y_max, z_min, z_max);
+    // printf("Point %ld:(%ld,%ld,%ld): %d \n", id,
+    //       x, y, z,getType(id));
 
 
   
@@ -1516,6 +1582,8 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
 
     // printf("id:%ld enter loop:%d\n",id,loop_index);
     loop_index++;
+    if(loop_index >=10)
+      break;
 
     id = getId(x,y,z);
 
@@ -1533,7 +1601,8 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
     numSIA = 0;
     get1nn(x,y,z,nn_list);
     for(int i=0;i < LatticesList::MAX_1NN;i++){
-      if(nn_list[i].type == LatticeTypes::MoMo || nn_list[i].type == LatticeTypes::MoRe)numSIA++;
+      if(nn_list[i].type == LatticeTypes::MoMo || nn_list[i].type == LatticeTypes::MoRe)
+        numSIA++;
     }
 
     if(numSIA >= 2) {
@@ -1560,7 +1629,7 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
     int randomNumber = (sum % 14 + 14) % 14;  // 确保结果在0-13之间
 
     if(randomNumber < 0 || randomNumber >= 14){
-        printf("%d : random num generate error %d\n",tid,randomNumber);
+        printf("%ld : random num generate error %ld\n",tid,randomNumber);
       }
     getRandomLattice(x,y,z,temp_x,temp_y,temp_z,randomNumber);
     randomLattice.id = getId(temp_x,temp_y,temp_z);
@@ -1579,7 +1648,7 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
     randomLattice.type = getType(randomLattice.id);
     LatticeTypes::lat_type rantype = randomLattice.type;
 
-    printf("%ld->%ld,\t%d->%d\n",id,randomLattice.id,cur_type,randomLattice.type);
+    printf("%ld --- %ld->%ld,\t%d->%d\n",tid,id,randomLattice.id,cur_type,randomLattice.type);
 
 
     if(randomLattice.type == LatticeTypes::Mo || randomLattice.type == LatticeTypes::Re){
@@ -1592,7 +1661,7 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
           num_momo--;
           ret = hash_set_insert_atom_op(g_MoMo_Hash,randomLattice.id);
           num_momo++;
-          g_Pair_Atoms[tid] = randomLattice.id;
+          // g_Pair_Atoms[tid] = randomLattice.id;
         }
         else if(randomLattice.type == LatticeTypes::Re) { // Re (momo 变成 mo，re 变成 more)
           // printf("%ld, %ld<--->%ld MoMo<--->Re\n",id,id,randomLattice.id);
@@ -1600,9 +1669,11 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
           ret = hash_set_remove_atom_op(g_MoMo_Hash,id);
           num_momo--;
           ret = hash_set_insert_atom_op(g_MoRe_Hash,randomLattice.id);
+          if(ret != 1)
+            printf("MoRe insert failed\n");
           num_more++;
           cur_type = LatticeTypes::MoRe;
-          g_Pair_Atoms[tid] = randomLattice.id;
+          //g_Pair_Atoms[tid] = randomLattice.id;
           // printf("(%d,%d) (%d->%d)  , (%d->%d)\n",tid,loop_index,id,randomLattice.id,getType(id),getType(randomLattice.id));
         }
 
@@ -1628,7 +1699,7 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
             num_more--;
             ret  = hash_set_insert_atom_op(g_MoRe_Hash,randomLattice.id);
             num_more++;
-            g_Pair_Atoms[tid]=randomLattice.id;
+            // g_Pair_Atoms[tid]=randomLattice.id;
             // printf("(%d,%d) (%d->%d)  , (%d->%d)\n",tid,loop_index,id,randomLattice.id,getType(id),getType(randomLattice.id));
           } else { // Re 也是交换位置
             ret = hash_set_remove_atom_op(g_Re_Hash,randomLattice.id);
@@ -1637,7 +1708,7 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
             // printf("%d:%d 2more removed:  %d ret = %d\n",tid,num_more,randomLattice.id,ret);
             ret = hash_set_insert_atom_op(g_Re_Hash,id);
             ret = hash_set_insert_atom_op(g_MoRe_Hash,randomLattice.id);
-            g_Pair_Atoms[tid]=randomLattice.id;
+            // g_Pair_Atoms[tid]=randomLattice.id;
             // printf("(%d,%d) (%d->%d)  , (%d->%d)\n",tid,loop_index,id,randomLattice.id,getType(id),getType(randomLattice.id));
             num_more++;;
           }
@@ -1664,7 +1735,7 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
 
             ret = hash_set_insert_atom_op(g_MoRe_Hash,randomLattice.id);
             num_more++;
-            g_Pair_Atoms[tid]=randomLattice.id;
+            // g_Pair_Atoms[tid]=randomLattice.id;
             // printf("(%d,%d) (%d->%d)  , (%d->%d)\n",tid,loop_index,id,randomLattice.id,getType(id),getType(randomLattice.id));
           } else if(randomLattice.type == LatticeTypes::Re) { // Re 也是交换位置
             ret = hash_set_remove_atom_op(g_Re_Hash,randomLattice.id);
@@ -1673,7 +1744,7 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
             ret = hash_set_insert_atom_op(g_Re_Hash,id);
             ret = hash_set_insert_atom_op(g_MoRe_Hash,randomLattice.id);
             num_more++;
-            g_Pair_Atoms[tid]=randomLattice.id;
+            // g_Pair_Atoms[tid]=randomLattice.id;
             // printf("(%d,%d) (%d->%d)  , (%d->%d)\n",tid,loop_index,id,randomLattice.id,getType(id),getType(randomLattice.id));
           }
           x = temp_x;
@@ -1708,7 +1779,7 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
       if(ret == 1)
         busy--;
       continue;
-    }
+      }
     }  
     ret = hash_set_remove_atom_op(g_Busy_Set,randomLattice.id);
     if(ret == 1)
@@ -1733,38 +1804,117 @@ __global__ void test_kernel(GPUHashSet* gpu_set) {
   }
 }
 
-
+__global__ void get_surface_and_ghost_type(long int *surface_type,long int *ghost_type){
+      _type_lattice_count tid = blockIdx.x * blockDim.x + threadIdx.x;
+      if(tid == 0){
+        // printf("tp capacity:%ld\n",g_surface_Hash->capacity);
+        for(int i=0;i<g_surface_Hash->capacity;i++){
+          if(g_surface_Hash->keys[i] != -1 && g_surface_Hash->keys[i] != -2){
+            // printf("tp2 %ld\t", g_surface_Hash->keys[i]);
+            surface_type[i] = getType(g_surface_Hash->keys[i]);
+            // printf("tp %ld\t", getType(g_surface_Hash->keys[i]));
+          }
+            
+        }
+         printf("\n");
+      }else if(tid == 1){
+        // printf("tp capacity:sld\n",g_ghost_Hash->capacity);
+        for(int i=0;i<g_ghost_Hash->capacity;i++){
+          if(g_ghost_Hash->keys[i] != -1 && g_ghost_Hash->keys[i] != -2){
+            // printf("tp3 %ld\t", g_ghost_Hash->keys[i]);
+            ghost_type[i] = getType(g_ghost_Hash->keys[i]);
+            // printf("tp1 %ld\t", getType(g_ghost_Hash->keys[i]));
+          }
+            
+        }
+        printf("\n");
+    }
+}
+__global__ void get_surface_and_ghost_type1(long int *surface_type, long int *ghost_type) {
+    _type_lattice_count tid = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // 处理surface数据
+    if (tid < g_surface_Hash->capacity) {
+        if (g_surface_Hash->keys[tid] != -1 && g_surface_Hash->keys[tid] != -2) {
+            surface_type[tid] = getType(g_surface_Hash->keys[tid]);
+        }
+    }
+    
+    // 处理ghost数据（需要调整索引计算）
+    _type_lattice_count ghost_tid = tid - g_surface_Hash->capacity;
+    if (tid >= g_surface_Hash->capacity && ghost_tid < g_ghost_Hash->capacity) {
+        if (g_ghost_Hash->keys[ghost_tid] != -1 && g_ghost_Hash->keys[ghost_tid] != -2) {
+            ghost_type[ghost_tid] = getType(g_ghost_Hash->keys[ghost_tid]);
+        }
+    }
+}
 void recb_solver_GPU(
                     const unsigned int& sector_id,long int arr_size,
                     long int *&h_ghost_Hash,long int *&h_surface_Hash,
+                    long int *&h_ghost_type, long int *&h_surface_type,
                     int *sizes
                   ){
     using namespace gpuSimulate;
     //在这里调用一个单核核函数对hash_set进行更新
     // printf("current arr size is %ld",arr_size);
-    hipLaunchKernelGGL(update_g_Pair_Atoms, 1, 1, 0, 0, 
-                      arr_size
-                      );
+    // HANDLE_HIP(hipMalloc((void**)&Pair_Atoms,arr_size*sizeof(long int)*2));
+    // HANDLE_HIP(hipMemset(Pair_Atoms, -1,arr_size * sizeof(long int) * 2));
+   
     // printf("starting recb solver with GPU sector_id:%d,arr_size:%d\n",sector_id,arr_size);
     blockSize = 128;
     numBlocks = arr_size / blockSize + 1;
     //DEBUG的时候改成单线程，到时候记得改回去
-    hipLaunchKernelGGL(calcExchangePairs, 1, 1, 0, 0, 
+    // print_Hash_and_Pair
+    // printf("+++++++++++++++++++++++++++++++++++++++++++++++++\n"); 
+    printf("arr size is %ld\n",arr_size);
+    // hipLaunchKernelGGL(print_Hash_and_Pair, 1, 1, 0, 0,arr_size,0);
+    hipLaunchKernelGGL(update_Pair_Atoms, 1, 1, 0, 0, arr_size
+                      );
+    hipDeviceSynchronize();
+    hipLaunchKernelGGL(calcExchangePairs, numBlocks, blockSize, 0, 0,
                       sector_id,arr_size
                       );
     hipDeviceSynchronize();
+    // hipLaunchKernelGGL(print_surface_and_ghost, 1, 1, 0, 0
+    //                   );
+    // print_surface_and_ghost
+
+    // printf("---------------------------------------------------\n"); 
+    // hipLaunchKernelGGL(print_Hash_and_Pair, 1, 1, 0, 0,arr_size,1);
+    // printf("+++++++++++++++++++++++++++++++++++++++++++++++++++\n");
+    // hipHostFree(Pair_Atoms);
     
 
     //这是计算后传回的部分
     //ghost和surface区需要传回
 
+    
+
+    long int *ghost_type;
+    long int *surface_type;
+    HANDLE_HIP(hipMalloc((void**)&ghost_type,ghost_Hash->device_ptr()->capacity*sizeof(long int)));
+    HANDLE_HIP(hipMalloc((void**)&surface_type,surface_Hash->device_ptr()->capacity*sizeof(long int)));
+    HANDLE_HIP(hipMemset(surface_type, 0xFF, surface_Hash->device_ptr()->capacity * sizeof(long int)));
+    HANDLE_HIP(hipMemset(ghost_type, 0xFF, ghost_Hash->device_ptr()->capacity * sizeof(long int)));
+
+    hipDeviceSynchronize();
+    hipLaunchKernelGGL(get_surface_and_ghost_type, 1, 2, 0, 0,surface_type,ghost_type);
+    hipDeviceSynchronize();
+
     HANDLE_HIP(hipMemcpy(h_ghost_Hash, ghost_Hash->device_ptr()->keys, ghost_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
     HANDLE_HIP(hipMemcpy(h_surface_Hash, surface_Hash->device_ptr()->keys, surface_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
     ghost_Hash->clear();
     surface_Hash->clear();
+    HANDLE_HIP(hipMemcpy(h_surface_type, surface_type, surface_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
+    HANDLE_HIP(hipMemcpy(h_ghost_type, ghost_type, ghost_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
+    // for(int i=0;i<surface_Hash->device_ptr()->capacity;i++){
+    //   printf("%ld-%ld\t",h_surface_Hash[i],h_surface_type[i]);
+    //   if(i%20 == 0)
+    //   printf("\n");
+    // }
     sizes[0]= ghost_Hash->device_ptr()->capacity;
     sizes[1]= surface_Hash->device_ptr()->capacity;
-
+    // printf("cal exchange finished \n");
 }
 
 double calculate_GPU(_type_lattice_id *vac_idArray,  const _type_lattice_count& vac_count) {
@@ -1884,7 +2034,8 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
     busy_set        host      忙碌队列
   */
   hipHostMalloc((void**)&Pair_Atoms,pair_atoms.size()*sizeof(long int));
-  HANDLE_HIP(hipMalloc((void**)&d_Pair_Atoms,pair_atoms.size()*sizeof(long int)));
+  HANDLE_HIP(hipMalloc((void**)&d_Pair_Atoms,pair_atoms.size()*sizeof(long int)*2));
+  HANDLE_HIP(hipMemset(d_Pair_Atoms, -1, pair_atoms.size() * sizeof(long int) * 2));
   //对环境变量以及哈希表进行初始化
   //每组的meta需要重新赋值
   printf("init gpu_info msg \n");
@@ -1911,6 +2062,8 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
   printf("init global pointer\n");
   //set hash pointer to gpu global pointer
   // printDevMeta(meta);
+  arr_size = pair_atoms.size();
+  printf("arr_size is %ld",arr_size);
   hipLaunchKernelGGL(setGlobalPointer, 1, 1, 0, 0, 
       d_meta,
       MoRe_Hash->device_ptr(),MoMo_Hash->device_ptr(),Re_Hash->device_ptr(),V_Hash->device_ptr(),Busy_Set->device_ptr(),
@@ -1935,6 +2088,9 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
 
     hipHostMalloc((void**)&lattice_list->h_ghost_Hash,ghost_Hash->device_ptr()->capacity*sizeof(long int));
     hipHostMalloc((void**)&lattice_list->h_surface_Hash,surface_Hash->device_ptr()->capacity*sizeof(long int));
+
+    hipHostMalloc((void**)&lattice_list->h_ghost_Hash_type,ghost_Hash->device_ptr()->capacity*sizeof(long int));
+    hipHostMalloc((void**)&lattice_list->h_surface_Hash_type,surface_Hash->device_ptr()->capacity*sizeof(long int));
 
   printf("finish gpu prepare\n");
   hipHostFree( Pair_Atoms);
@@ -2060,18 +2216,25 @@ void output_time() {
 }
 __global__ void update_hash_set(ChangeLattice_GPU *d_buffer,int receive_len,const int dimension,
                                 int sector_id,
-                                int64_t sub_box_lattice_size_0,int64_t sub_box_lattice_size_1,int64_t sub_box_lattice_size_2,
-                                int64_t neighbour_local_sub_box_0,int64_t neighbour_local_sub_box_1,int64_t neighbour_local_sub_box_2
+                                long int sub_box_lattice_size_0,long int sub_box_lattice_size_1,long int sub_box_lattice_size_2,
+                                long int  neighbour_local_sub_box_0,long int neighbour_local_sub_box_1,long int neighbour_local_sub_box_2
 ){
-  int BCC_DBX = 2;
+  // printf("env params:\t%ld\t%ld\t%ld ----- %ld\t%ld\t%ld\n",sub_box_lattice_size_0,sub_box_lattice_size_1,sub_box_lattice_size_2,
+  //       neighbour_local_sub_box_0,neighbour_local_sub_box_1,neighbour_local_sub_box_2);
+
+  long int BCC_DBX = 2;
   int index = blockIdx.x * blockDim.x + threadIdx.x;
   if(index >= receive_len)
     return;
 
-  int64_t x,y,z;
-  long int id;
+  long int  x,y,z=0;
+  long int id=0;
   if(dimension == 0){
-    for(int i=index;i<receive_len;i+=blockDim.x){
+    // for(int i=index;i<receive_len;i+=blockDim.x)
+    {
+      // printf("before change pos:(%ld,%ld,%ld)-%ld\n",d_buffer[index].x,d_buffer[index].y,d_buffer[index].z,id);
+      // printf("cal env params:\t%ld\t%ld\t%ld ----- %ld\t%ld\t%ld------%ld\n",sub_box_lattice_size_0,sub_box_lattice_size_1,sub_box_lattice_size_2,
+        // neighbour_local_sub_box_0,neighbour_local_sub_box_1,neighbour_local_sub_box_2,BCC_DBX);
       if(sector_id % 2 == 0){
         d_buffer[index].x += BCC_DBX * sub_box_lattice_size_0;
       }else{
@@ -2081,20 +2244,25 @@ __global__ void update_hash_set(ChangeLattice_GPU *d_buffer,int receive_len,cons
       y = d_buffer[index].y;
       z = d_buffer[index].z;
       id = getId(x,y,z);
+      printf("change pos:(%ld,%ld,%ld)-%ld",x,y,z,id);
 
       if(hash_set_contains(g_V_Hash,id)){
         hash_set_remove_atom_op(g_V_Hash,id);
+        printf("--V--");
       }
       else if(hash_set_contains(g_Re_Hash,id)){
         hash_set_remove_atom_op(g_Re_Hash,id);
+         printf("--Re--");
       }
       else if(hash_set_contains(g_MoMo_Hash,id)){
         hash_set_remove_atom_op(g_MoMo_Hash,id);
+         printf("--MoMo--");
       }
       else if(hash_set_contains(g_MoRe_Hash,id)){
         hash_set_remove_atom_op(g_MoRe_Hash,id);
+         printf("--MoRe--");
       }
-
+      printf("%ld\n",d_buffer[index].type);
       switch(d_buffer[index].type){
         case LatticeTypes::V:
           hash_set_insert_atom_op(g_V_Hash,id);
@@ -2117,7 +2285,11 @@ __global__ void update_hash_set(ChangeLattice_GPU *d_buffer,int receive_len,cons
 
   }
   else if(dimension == 1){
-    for(int i=index;i<receive_len;i+=blockDim.x){
+    // for(int i=index;i<receive_len;i+=blockDim.x)
+    {
+      // printf("before change pos:(%ld,%ld,%ld)-%ld\n",d_buffer[index].x,d_buffer[index].y,d_buffer[index].z,id);
+      // printf("cal env params:\t%ld\t%ld\t%ld ----- %ld\t%ld\t%ld------%ld\n",sub_box_lattice_size_0,sub_box_lattice_size_1,sub_box_lattice_size_2,
+        // neighbour_local_sub_box_0,neighbour_local_sub_box_1,neighbour_local_sub_box_2,BCC_DBX);
       x = d_buffer[index].x;
       if(sector_id == 0 || sector_id == 1 || sector_id == 4 || sector_id == 5) {
         d_buffer[index].y += sub_box_lattice_size_1;
@@ -2128,19 +2300,27 @@ __global__ void update_hash_set(ChangeLattice_GPU *d_buffer,int receive_len,cons
       z = d_buffer[index].z;
 
       id = getId(x,y,z);
+       //printf("change pos:(%ld,%ld,%ld)-%ld\n",x,y,z,id);
+
+      printf("change pos:(%ld,%ld,%ld)-%ld",x,y,z,id);
 
       if(hash_set_contains(g_V_Hash,id)){
         hash_set_remove_atom_op(g_V_Hash,id);
+        printf("--V--");
       }
       else if(hash_set_contains(g_Re_Hash,id)){
         hash_set_remove_atom_op(g_Re_Hash,id);
+         printf("--Re--");
       }
       else if(hash_set_contains(g_MoMo_Hash,id)){
         hash_set_remove_atom_op(g_MoMo_Hash,id);
+         printf("--MoMo--");
       }
       else if(hash_set_contains(g_MoRe_Hash,id)){
         hash_set_remove_atom_op(g_MoRe_Hash,id);
+         printf("--MoRe--");
       }
+      printf("%ld\n",d_buffer[index].type);
 
       switch(d_buffer[index].type){
         case LatticeTypes::V:
@@ -2163,7 +2343,11 @@ __global__ void update_hash_set(ChangeLattice_GPU *d_buffer,int receive_len,cons
     }
   }
   else if(dimension == 2){
-    for(int i=index;i<receive_len;i+=blockDim.x){
+    // for(int i=index;i<receive_len;i+=blockDim.x)
+    {
+      // printf("before change pos:(%ld,%ld,%ld)-%ld\n",d_buffer[index].x,d_buffer[index].y,d_buffer[index].z,id);
+      // printf("cal env params:\t%ld\t%ld\t%ld ----- %ld\t%ld\t%ld------%ld\n",sub_box_lattice_size_0,sub_box_lattice_size_1,sub_box_lattice_size_2,
+        // neighbour_local_sub_box_0,neighbour_local_sub_box_1,neighbour_local_sub_box_2,BCC_DBX);
       x = d_buffer[index].x;
       y = d_buffer[index].y;
       if(sector_id < 4) {
@@ -2174,19 +2358,27 @@ __global__ void update_hash_set(ChangeLattice_GPU *d_buffer,int receive_len,cons
       z = d_buffer[index].z;
 
       id = getId(x,y,z);
+      //printf("change pos:(%ld,%ld,%ld)-%ld\n",x,y,z,id);
+
+      printf("change pos:(%ld,%ld,%ld)-%ld",x,y,z,id);
 
       if(hash_set_contains(g_V_Hash,id)){
         hash_set_remove_atom_op(g_V_Hash,id);
+        printf("--V--");
       }
       else if(hash_set_contains(g_Re_Hash,id)){
         hash_set_remove_atom_op(g_Re_Hash,id);
+         printf("--Re--");
       }
       else if(hash_set_contains(g_MoMo_Hash,id)){
         hash_set_remove_atom_op(g_MoMo_Hash,id);
+         printf("--MoMo--");
       }
       else if(hash_set_contains(g_MoRe_Hash,id)){
         hash_set_remove_atom_op(g_MoRe_Hash,id);
+         printf("--MoRe--");
       }
+      printf("%ld\n",d_buffer[index].type);
 
       switch(d_buffer[index].type){
         case LatticeTypes::V:
@@ -2214,18 +2406,25 @@ __global__ void update_hash_set(ChangeLattice_GPU *d_buffer,int receive_len,cons
 }
 __global__ void update_hash_set2(ChangeLattice_GPU *d_buffer,int receive_len,const int dimension,
                                 int next_id,
-                                int64_t sub_box_lattice_size_0,int64_t sub_box_lattice_size_1,int64_t sub_box_lattice_size_2,
-                                int64_t neighbour_local_sub_box_0,int64_t neighbour_local_sub_box_1,int64_t neighbour_local_sub_box_2
+                                long int sub_box_lattice_size_0,long int sub_box_lattice_size_1,long int sub_box_lattice_size_2,
+                                long int neighbour_local_sub_box_0,long int neighbour_local_sub_box_1,long int neighbour_local_sub_box_2
 ){
-  int BCC_DBX = 2;
+
+  // printf("env params:\t%ld\t%ld\t%ld ----- %ld\t%ld\t%ld\n",sub_box_lattice_size_0,sub_box_lattice_size_1,sub_box_lattice_size_2,
+        // neighbour_local_sub_box_0,neighbour_local_sub_box_1,neighbour_local_sub_box_2);
+  long int BCC_DBX = 2;
   int index = blockIdx.x * blockDim.x + threadIdx.x;
   if(index >= receive_len)
     return;
 
-  int64_t x,y,z;
+  long int x,y,z;
   long int id;
   if(dimension == 0){
-    for(int i=index;i<receive_len;i+=blockDim.x){
+    // for(int i=index;i<receive_len;i+=blockDim.x)
+    {
+      // printf("before change pos:(%ld,%ld,%ld)-%ld\n",d_buffer[index].x,d_buffer[index].y,d_buffer[index].z,id);
+      // printf("cal env params:\t%ld\t%ld\t%ld ----- %ld\t%ld\t%ld------%ld\n",sub_box_lattice_size_0,sub_box_lattice_size_1,sub_box_lattice_size_2,
+        // neighbour_local_sub_box_0,neighbour_local_sub_box_1,neighbour_local_sub_box_2,BCC_DBX);
       if(next_id % 2 == 1){
         d_buffer[index].x += BCC_DBX * sub_box_lattice_size_0;
       }else{
@@ -2235,19 +2434,27 @@ __global__ void update_hash_set2(ChangeLattice_GPU *d_buffer,int receive_len,con
       y = d_buffer[index].y;
       z = d_buffer[index].z;
       id = getId(x,y,z);
+      // printf("after change pos:(%ld,%ld,%ld)-%ld\n",d_buffer[index].x,d_buffer[index].y,d_buffer[index].z,id);
+      //printf("change pos:(%ld,%ld,%ld)-%ld\n",x,y,z,id);
+      printf("change pos:(%ld,%ld,%ld)-%ld-%ld",x,y,z,id,d_buffer[index].type);
 
       if(hash_set_contains(g_V_Hash,id)){
         hash_set_remove_atom_op(g_V_Hash,id);
+        printf("--V--");
       }
       else if(hash_set_contains(g_Re_Hash,id)){
         hash_set_remove_atom_op(g_Re_Hash,id);
+         printf("--Re--");
       }
       else if(hash_set_contains(g_MoMo_Hash,id)){
         hash_set_remove_atom_op(g_MoMo_Hash,id);
+         printf("--MoMo--");
       }
       else if(hash_set_contains(g_MoRe_Hash,id)){
         hash_set_remove_atom_op(g_MoRe_Hash,id);
+         printf("--MoRe--");
       }
+      printf("%ld\n",d_buffer[index].type);
 
       switch(d_buffer[index].type){
         case LatticeTypes::V:
@@ -2271,7 +2478,11 @@ __global__ void update_hash_set2(ChangeLattice_GPU *d_buffer,int receive_len,con
 
   }
   else if(dimension == 1){
-    for(int i=index;i<receive_len;i+=blockDim.x){
+    // for(int i=index;i<receive_len;i+=blockDim.x)
+    {
+      // printf("before change pos:(%ld,%ld,%ld)-%ld\n",d_buffer[index].x,d_buffer[index].y,d_buffer[index].z,id);
+      // printf("cal env params:\t%ld\t%ld\t%ld ----- %ld\t%ld\t%ld------%ld\n",sub_box_lattice_size_0,sub_box_lattice_size_1,sub_box_lattice_size_2,
+        // neighbour_local_sub_box_0,neighbour_local_sub_box_1,neighbour_local_sub_box_2,BCC_DBX);
       x = d_buffer[index].x;
       if(next_id == 2 || next_id == 3 || next_id == 6 || next_id == 7) {
         d_buffer[index].y += sub_box_lattice_size_1;
@@ -2282,19 +2493,26 @@ __global__ void update_hash_set2(ChangeLattice_GPU *d_buffer,int receive_len,con
       z = d_buffer[index].z;
 
       id = getId(x,y,z);
+       //printf("change pos:(%ld,%ld,%ld)-%ld\n",x,y,z,id);
+      printf("change pos:(%ld,%ld,%ld)-%ld",x,y,z,id);
 
       if(hash_set_contains(g_V_Hash,id)){
         hash_set_remove_atom_op(g_V_Hash,id);
+        printf("--V--");
       }
       else if(hash_set_contains(g_Re_Hash,id)){
         hash_set_remove_atom_op(g_Re_Hash,id);
+         printf("--Re--");
       }
       else if(hash_set_contains(g_MoMo_Hash,id)){
         hash_set_remove_atom_op(g_MoMo_Hash,id);
+         printf("--MoMo--");
       }
       else if(hash_set_contains(g_MoRe_Hash,id)){
         hash_set_remove_atom_op(g_MoRe_Hash,id);
+         printf("--MoRe--");
       }
+      printf("%ld\n",d_buffer[index].type);
 
       switch(d_buffer[index].type){
         case LatticeTypes::V:
@@ -2317,7 +2535,11 @@ __global__ void update_hash_set2(ChangeLattice_GPU *d_buffer,int receive_len,con
     }
   }
   else if(dimension == 2){
-    for(int i=index;i<receive_len;i+=blockDim.x){
+    // for(int i=index;i<receive_len;i+=blockDim.x)
+    {
+      // printf("before change pos:(%ld,%ld,%ld)-%ld\n",d_buffer[index].x,d_buffer[index].y,d_buffer[index].z,id);
+      // printf("cal env params:\t%ld\t%ld\t%ld ----- %ld\t%ld\t%ld------%ld\n",sub_box_lattice_size_0,sub_box_lattice_size_1,sub_box_lattice_size_2,
+        // neighbour_local_sub_box_0,neighbour_local_sub_box_1,neighbour_local_sub_box_2,BCC_DBX);
       x = d_buffer[index].x;
       y = d_buffer[index].y;
       if(next_id > 3 ) {
@@ -2328,19 +2550,27 @@ __global__ void update_hash_set2(ChangeLattice_GPU *d_buffer,int receive_len,con
       z = d_buffer[index].z;
 
       id = getId(x,y,z);
+       //printf("change pos:(%ld,%ld,%ld)-%ld\n",x,y,z,id);
+
+      printf("change pos:(%ld,%ld,%ld)-%ld",x,y,z,id);
 
       if(hash_set_contains(g_V_Hash,id)){
         hash_set_remove_atom_op(g_V_Hash,id);
+        printf("--V--");
       }
       else if(hash_set_contains(g_Re_Hash,id)){
         hash_set_remove_atom_op(g_Re_Hash,id);
+         printf("--Re--");
       }
       else if(hash_set_contains(g_MoMo_Hash,id)){
         hash_set_remove_atom_op(g_MoMo_Hash,id);
+         printf("--MoMo--");
       }
       else if(hash_set_contains(g_MoRe_Hash,id)){
         hash_set_remove_atom_op(g_MoRe_Hash,id);
+         printf("--MoRe--");
       }
+      printf("%ld\n",d_buffer[index].type);
 
       switch(d_buffer[index].type){
         case LatticeTypes::V:
@@ -2367,42 +2597,50 @@ __global__ void update_hash_set2(ChangeLattice_GPU *d_buffer,int receive_len,con
 void transferBufferToGPU(ChangeLattice *buffer, int receive_len, const int dimension,
                           const _type_lattice_count *sub_box_lattice_size, const _type_lattice_count *neighbour_local_sub_box, unsigned int id){
     ChangeLattice_GPU *h_buffer;
-    hipHostMalloc((void**)&h_buffer,receive_len*sizeof(receive_len));
-    init_ChangeLattice_GPU(buffer,h_buffer,receive_len);
+    receive_len = receive_len-1;
+    if(receive_len > 0){
+      hipHostMalloc((void**)&h_buffer,receive_len*sizeof(ChangeLattice_GPU));
+      init_ChangeLattice_GPU(buffer,h_buffer,receive_len);
 
-    ChangeLattice_GPU *d_buffer;
-    HANDLE_HIP(hipMalloc((void**)&d_buffer,sizeof(ChangeLattice_GPU)*receive_len));
-    HANDLE_HIP(hipMemcpy(d_buffer,&d_buffer,sizeof(ChangeLattice_GPU)*receive_len,hipMemcpyHostToDevice));
-    int blockSize = 128;
-    int blockNum = (receive_len)/blockSize + 1;
-    hipLaunchKernelGGL(update_hash_set, blockSize, blockNum, 0, 0, 
-      d_buffer,
-      receive_len,
-      dimension,
-      id,
-      sub_box_lattice_size[0],
-      sub_box_lattice_size[1],
-      sub_box_lattice_size[2],
-      neighbour_local_sub_box[0],
-      neighbour_local_sub_box[1],
-      neighbour_local_sub_box[2]
-    );
-
+      ChangeLattice_GPU *d_buffer;
+      HANDLE_HIP(hipMalloc((void**)&d_buffer,sizeof(ChangeLattice_GPU)*receive_len));
+      HANDLE_HIP(hipMemcpy(d_buffer,h_buffer,sizeof(ChangeLattice_GPU)*receive_len,hipMemcpyHostToDevice));
+      int blockSize = 128;
+      int blockNum = (receive_len)/blockSize + 1;
+      printf("start kernel update\n");
+      hipLaunchKernelGGL(update_hash_set, blockNum, blockSize, 0, 0, 
+        d_buffer,
+        receive_len,
+        dimension,
+        id,
+        sub_box_lattice_size[0],
+        sub_box_lattice_size[1],
+        sub_box_lattice_size[2],
+        neighbour_local_sub_box[0],
+        neighbour_local_sub_box[1],
+        neighbour_local_sub_box[2]
+      );
+      hipDeviceSynchronize();
+    }
+    // hipLaunchKernelGGL(update_Pair_Atoms, 1, 1, 0, 0, arr_size);
+    // hipDeviceSynchronize();
 }
 
 
 void transferBufferToGPU2(ChangeLattice *buffer, int receive_len, const int dimension,
                           const _type_lattice_count *sub_box_lattice_size, const _type_lattice_count *neighbour_local_sub_box, unsigned int next_id){
     ChangeLattice_GPU *h_buffer;
-    hipHostMalloc((void**)&h_buffer,receive_len*sizeof(receive_len));
+    hipHostMalloc((void**)&h_buffer,receive_len*sizeof(ChangeLattice_GPU));
     init_ChangeLattice_GPU(buffer,h_buffer,receive_len);
 
     ChangeLattice_GPU *d_buffer;
     HANDLE_HIP(hipMalloc((void**)&d_buffer,sizeof(ChangeLattice_GPU)*receive_len));
-    HANDLE_HIP(hipMemcpy(d_buffer,&d_buffer,sizeof(ChangeLattice_GPU)*receive_len,hipMemcpyHostToDevice));
+    HANDLE_HIP(hipMemcpy(d_buffer,h_buffer,sizeof(ChangeLattice_GPU)*receive_len,hipMemcpyHostToDevice));
     int blockSize = 128;
     int blockNum = (receive_len)/blockSize + 1;
-    hipLaunchKernelGGL(update_hash_set2, blockSize, blockNum, 0, 0, 
+    // hipLaunchKernelGGL(print_g_Pair_Atoms,1,1,0,0,arr_size);
+    hipDeviceSynchronize();
+    hipLaunchKernelGGL(update_hash_set2,blockNum, blockSize, 0, 0, 
       d_buffer,
       receive_len,
       dimension,
@@ -2414,4 +2652,10 @@ void transferBufferToGPU2(ChangeLattice *buffer, int receive_len, const int dime
       neighbour_local_sub_box[1],
       neighbour_local_sub_box[2]
     );
+    hipDeviceSynchronize();
+    
+    // hipDeviceSynchronize();
+    // // printf("------this is end print-----\n");
+    // // hipLaunchKernelGGL(print_g_Pair_Atoms,1,1,0,0,arr_size);
+    // hipDeviceSynchronize();
 }

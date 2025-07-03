@@ -25,10 +25,11 @@
 #include "../src/lattice/lattice_list_meta.h"
 
 void recb_solver_GPU(
-    const unsigned int& sector_id,long int arr_size,
-    long int *&h_ghost_Hash,long int *&h_surface_Hash,
-    int *sizes
-  );
+                    const unsigned int& sector_id,long int arr_size,
+                    long int *&h_ghost_Hash,long int *&h_surface_Hash,
+                    long int *&h_ghost_type, long int *&h_surface_type,
+                    int *sizes
+                  );
 double calculate_GPU(_type_lattice_id *vac_idArray,  const _type_lattice_count& vac_count);
 
 void selectAndPerformEventGPU(double excepted_rand, int rank, _type_lattice_count step, int sect,
