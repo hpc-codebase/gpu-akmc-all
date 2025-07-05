@@ -111,8 +111,8 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
       ++sec_meta.sector_itl;                    // update sector id. 更新扇区id。
       nextSector();                             // some post operations after moved to next sector. 在移动到下一个子域后的一些后期操作。目前是空的
     }
-    printf("step %d finished",step);
-    p_event_hooks->onStepFinished(step);
+    printf("step %d finished",step+1);
+    p_event_hooks->onStepFinished(step+1);
   }
   time_total_end = MPI_Wtime() - time_total_start;
 
@@ -458,7 +458,10 @@ template <class PKs, class Ins> void SubLattice::syncSimRegions(Ins &pk_inst, st
     // int receive_len = recv_regions[dim_id];
     // printf("start transfer\n");
     // if(num_receive[dim_id] -1 > 0)
-    packer.transfer_buffer_to_GPU(receive_buff, num_receive[dim_id]-1, dim_id, p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, cur_sector.id);
+    for(int i=0;i<num_receive[dim_id];i++)
+      printf("r_buffer (%ld,%ld,%ld)\t",receive_buff[i].x,receive_buff[i].y,receive_buff[i].z);
+    printf("\n");
+    packer.transfer_buffer_to_GPU(receive_buff, num_receive[dim_id], dim_id, p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, cur_sector.id);
     packer.onReceive2(receive_buff, recv_regions[dim_id], num_receive[dim_id], dim_id, exchange_ghost, 
                       p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, cur_sector.id, 
                       exchange_surface_x, exchange_surface_y, exchange_surface_z, p_domain);
@@ -583,8 +586,11 @@ template <class PKg, class Ins> void SubLattice::syncNextSectorGhostRegions(Ins 
 
     int receive_len = num_receive[dim_id];
 
-      // printf("rece !!! %ld\n",num_receive[dim_id]);
-      packer.transfer_buffer_to_GPU2(receive_buff, receive_len, dim_id, p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, next_sector.id);
+    // printf("ghost dim id is %d,next_sector.id: %d\n",dim_id,next_sector.id);
+    for(int i=0;i<num_receive[dim_id];i++)
+      printf("ss_buffer (%ld,%ld,%ld)\t",receive_buff[i].x,receive_buff[i].y,receive_buff[i].z);
+    printf("\n");
+    packer.transfer_buffer_to_GPU2(receive_buff,num_receive[dim_id], dim_id, p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, next_sector.id);
     packer.onReceive2(receive_buff, num_receive[dim_id], dim_id, exchange_surface_x, exchange_surface_y, exchange_surface_z,
                 p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, next_sector.id, p_domain);
 

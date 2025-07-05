@@ -175,7 +175,7 @@ HIPHashSet::~HIPHashSet() {
 
 int init_ChangeLattice_GPU(ChangeLattice *buffer,ChangeLattice_GPU *h_buffer,int len){
 
-    // printf("------this is buffer data-------------\n");
+    printf("------this is buffer data-------------\n");
     for(int i=0;i<len;i++){
         h_buffer[i].x = buffer[i].x;
         h_buffer[i].y = buffer[i].y;
@@ -185,7 +185,8 @@ int init_ChangeLattice_GPU(ChangeLattice *buffer,ChangeLattice_GPU *h_buffer,int
         // if(i%10 == 0)
         // printf("\n");
     }
-    // printf("------ end buffer data----------------\n");
+     // printf("\n");
+    printf("------ end buffer data----------------\n");
 }
 
 // 清空HIPHashSet中的所有元素，保留哈希表结构
@@ -246,11 +247,15 @@ void HIPHashSet::copyToHost(std::unordered_set<_type_lattice_id> &cpu_hash){
     hipDeviceSynchronize();
     
     // 过滤有效键并插入到CPU哈希表
+    long int hash_num =0;
     cpu_hash.clear();
     for (const auto& key : keys) {
         if (key != INIT_FLAG && key != TOMBSTONE) {
             cpu_hash.emplace(key);  // 值设为true表示存在
+           hash_num++;
         }
     }
+     printf("this key num is %ld\n",hash_num);
+     hipDeviceSynchronize();
     // HANDLE_HIP(hipMemcpy(h_ghost_Hash, ghost_Hash->device_ptr()->keys, ghost_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
 }
