@@ -574,7 +574,7 @@ __device__ int hash_set_contains(GPUHashSet* table, long int key) {
 
 
 __device__ int hash_set_find(long int key){
-
+  return 1;
 }
 // 设备端插入函数（线程安全）
 __device__ int hash_set_insert(GPUHashSet* set, long int key) {
@@ -1252,6 +1252,7 @@ __device__ int randomInt(unsigned long long seed, int min, int max) {
     // int randNum = hiprand(&state) % (max - min + 1) + min;
 
     // return randNum;
+    return 1;
 }
 
 __device__ void getRandomLattice(const _type_lattice_coord& x, const _type_lattice_coord& y, const _type_lattice_coord& z,

@@ -603,5 +603,6 @@ LatticeTypes::lat_type LatticesList::setType(const _type_lattice_id& latti_id,lo
     case LatticeTypes::Mo:
       break;
   }
+  return LatticeTypes::V;
 }
 

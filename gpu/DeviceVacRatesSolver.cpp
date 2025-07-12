@@ -187,6 +187,8 @@ int init_ChangeLattice_GPU(ChangeLattice *buffer,ChangeLattice_GPU *h_buffer,int
     }
      // printf("\n");
     printf("------ end buffer data----------------\n");
+
+    return 1;
 }
 
 // 清空HIPHashSet中的所有元素，保留哈希表结构
