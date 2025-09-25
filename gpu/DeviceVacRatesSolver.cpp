@@ -175,18 +175,18 @@ HIPHashSet::~HIPHashSet() {
 
 int init_ChangeLattice_GPU(ChangeLattice *buffer,ChangeLattice_GPU *h_buffer,int len){
 
-    printf("------this is buffer data-------------\n");
+    // printf("------this is buffer data-------------\n");
     for(int i=0;i<len;i++){
         h_buffer[i].x = buffer[i].x;
         h_buffer[i].y = buffer[i].y;
         h_buffer[i].z = buffer[i].z;
         h_buffer[i].type = buffer[i].type._type;
-        printf("h_buffer data (%ld,%ld,%ld)-%ld\t",h_buffer[i].x,h_buffer[i].y,h_buffer[i].z,h_buffer[i].type);
+        // printf("h_buffer data (%ld,%ld,%ld)-%ld\t",h_buffer[i].x,h_buffer[i].y,h_buffer[i].z,h_buffer[i].type);
         // if(i%10 == 0)
         // printf("\n");
     }
      // printf("\n");
-    printf("------ end buffer data----------------\n");
+    // printf("------ end buffer data----------------\n");
 
     return 1;
 }
@@ -257,7 +257,7 @@ void HIPHashSet::copyToHost(std::unordered_set<_type_lattice_id> &cpu_hash){
            hash_num++;
         }
     }
-     printf("this key num is %ld\n",hash_num);
+    //  printf("this key num is %ld\n",hash_num);
      hipDeviceSynchronize();
     // HANDLE_HIP(hipMemcpy(h_ghost_Hash, ghost_Hash->device_ptr()->keys, ghost_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
 }

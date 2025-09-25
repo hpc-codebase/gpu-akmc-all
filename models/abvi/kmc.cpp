@@ -273,26 +273,26 @@ void ABVIModel::recb_solver(std::vector<_type_lattice_id>id, const lat_region& r
                   sizes
                 );
     //更新哈希表现在不用更新，最后一次更新就完了
-    printf("recb_solver_GPU finished\n");
-    printf("sizes:%ld,%ld\n",sizes[0],sizes[1]);
+    // printf("recb_solver_GPU finished\n");
+    // printf("sizes:%ld,%ld\n",sizes[0],sizes[1]);
     //surface和ghost区每次都要更新
     for(int i = 0;i<sizes[0];i++){
       if(box->lattice_list->h_ghost_Hash[i] != -1 && box->lattice_list->h_ghost_Hash[i] != -2){
 
       // if(!box->lattice_list->more_hash.count(h_MoRe_Hash[i]))
-      printf("adding %ld\n",box->lattice_list->h_ghost_Hash[i]);
+      // printf("adding %ld\n",box->lattice_list->h_ghost_Hash[i]);
       if(box->lattice_list->meta.isGhostLat(box->lattice_list->h_ghost_Hash[i])){
-          printf("adding1 %ld\n",box->lattice_list->h_ghost_Hash[i]);
+          // printf("adding1 %ld\n",box->lattice_list->h_ghost_Hash[i]);
           addExchange_ghost((long int)box->lattice_list->h_ghost_Hash[i],sector_id);
-          printf("adding %ld finished\n",box->lattice_list->h_ghost_Hash[i]);
+          // printf("adding %ld finished\n",box->lattice_list->h_ghost_Hash[i]);
           box->lattice_list->setType(box->lattice_list->h_ghost_Hash[i],box->lattice_list->h_ghost_Hash_type[i]);
-          printf("gh (%ld,%ld)\t",box->lattice_list->h_ghost_Hash[i],box->lattice_list->h_ghost_Hash_type[i]);
+          // printf("gh (%ld,%ld)\t",box->lattice_list->h_ghost_Hash[i],box->lattice_list->h_ghost_Hash_type[i]);
       }
       }
     }
-      printf("\n");
+      // printf("\n");
 
-       printf("recb_solver_GPU finished1\n");
+      //  printf("recb_solver_GPU finished1\n");
     // for(int i=0;i<sizes[0];i++){
     //   printf("%ld-%ld\t",box->lattice_list->h_surface_Hash[i],box->lattice_list->h_surface_Hash_type[i]);
     //   if(i%20 == 0)
@@ -306,11 +306,11 @@ void ABVIModel::recb_solver(std::vector<_type_lattice_id>id, const lat_region& r
         if(box->lattice_list->meta.isSurfaceLat(box->lattice_list->h_surface_Hash[i])){
           addExchange_surface(box->lattice_list->h_surface_Hash[i]);
           box->lattice_list->setType(box->lattice_list->h_surface_Hash[i],box->lattice_list->h_surface_Hash_type[i]);
-          printf("su (%ld,%ld)\t",box->lattice_list->h_surface_Hash[i],box->lattice_list->h_surface_Hash_type[i]);
+          // printf("su (%ld,%ld)\t",box->lattice_list->h_surface_Hash[i],box->lattice_list->h_surface_Hash_type[i]);
         }
       }
     }
-    printf("\n");
+    // printf("\n");
     //TODO：这里的free要放到最后
     // hipHostFree(h_ghost_Hash);
     // hipHostFree(h_surface_Hash);

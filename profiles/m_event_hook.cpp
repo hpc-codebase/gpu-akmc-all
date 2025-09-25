@@ -70,7 +70,7 @@ void MEventHook::onStepFinished(unsigned long step) {
     ||step == 99999||step == 999999
     ||step == 499999 || step == 999999 || step == 1999999 || step == 2999999 || step == 3999999 || step == 4999999 || step == 9999999||step%5000000== 0) {
     // if(step != 0)
-        
+      p_lattice_list->update_hash_CPU();
       std::string dump_file_path = fmt::format(output_config.dump_file_path, step);
       const kiwi::mpi_process process = SimulationDomain::kiwi_sim_pro;
       if (process.all_ranks != 1) {
@@ -78,7 +78,7 @@ void MEventHook::onStepFinished(unsigned long step) {
       }
       kiwi::logs::v("dump", "dumping to file {} at step {}.\n", dump_file_path, step);
       LatticeDump dump;
-      p_lattice_list->update_hash_CPU();
+      
       dump.dump(dump_file_path, p_lattice_list, step);
     }
   }

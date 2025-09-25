@@ -49,6 +49,8 @@ std::string lat::LatTypesString(LatticeTypes::lat_type lat_type) {
       return "NiSi";
     case LatticeTypes::SiSi:
       return "SiSi";
+    default
+      return "ERROR"
   }
 }
 
