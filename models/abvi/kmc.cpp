@@ -80,6 +80,7 @@ _type_rate ABVIModel::calcRates(const comm::Region<comm::_type_lattice_size> reg
 }
 int ABVIModel::initGPUHashSet(const comm::Region<comm::_type_lattice_size> region, int sect){
   //暂时没用到
+  return 1;
 }
 _type_rate ABVIModel::calcRatesGPU(const comm::Region<comm::_type_lattice_size> region, int sect) {
   _type_lattice_id *vac_idArray;

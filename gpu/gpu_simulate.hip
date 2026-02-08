@@ -1135,8 +1135,8 @@ __global__ void setGlobalPointer(dev_meta *meta,
   g_meta = meta;
   g_MoRe_Hash = MoRe_Hash;
   g_MoMo_Hash = MoMo_Hash;
-  printf("MoMo:%p\n",MoMo_Hash);
-  printf("g_MoMo:%p\n",g_MoMo_Hash);
+  // printf("MoMo:%p\n",MoMo_Hash);
+  // printf("g_MoMo:%p\n",g_MoMo_Hash);
   g_Re_Hash = Re_Hash;
   g_V_Hash = V_Hash;
   g_Busy_Set = Busy_Set_Hash;
@@ -1145,7 +1145,7 @@ __global__ void setGlobalPointer(dev_meta *meta,
   g_Pair_Atoms = Pair_Atoms;
   
     // printHashTableKernel(g_MoMo_Hash,200,false);
-    printDevMetaKernel(g_meta);
+    // printDevMetaKernel(g_meta);
 
    
   }
@@ -2028,6 +2028,22 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
                 ){
   using namespace gpuSimulate;
 
+  int device_id;
+  hipGetDevice(&device_id);  // 获取当前设备ID
+  hipDeviceProp_t prop;
+  hipGetDeviceProperties(&prop, device_id);  // 获取设备属性
+  std::cout << "GPU名称: " << prop.name << std::endl;
+  std::cout << "每个线程块最大线程数: " << prop.maxThreadsPerBlock << std::endl;
+  std::cout << "每个多处理器最大线程块数: " << prop.maxThreadsPerMultiProcessor << std::endl;
+  std::cout << "线程块最大尺寸（x,y,z）: (" 
+            << prop.maxThreadsDim[0] << ", " 
+            << prop.maxThreadsDim[1] << ", " 
+            << prop.maxThreadsDim[2] << ")" << std::endl;
+  std::cout << "网格最大尺寸（x,y,z）: (" 
+            << prop.maxGridSize[0] << ", " 
+            << prop.maxGridSize[1] << ", " 
+            << prop.maxGridSize[2] << ")" << std::endl;
+
   lattice_list = p_list;
   p_domain = _p_domain;
   h_config[0] = v;   // v
@@ -2069,7 +2085,6 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
   hipHostMalloc((void**)&ret_atoms, HostAtomCapacity * sizeof(dev_atom));
   HANDLE_HIP(hipMalloc((void**)&d_atoms, HostAtomCapacity * sizeof(dev_atom)));
 
-  printf("init vac finished \n");
   //以下是对recb_solver_GPU的空间分配
   //在这里直接把GPU中的哈希表分配掉了，然后在空位交换的时候更新哈希表
   /*
@@ -2091,12 +2106,12 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
   HANDLE_HIP(hipMemset(d_Pair_Atoms, -1, pair_atoms.size() * sizeof(long int) * 2));
   //对环境变量以及哈希表进行初始化
   //每组的meta需要重新赋值
-  printf("init gpu_info msg \n");
+  // printf("init gpu_info msg \n");
   lattice_list->initGpuInfo_exchange(pair_atoms,region_msg,
                                     0,meta,Pair_Atoms,
                                     MoRe_Hash,MoMo_Hash,Re_Hash,V_Hash,Busy_Set
                                     );
-  printf("init gpu_info msg end\n");
+  // printf("init gpu_info msg end\n");
   HANDLE_HIP(hipMemcpy(d_Pair_Atoms, Pair_Atoms,pair_atoms.size()*sizeof(long int), hipMemcpyHostToDevice));
 
   int ghost_size = (meta.regions[1] + meta.ghost_x - meta.regions[0])*(meta.regions[3] + meta.ghost_y - meta.regions[2]) * (meta.regions[5] + meta.ghost_z - meta.regions[4])
@@ -2112,11 +2127,11 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
   //这是对meta的首次更新，以后每次都得更新
   HANDLE_HIP(hipMalloc((void**)&d_meta,sizeof(dev_meta)));
   HANDLE_HIP(hipMemcpy(d_meta, &meta,sizeof(dev_meta), hipMemcpyHostToDevice));
-  printf("init global pointer\n");
+  // printf("init global pointer\n");
   //set hash pointer to gpu global pointer
   // printDevMeta(meta);
   arr_size = pair_atoms.size();
-  printf("arr_size is %ld",arr_size);
+  // printf("arr_size is %ld",arr_size);
   hipLaunchKernelGGL(setGlobalPointer, 1, 1, 0, 0, 
       d_meta,
       MoRe_Hash->device_ptr(),MoMo_Hash->device_ptr(),Re_Hash->device_ptr(),V_Hash->device_ptr(),Busy_Set->device_ptr(),
@@ -2133,7 +2148,7 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
 
 
   //这些是对返回CPU的空间
-    printf("malloc CPU hashset\n");
+    // printf("malloc CPU hashset\n");
     // hipHostMalloc((void**)&lattice_list->h_MoRe_Hash,MoRe_Hash->device_ptr()->capacity*sizeof(long int));
     // hipHostMalloc((void**)&lattice_list->h_MoMo_Hash,MoMo_Hash->device_ptr()->capacity*sizeof(long int));
     // hipHostMalloc((void**)&lattice_list->h_Re_Hash,Re_Hash->device_ptr()->capacity*sizeof(long int));
@@ -2145,7 +2160,7 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
     hipHostMalloc((void**)&lattice_list->h_ghost_Hash_type,ghost_Hash->device_ptr()->capacity*sizeof(long int));
     hipHostMalloc((void**)&lattice_list->h_surface_Hash_type,surface_Hash->device_ptr()->capacity*sizeof(long int));
 
-  printf("finish gpu prepare\n");
+  // printf("finish gpu prepare\n");
   hipHostFree( Pair_Atoms);
 }
 
