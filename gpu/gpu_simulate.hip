@@ -71,6 +71,15 @@ namespace gpuSimulate {
     long int *d_Pair_Atoms;
     dev_meta *d_meta;
 
+    long int *d_ghost_list;
+    long int *d_surface_list;
+    long int *d_ghost_list_type;
+    long int *d_surface_list_type;
+    int *d_ghost_count;
+    int *d_surface_count;
+    int ghost_capacity;
+    int surface_capacity;
+
     static bool recbProfileEnabled() {
       static int cached = -1;
       if (cached != -1) return cached != 0;
@@ -2087,6 +2096,24 @@ __global__ void compute_types_for_keys(const long int* __restrict__ keys,
     long int k = keys[tid];
     if (k != -1 && k != -2) out_types[tid] = getType(k);
 }
+__global__ void compact_valid_keys(const long int* __restrict__ keys,
+                                  int capacity,
+                                  long int* __restrict__ out_keys,
+                                  int* __restrict__ out_count) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= capacity) return;
+    long int k = keys[tid];
+    if (k == -1 || k == -2) return;
+    int idx = atomicAdd(out_count, 1);
+    out_keys[idx] = k;
+}
+__global__ void compute_types_for_list(const long int* __restrict__ list,
+                                      long int* __restrict__ out_types,
+                                      int count) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= count) return;
+    out_types[tid] = getType(list[tid]);
+}
 __global__ void get_surface_and_ghost_type1(long int *surface_type, long int *ghost_type) {
     _type_lattice_count tid = blockIdx.x * blockDim.x + threadIdx.x;
     
@@ -2154,31 +2181,48 @@ void recb_solver_GPU(
 
     
 
-    long int *ghost_type;
-    long int *surface_type;
-    HANDLE_HIP(hipMalloc((void**)&ghost_type,ghost_Hash->device_ptr()->capacity*sizeof(long int)));
-    HANDLE_HIP(hipMalloc((void**)&surface_type,surface_Hash->device_ptr()->capacity*sizeof(long int)));
-    HANDLE_HIP(hipMemset(surface_type, 0xFF, surface_Hash->device_ptr()->capacity * sizeof(long int)));
-    HANDLE_HIP(hipMemset(ghost_type, 0xFF, ghost_Hash->device_ptr()->capacity * sizeof(long int)));
+    HANDLE_HIP(hipMemset(d_surface_count, 0, sizeof(int)));
+    HANDLE_HIP(hipMemset(d_ghost_count, 0, sizeof(int)));
+    const int compact_block = 256;
+    const int surface_grid = (surface_capacity + compact_block - 1) / compact_block;
+    const int ghost_grid = (ghost_capacity + compact_block - 1) / compact_block;
+    hipLaunchKernelGGL(compact_valid_keys, surface_grid, compact_block, 0, 0,
+                       surface_Hash->device_ptr()->keys, surface_capacity, d_surface_list, d_surface_count);
+    CHECK_FOR_ERROR();
+    hipLaunchKernelGGL(compact_valid_keys, ghost_grid, compact_block, 0, 0,
+                       ghost_Hash->device_ptr()->keys, ghost_capacity, d_ghost_list, d_ghost_count);
+    CHECK_FOR_ERROR();
+    hipDeviceSynchronize();
+
+    int h_surface_count = 0;
+    int h_ghost_count = 0;
+    HANDLE_HIP(hipMemcpy(&h_surface_count, d_surface_count, sizeof(int), hipMemcpyDeviceToHost));
+    HANDLE_HIP(hipMemcpy(&h_ghost_count, d_ghost_count, sizeof(int), hipMemcpyDeviceToHost));
 
     const int type_block = 256;
-    const int surface_cap = surface_Hash->device_ptr()->capacity;
-    const int ghost_cap = ghost_Hash->device_ptr()->capacity;
-    const int surface_grid = (surface_cap + type_block - 1) / type_block;
-    const int ghost_grid = (ghost_cap + type_block - 1) / type_block;
-    hipLaunchKernelGGL(compute_types_for_keys, surface_grid, type_block, 0, 0,
-                       surface_Hash->device_ptr()->keys, surface_type, surface_cap);
-    CHECK_FOR_ERROR();
-    hipLaunchKernelGGL(compute_types_for_keys, ghost_grid, type_block, 0, 0,
-                       ghost_Hash->device_ptr()->keys, ghost_type, ghost_cap);
-    CHECK_FOR_ERROR();
+    if (h_surface_count > 0) {
+      const int grid = (h_surface_count + type_block - 1) / type_block;
+      hipLaunchKernelGGL(compute_types_for_list, grid, type_block, 0, 0,
+                         d_surface_list, d_surface_list_type, h_surface_count);
+      CHECK_FOR_ERROR();
+    }
+    if (h_ghost_count > 0) {
+      const int grid = (h_ghost_count + type_block - 1) / type_block;
+      hipLaunchKernelGGL(compute_types_for_list, grid, type_block, 0, 0,
+                         d_ghost_list, d_ghost_list_type, h_ghost_count);
+      CHECK_FOR_ERROR();
+    }
     hipDeviceSynchronize();
     if (do_profile) HANDLE_HIP(hipEventRecord(recb_evt_after_type, 0));
 
-    HANDLE_HIP(hipMemcpy(h_ghost_Hash, ghost_Hash->device_ptr()->keys, ghost_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
-    HANDLE_HIP(hipMemcpy(h_surface_Hash, surface_Hash->device_ptr()->keys, surface_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
-    HANDLE_HIP(hipMemcpy(h_surface_type, surface_type, surface_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
-    HANDLE_HIP(hipMemcpy(h_ghost_type, ghost_type, ghost_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
+    if (h_ghost_count > 0) {
+      HANDLE_HIP(hipMemcpy(h_ghost_Hash, d_ghost_list, h_ghost_count * sizeof(long int), hipMemcpyDeviceToHost));
+      HANDLE_HIP(hipMemcpy(h_ghost_type, d_ghost_list_type, h_ghost_count * sizeof(long int), hipMemcpyDeviceToHost));
+    }
+    if (h_surface_count > 0) {
+      HANDLE_HIP(hipMemcpy(h_surface_Hash, d_surface_list, h_surface_count * sizeof(long int), hipMemcpyDeviceToHost));
+      HANDLE_HIP(hipMemcpy(h_surface_type, d_surface_list_type, h_surface_count * sizeof(long int), hipMemcpyDeviceToHost));
+    }
     if (do_profile) HANDLE_HIP(hipEventRecord(recb_evt_after_copy, 0));
 
     ghost_Hash->clear();
@@ -2189,10 +2233,8 @@ void recb_solver_GPU(
     //   if(i%20 == 0)
     //   printf("\n");
     // }
-    sizes[0]= ghost_Hash->device_ptr()->capacity;
-    sizes[1]= surface_Hash->device_ptr()->capacity;
-    hipFree(surface_type);
-    hipFree(ghost_type);
+    sizes[0]= h_ghost_count;
+    sizes[1]= h_surface_count;
 
     if (do_profile) {
       HANDLE_HIP(hipEventSynchronize(recb_evt_after_clear));
@@ -2366,6 +2408,14 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
 
   surface_Hash = new HIPHashSet(surface_size);
   ghost_Hash = new HIPHashSet(ghost_size);
+  surface_capacity = surface_size * 2;
+  ghost_capacity = ghost_size * 2;
+  HANDLE_HIP(hipMalloc((void**)&d_surface_list, surface_capacity * sizeof(long int)));
+  HANDLE_HIP(hipMalloc((void**)&d_ghost_list, ghost_capacity * sizeof(long int)));
+  HANDLE_HIP(hipMalloc((void**)&d_surface_list_type, surface_capacity * sizeof(long int)));
+  HANDLE_HIP(hipMalloc((void**)&d_ghost_list_type, ghost_capacity * sizeof(long int)));
+  HANDLE_HIP(hipMalloc((void**)&d_surface_count, sizeof(int)));
+  HANDLE_HIP(hipMalloc((void**)&d_ghost_count, sizeof(int)));
   //这是对meta的首次更新，以后每次都得更新
   HANDLE_HIP(hipMalloc((void**)&d_meta,sizeof(dev_meta)));
   HANDLE_HIP(hipMemcpy(d_meta, &meta,sizeof(dev_meta), hipMemcpyHostToDevice));
@@ -2396,11 +2446,11 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
     // hipHostMalloc((void**)&lattice_list->h_Re_Hash,Re_Hash->device_ptr()->capacity*sizeof(long int));
     // hipHostMalloc((void**)&lattice_list->h_V_Hash,V_Hash->device_ptr()->capacity*sizeof(long int));
 
-    hipHostMalloc((void**)&lattice_list->h_ghost_Hash,ghost_Hash->device_ptr()->capacity*sizeof(long int));
-    hipHostMalloc((void**)&lattice_list->h_surface_Hash,surface_Hash->device_ptr()->capacity*sizeof(long int));
+    hipHostMalloc((void**)&lattice_list->h_ghost_Hash, ghost_capacity * sizeof(long int));
+    hipHostMalloc((void**)&lattice_list->h_surface_Hash, surface_capacity * sizeof(long int));
 
-    hipHostMalloc((void**)&lattice_list->h_ghost_Hash_type,ghost_Hash->device_ptr()->capacity*sizeof(long int));
-    hipHostMalloc((void**)&lattice_list->h_surface_Hash_type,surface_Hash->device_ptr()->capacity*sizeof(long int));
+    hipHostMalloc((void**)&lattice_list->h_ghost_Hash_type, ghost_capacity * sizeof(long int));
+    hipHostMalloc((void**)&lattice_list->h_surface_Hash_type, surface_capacity * sizeof(long int));
 
   // printf("finish gpu prepare\n");
   hipHostFree( Pair_Atoms);
@@ -2430,6 +2480,13 @@ void gpu_final(){
   delete MoMo_Hash;
   delete Re_Hash;
   delete V_Hash;
+
+  HANDLE_HIP(hipFree(d_surface_list));
+  HANDLE_HIP(hipFree(d_ghost_list));
+  HANDLE_HIP(hipFree(d_surface_list_type));
+  HANDLE_HIP(hipFree(d_ghost_list_type));
+  HANDLE_HIP(hipFree(d_surface_count));
+  HANDLE_HIP(hipFree(d_ghost_count));
 
   hipFree(d_Pair_Atoms);
 

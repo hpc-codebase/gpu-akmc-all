@@ -79,3 +79,28 @@
 ### 对行为/接口的影响
 - 不改变对外接口、不改变 keys/type 的对齐语义。
 - 输出类型结果与原逻辑一致（仍对每个有效 key 调用 `getType`）。
+
+## 变更 004：回传升级为 compact list + count，减少 D2H 传输与 CPU 扫描
+
+### 修改文件
+- [gpu_simulate.hip](file:///Users/bytedance/Downloads/kmc_new/gpu/gpu_simulate.hip)
+
+### 修改内容
+- 新增核函数 `compact_valid_keys(keys, capacity, out_keys, out_count)`：
+  - 从 hashset 的槽位数组 `keys[0..capacity)` 中提取有效 key（非 -1/-2），用 `atomicAdd` 写入连续的 `out_keys` 列表，并得到 `out_count`。
+- 新增核函数 `compute_types_for_list(list, out_types, count)`：
+  - 对 compact 后的 key 列表按 `count` 并行计算类型。
+- `gpu_prepare()` 中常驻分配 device 缓冲：
+  - `d_surface_list/d_ghost_list`、`d_surface_list_type/d_ghost_list_type`、`d_surface_count/d_ghost_count`
+- `recb_solver_GPU()` 回传逻辑改为：
+  - 先 compact 得到 `h_surface_count/h_ghost_count`
+  - 再仅对 `count` 个元素计算 type 并仅回传 `count` 个 keys/types 到 host pinned buffer
+  - `sizes[0/1]` 从原先的 capacity 改为“有效数量 count”
+
+### 为什么要这样改
+- 原流程回传的是 hashset 槽位数组（capacity=2*size），CPU 需要扫描大量 `-1/-2` 才能找出有效 key，且 D2H memcpy 也必须按 capacity 全量传输，规模上来后会成为主要瓶颈。
+- compact list + count 使 CPU 与 D2H 都按“真实有效触达点数量”线性工作，后续百万级支持与 5x 目标更容易达成。
+
+### 对行为/接口的影响
+- `recb_solver_GPU` 对外签名不变，但 `sizes[0/1]` 的语义变为“有效元素数量”：
+  - CPU 侧原本用 `sizes` 作为循环上限与 memset 上限；改为 count 后同样成立，并避免无意义扫描。
