@@ -104,3 +104,21 @@
 ### 对行为/接口的影响
 - `recb_solver_GPU` 对外签名不变，但 `sizes[0/1]` 的语义变为“有效元素数量”：
   - CPU 侧原本用 `sizes` 作为循环上限与 memset 上限；改为 count 后同样成立，并避免无意义扫描。
+
+## 变更 005：优化 HIPHashSet::clear，移除 host 临时数组初始化
+
+### 修改文件
+- [DeviceVacRatesSolver.cpp](file:///Users/bytedance/Downloads/kmc_new/gpu/DeviceVacRatesSolver.cpp)
+
+### 修改内容
+- 将 `HIPHashSet::clear()` 从：
+  - 分配临时 host 数组 `new[]` → 填充 `-1` → `hipMemcpy` 到 device → `delete[]`
+  - 改为直接对 device `keys` 执行 `hipMemset(keys, 0xFF, bytes)`（等价写入 `-1`）。
+
+### 为什么要这样改
+- `ghost_Hash/surface_Hash` 每轮都会 `clear()`，原实现每次都发生 host 侧动态分配与一次大 memcpy，会成为明显的常数级开销与碎片风险，且在百万级 capacity 下会放大为主要瓶颈。
+- `hipMemset` 直接在设备侧清空 keys，成本接近纯带宽上限，且不引入任何额外 host 内存生命周期问题。
+
+### 对行为/接口的影响
+- 不改变哈希表语义：清空后槽位仍为 `INIT_FLAG(-1)`。
+- 不改变任何对外接口。

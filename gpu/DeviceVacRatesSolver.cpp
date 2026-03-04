@@ -193,32 +193,13 @@ int init_ChangeLattice_GPU(ChangeLattice *buffer,ChangeLattice_GPU *h_buffer,int
 
 // 清空HIPHashSet中的所有元素，保留哈希表结构
 void HIPHashSet::clear() {
-    // 确保设备端结构体已分配
     if (d_table == nullptr) return;
-
-    // 1. 先将主机端h_table中的keys指针设为nullptr（避免误操作）
-    long int* temp_keys = h_table.keys;
-    h_table.keys = nullptr;
-
-    // 2. 分配临时主机端数组用于初始化
-    long int* h_init_keys = new long int[h_table.capacity];
-    std::fill(h_init_keys, h_init_keys + h_table.capacity, INIT_FLAG);
-
-    // 3. 将初始化数据拷贝到设备端keys数组
-    hipError_t err = hipMemcpy(temp_keys, h_init_keys, 
-                               h_table.capacity * sizeof(long int), 
-                               hipMemcpyHostToDevice);
+    if (h_table.keys == nullptr) return;
+    hipError_t err = hipMemset(h_table.keys, 0xFF, h_table.capacity * sizeof(long int));
     if (err != hipSuccess) {
-        std::cerr << "hipMemcpy failed: " << hipGetErrorString(err) << std::endl;
-        delete[] h_init_keys;
+        std::cerr << "hipMemset failed: " << hipGetErrorString(err) << std::endl;
         return;
     }
-
-    // 4. 释放临时主机端数组
-    delete[] h_init_keys;
-
-    // 5. 更新主机端结构体（可选，因为实际操作在设备端）
-    h_table.keys = temp_keys;
 }
 
 void HIPHashSet::copyToHost(std::unordered_set<_type_lattice_id> &cpu_hash){
