@@ -139,3 +139,6 @@ dkms.conf
 *.lai
 
 # Executables
+
+ai_docs/
+*.bundle

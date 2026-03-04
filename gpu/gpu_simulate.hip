@@ -675,6 +675,14 @@ __device__ long atomicExch(long* address, long val) {
     return static_cast<long>(old_val);
 }
 
+__device__ long atomicCASLong(long* address, long compare, long val) {
+    unsigned long long* addr_as_ull = reinterpret_cast<unsigned long long*>(address);
+    unsigned long long compare_as_ull = static_cast<unsigned long long>(compare);
+    unsigned long long val_as_ull = static_cast<unsigned long long>(val);
+    unsigned long long old_val = atomicCAS(addr_as_ull, compare_as_ull, val_as_ull);
+    return static_cast<long>(old_val);
+}
+
 // 辅助函数
 __device__ unsigned long long int_as_longlong(unsigned int low, unsigned int high) {
     return ((unsigned long long)high << 32) | low;
@@ -698,19 +706,18 @@ __device__ long atomicLoad(long* address) {
 __device__ int hash_set_remove_atom_op(GPUHashSet* table, long key) {
     unsigned long long index = key % table->capacity;
     unsigned long long original_index = index;
-    
+
+    volatile long* keys = (volatile long*)table->keys;
     do {
-        // 使用适配long类型的原子加载
-        long current = atomicLoad(&table->keys[index]);
+        long current = keys[index];
         
         if (current == table->empty_flag) {
             return 0;
         }
         
         if (current == key) {
-            // 使用适配long类型的原子交换
-            atomicExch(&table->keys[index], table->tombstone_flag);
-            return 1;
+            long old = atomicCASLong((long*)&table->keys[index], key, table->tombstone_flag);
+            if (old == key) return 1;
         }
         
         index = (index + 1) % table->capacity;
@@ -722,19 +729,19 @@ __device__ int hash_set_remove_atom_op(GPUHashSet* table, long key) {
 __device__ int hash_set_insert_atom_op(GPUHashSet* set, long int key) {
   unsigned long long pos = key % set->capacity;  // 保持修正后的哈希计算
   unsigned long long start_pos = pos;
-  
+
+  volatile long* keys = (volatile long*)set->keys;
   do {
-      // long int current = set->keys[pos];  // 直接内存访问
-      long current = atomicLoad(&set->keys[pos]);
+      long current = keys[pos];
       
       if (current == key) {
           return 0; // 已存在相同key
       }
       
       if (current == set->empty_flag || current == set->tombstone_flag) {
-          // set->keys[pos] = key; // 直接赋值
-          atomicExch(&set->keys[pos], key);
-          return 1;
+          long old = atomicCASLong((long*)&set->keys[pos], current, key);
+          if (old == current) return 1;
+          if (old == key) return 0;
       }
       
       pos = (pos + 1) % set->capacity;
@@ -1750,27 +1757,64 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
     if(randomLattice.type == LatticeTypes::Mo || randomLattice.type == LatticeTypes::Re){
       
       if(cur_type == LatticeTypes::MoMo){
-         if (randomLattice.type == LatticeTypes::Mo) { // 交换位置
-          // ret = hash_set_contains_debug(g_MoMo_Hash,id);
-          // printf("%ld in MoMo is %d \n",id,ret);
-          ret = hash_set_remove_atom_op(g_MoMo_Hash,id);
-          num_momo--;
-          ret = hash_set_insert_atom_op(g_MoMo_Hash,randomLattice.id);
-          num_momo++;
-          // g_Pair_Atoms[tid] = randomLattice.id;
-        }
-        else if(randomLattice.type == LatticeTypes::Re) { // Re (momo 变成 mo，re 变成 more)
-          // printf("%ld, %ld<--->%ld MoMo<--->Re\n",id,id,randomLattice.id);
-          ret = hash_set_remove_atom_op(g_Re_Hash,randomLattice.id);
-          ret = hash_set_remove_atom_op(g_MoMo_Hash,id);
-          num_momo--;
-          ret = hash_set_insert_atom_op(g_MoRe_Hash,randomLattice.id);
-          if(ret != 1)
-            printf("MoRe insert failed\n");
-          num_more++;
+        bool exchanged = false;
+        if (randomLattice.type == LatticeTypes::Mo) {
+          int rm = hash_set_remove_atom_op(g_MoMo_Hash,id);
+          if (rm != 1) {
+            ret = hash_set_remove_atom_op(g_Busy_Set,randomLattice.id);
+            if(ret == 1) busy--;
+            ret = hash_set_remove_atom_op(g_Busy_Set,id);
+            if(ret == 1) busy--;
+            continue;
+          }
+          int ins = hash_set_insert_atom_op(g_MoMo_Hash,randomLattice.id);
+          if (ins != 1) {
+            hash_set_insert_atom_op(g_MoMo_Hash,id);
+            ret = hash_set_remove_atom_op(g_Busy_Set,randomLattice.id);
+            if(ret == 1) busy--;
+            ret = hash_set_remove_atom_op(g_Busy_Set,id);
+            if(ret == 1) busy--;
+            continue;
+          }
+          exchanged = true;
+        } else if(randomLattice.type == LatticeTypes::Re) {
+          int rm_re = hash_set_remove_atom_op(g_Re_Hash,randomLattice.id);
+          if (rm_re != 1) {
+            ret = hash_set_remove_atom_op(g_Busy_Set,randomLattice.id);
+            if(ret == 1) busy--;
+            ret = hash_set_remove_atom_op(g_Busy_Set,id);
+            if(ret == 1) busy--;
+            continue;
+          }
+          int rm_momo = hash_set_remove_atom_op(g_MoMo_Hash,id);
+          if (rm_momo != 1) {
+            hash_set_insert_atom_op(g_Re_Hash,randomLattice.id);
+            ret = hash_set_remove_atom_op(g_Busy_Set,randomLattice.id);
+            if(ret == 1) busy--;
+            ret = hash_set_remove_atom_op(g_Busy_Set,id);
+            if(ret == 1) busy--;
+            continue;
+          }
+          int ins_more = hash_set_insert_atom_op(g_MoRe_Hash,randomLattice.id);
+          if (ins_more != 1) {
+            hash_set_insert_atom_op(g_Re_Hash,randomLattice.id);
+            hash_set_insert_atom_op(g_MoMo_Hash,id);
+            ret = hash_set_remove_atom_op(g_Busy_Set,randomLattice.id);
+            if(ret == 1) busy--;
+            ret = hash_set_remove_atom_op(g_Busy_Set,id);
+            if(ret == 1) busy--;
+            continue;
+          }
           cur_type = LatticeTypes::MoRe;
-          //g_Pair_Atoms[tid] = randomLattice.id;
-          // printf("(%d,%d) (%d->%d)  , (%d->%d)\n",tid,loop_index,id,randomLattice.id,getType(id),getType(randomLattice.id));
+          exchanged = true;
+        }
+
+        if (!exchanged) {
+          ret = hash_set_remove_atom_op(g_Busy_Set,randomLattice.id);
+          if(ret == 1) busy--;
+          ret = hash_set_remove_atom_op(g_Busy_Set,id);
+          if(ret == 1) busy--;
+          continue;
         }
 
         x = temp_x;
@@ -1790,23 +1834,74 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
       }
       else if(cur_type == LatticeTypes::MoRe){
         if(numRe == 0){
-          if (randomLattice.type == LatticeTypes::Mo) { // 交换位置
-            ret = hash_set_remove_atom_op(g_MoRe_Hash,id);
-            num_more--;
-            ret  = hash_set_insert_atom_op(g_MoRe_Hash,randomLattice.id);
-            num_more++;
-            // g_Pair_Atoms[tid]=randomLattice.id;
-            // printf("(%d,%d) (%d->%d)  , (%d->%d)\n",tid,loop_index,id,randomLattice.id,getType(id),getType(randomLattice.id));
-          } else { // Re 也是交换位置
-            ret = hash_set_remove_atom_op(g_Re_Hash,randomLattice.id);
-            ret = hash_set_remove_atom_op(g_MoRe_Hash,id);
-            num_more--;
-            // printf("%d:%d 2more removed:  %d ret = %d\n",tid,num_more,randomLattice.id,ret);
-            ret = hash_set_insert_atom_op(g_Re_Hash,id);
-            ret = hash_set_insert_atom_op(g_MoRe_Hash,randomLattice.id);
-            // g_Pair_Atoms[tid]=randomLattice.id;
-            // printf("(%d,%d) (%d->%d)  , (%d->%d)\n",tid,loop_index,id,randomLattice.id,getType(id),getType(randomLattice.id));
-            num_more++;;
+          bool exchanged = false;
+          if (randomLattice.type == LatticeTypes::Mo) {
+            int rm_more = hash_set_remove_atom_op(g_MoRe_Hash,id);
+            if (rm_more != 1) {
+              ret = hash_set_remove_atom_op(g_Busy_Set,randomLattice.id);
+              if(ret == 1) busy--;
+              ret = hash_set_remove_atom_op(g_Busy_Set,id);
+              if(ret == 1) busy--;
+              continue;
+            }
+            int ins_more = hash_set_insert_atom_op(g_MoRe_Hash,randomLattice.id);
+            if (ins_more != 1) {
+              hash_set_insert_atom_op(g_MoRe_Hash,id);
+              ret = hash_set_remove_atom_op(g_Busy_Set,randomLattice.id);
+              if(ret == 1) busy--;
+              ret = hash_set_remove_atom_op(g_Busy_Set,id);
+              if(ret == 1) busy--;
+              continue;
+            }
+            exchanged = true;
+          } else {
+            int rm_re = hash_set_remove_atom_op(g_Re_Hash,randomLattice.id);
+            if (rm_re != 1) {
+              ret = hash_set_remove_atom_op(g_Busy_Set,randomLattice.id);
+              if(ret == 1) busy--;
+              ret = hash_set_remove_atom_op(g_Busy_Set,id);
+              if(ret == 1) busy--;
+              continue;
+            }
+            int rm_more = hash_set_remove_atom_op(g_MoRe_Hash,id);
+            if (rm_more != 1) {
+              hash_set_insert_atom_op(g_Re_Hash,randomLattice.id);
+              ret = hash_set_remove_atom_op(g_Busy_Set,randomLattice.id);
+              if(ret == 1) busy--;
+              ret = hash_set_remove_atom_op(g_Busy_Set,id);
+              if(ret == 1) busy--;
+              continue;
+            }
+            int ins_re = hash_set_insert_atom_op(g_Re_Hash,id);
+            if (ins_re != 1) {
+              hash_set_insert_atom_op(g_Re_Hash,randomLattice.id);
+              hash_set_insert_atom_op(g_MoRe_Hash,id);
+              ret = hash_set_remove_atom_op(g_Busy_Set,randomLattice.id);
+              if(ret == 1) busy--;
+              ret = hash_set_remove_atom_op(g_Busy_Set,id);
+              if(ret == 1) busy--;
+              continue;
+            }
+            int ins_more = hash_set_insert_atom_op(g_MoRe_Hash,randomLattice.id);
+            if (ins_more != 1) {
+              hash_set_remove_atom_op(g_Re_Hash,id);
+              hash_set_insert_atom_op(g_Re_Hash,randomLattice.id);
+              hash_set_insert_atom_op(g_MoRe_Hash,id);
+              ret = hash_set_remove_atom_op(g_Busy_Set,randomLattice.id);
+              if(ret == 1) busy--;
+              ret = hash_set_remove_atom_op(g_Busy_Set,id);
+              if(ret == 1) busy--;
+              continue;
+            }
+            exchanged = true;
+          }
+
+          if (!exchanged) {
+            ret = hash_set_remove_atom_op(g_Busy_Set,randomLattice.id);
+            if(ret == 1) busy--;
+            ret = hash_set_remove_atom_op(g_Busy_Set,id);
+            if(ret == 1) busy--;
+            continue;
           }
           x = temp_x;
           y = temp_y;
@@ -1825,24 +1920,81 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
         else if(numRe > 0 && numRe < LatticesList::MAX_1NN){
           double ranmov = randomFloat(tid + id + loop_index);
           if(ranmov > (static_cast<double>(numRe) / LatticesList::MAX_1NN)) {
-            if (randomLattice.type == LatticeTypes::Mo) {  // 交换位置
-              ret = hash_set_remove_atom_op(g_MoRe_Hash,id);
-              num_more--;
+            bool exchanged = false;
+            if (randomLattice.type == LatticeTypes::Mo) {
+              int rm_more = hash_set_remove_atom_op(g_MoRe_Hash,id);
+              if (rm_more != 1) {
+                ret = hash_set_remove_atom_op(g_Busy_Set,randomLattice.id);
+                if(ret == 1) busy--;
+                ret = hash_set_remove_atom_op(g_Busy_Set,id);
+                if(ret == 1) busy--;
+                continue;
+              }
+              int ins_more = hash_set_insert_atom_op(g_MoRe_Hash,randomLattice.id);
+              if (ins_more != 1) {
+                hash_set_insert_atom_op(g_MoRe_Hash,id);
+                ret = hash_set_remove_atom_op(g_Busy_Set,randomLattice.id);
+                if(ret == 1) busy--;
+                ret = hash_set_remove_atom_op(g_Busy_Set,id);
+                if(ret == 1) busy--;
+                continue;
+              }
+              exchanged = true;
+            } else if(randomLattice.type == LatticeTypes::Re) {
+              int rm_re = hash_set_remove_atom_op(g_Re_Hash,randomLattice.id);
+              if (rm_re != 1) {
+                ret = hash_set_remove_atom_op(g_Busy_Set,randomLattice.id);
+                if(ret == 1) busy--;
+                ret = hash_set_remove_atom_op(g_Busy_Set,id);
+                if(ret == 1) busy--;
+                continue;
+              }
+              int rm_more = hash_set_remove_atom_op(g_MoRe_Hash,id);
+              if (rm_more != 1) {
+                hash_set_insert_atom_op(g_Re_Hash,randomLattice.id);
+                ret = hash_set_remove_atom_op(g_Busy_Set,randomLattice.id);
+                if(ret == 1) busy--;
+                ret = hash_set_remove_atom_op(g_Busy_Set,id);
+                if(ret == 1) busy--;
+                continue;
+              }
+              int ins_re = hash_set_insert_atom_op(g_Re_Hash,id);
+              if (ins_re != 1) {
+                hash_set_insert_atom_op(g_Re_Hash,randomLattice.id);
+                hash_set_insert_atom_op(g_MoRe_Hash,id);
+                ret = hash_set_remove_atom_op(g_Busy_Set,randomLattice.id);
+                if(ret == 1) busy--;
+                ret = hash_set_remove_atom_op(g_Busy_Set,id);
+                if(ret == 1) busy--;
+                continue;
+              }
+              int ins_more = hash_set_insert_atom_op(g_MoRe_Hash,randomLattice.id);
+              if (ins_more != 1) {
+                hash_set_remove_atom_op(g_Re_Hash,id);
+                hash_set_insert_atom_op(g_Re_Hash,randomLattice.id);
+                hash_set_insert_atom_op(g_MoRe_Hash,id);
+                ret = hash_set_remove_atom_op(g_Busy_Set,randomLattice.id);
+                if(ret == 1) busy--;
+                ret = hash_set_remove_atom_op(g_Busy_Set,id);
+                if(ret == 1) busy--;
+                continue;
+              }
+              exchanged = true;
+            } else {
+              ret = hash_set_remove_atom_op(g_Busy_Set,randomLattice.id);
+              if(ret == 1) busy--;
+              ret = hash_set_remove_atom_op(g_Busy_Set,id);
+              if(ret == 1) busy--;
+              continue;
+            }
 
-              ret = hash_set_insert_atom_op(g_MoRe_Hash,randomLattice.id);
-              num_more++;
-              // g_Pair_Atoms[tid]=randomLattice.id;
-              // printf("(%d,%d) (%d->%d)  , (%d->%d)\n",tid,loop_index,id,randomLattice.id,getType(id),getType(randomLattice.id));
-            } else if(randomLattice.type == LatticeTypes::Re) { // Re 也是交换位置
-              ret = hash_set_remove_atom_op(g_Re_Hash,randomLattice.id);
-              ret = hash_set_remove_atom_op(g_MoRe_Hash,id);
-              num_more--;
-              ret = hash_set_insert_atom_op(g_Re_Hash,id);
-              ret = hash_set_insert_atom_op(g_MoRe_Hash,randomLattice.id);
-              num_more++;
-              // g_Pair_Atoms[tid]=randomLattice.id;
-              // printf("(%d,%d) (%d->%d)  , (%d->%d)\n",tid,loop_index,id,randomLattice.id,getType(id),getType(randomLattice.id));
-            }else continue;
+            if (!exchanged) {
+              ret = hash_set_remove_atom_op(g_Busy_Set,randomLattice.id);
+              if(ret == 1) busy--;
+              ret = hash_set_remove_atom_op(g_Busy_Set,id);
+              if(ret == 1) busy--;
+              continue;
+            }
             x = temp_x;
             y = temp_y;
             z = temp_z;
