@@ -11,7 +11,7 @@ add_library(${KMC_GPU_LIB_NAME} STATIC
         DeviceVacRatesSolver.cpp
         )
 
-target_compile_options(${KMC_GPU_LIB_NAME} PRIVATE -D__HIP_PLATFORM_HCC__= -DTHRUST_DEVICE_SYSTEM=THRUST_DEVICE_SYSTEM_HIP  -D__HIP__ -D__HIP_PLATFORM_AMD__= -I"${ROCM_PATH}/hip/include" -I"${ROCM_PATH}/llvm/lib/clang/14.0.0" -I${ROCM_PATH}/hsa/include)
+target_compile_options(${KMC_GPU_LIB_NAME} PRIVATE -D__HIP_PLATFORM_HCC__= -DTHRUST_DEVICE_SYSTEM=THRUST_DEVICE_SYSTEM_HIP  -D__HIP__ -D__HIP_PLATFORM_AMD__= -I"${ROCM_PATH}/hip/include" -I"${ROCM_PATH}/llvm/lib/clang/17.0.0" -I${ROCM_PATH}/hsa/include)
 
 target_include_directories(${KMC_GPU_LIB_NAME} PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
