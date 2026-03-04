@@ -1,7 +1,12 @@
 
 #include "gpu_simulate.h"
+#include <cstdlib>
 
 // #include <hiprand_kernel.h>
+#ifndef KMC_RECB_DEVICE_PRINTF
+#define KMC_RECB_DEVICE_PRINTF 0
+#endif
+
 // Global Variables
 __device__ static GPUHashSet *g_MoRe_Hash;
 __device__ static GPUHashSet *g_MoMo_Hash;
@@ -65,6 +70,46 @@ namespace gpuSimulate {
     long int *Pair_Atoms;
     long int *d_Pair_Atoms;
     dev_meta *d_meta;
+
+    static bool recbProfileEnabled() {
+      static int cached = -1;
+      if (cached != -1) return cached != 0;
+      const char* v = std::getenv("KMC_RECB_PROFILE");
+      cached = (v != nullptr && v[0] != '\0' && v[0] != '0') ? 1 : 0;
+      return cached != 0;
+    }
+
+    static hipEvent_t recb_evt_begin{};
+    static hipEvent_t recb_evt_after_exchange{};
+    static hipEvent_t recb_evt_after_type{};
+    static hipEvent_t recb_evt_after_copy{};
+    static hipEvent_t recb_evt_after_clear{};
+    static bool recb_evt_inited = false;
+
+    static float recb_ms_exchange = 0.0f;
+    static float recb_ms_type = 0.0f;
+    static float recb_ms_copy = 0.0f;
+    static float recb_ms_clear = 0.0f;
+
+    static void initRecbProfileEvents() {
+      if (recb_evt_inited) return;
+      HANDLE_HIP(hipEventCreate(&recb_evt_begin));
+      HANDLE_HIP(hipEventCreate(&recb_evt_after_exchange));
+      HANDLE_HIP(hipEventCreate(&recb_evt_after_type));
+      HANDLE_HIP(hipEventCreate(&recb_evt_after_copy));
+      HANDLE_HIP(hipEventCreate(&recb_evt_after_clear));
+      recb_evt_inited = true;
+    }
+
+    static void destroyRecbProfileEvents() {
+      if (!recb_evt_inited) return;
+      hipEventDestroy(recb_evt_begin);
+      hipEventDestroy(recb_evt_after_exchange);
+      hipEventDestroy(recb_evt_after_type);
+      hipEventDestroy(recb_evt_after_copy);
+      hipEventDestroy(recb_evt_after_clear);
+      recb_evt_inited = false;
+    }
 
 
 
@@ -1550,7 +1595,9 @@ __global__ void update_Pair_Atoms(int arr_size){
 }
 __global__ void calcExchangePairs(int sector_id,int arr_size
 ){
+#if KMC_RECB_DEVICE_PRINTF
   printf("begin calcExchangePairs\n");
+#endif
   // print_g_Pair_Atoms(arr_size);
   // checkpointers();
   if(g_Pair_Atoms == nullptr)
@@ -1911,6 +1958,9 @@ void recb_solver_GPU(
     // HANDLE_HIP(hipMemset(Pair_Atoms, -1,arr_size * sizeof(long int) * 2));
    
     // printf("starting recb solver with GPU sector_id:%d,arr_size:%d\n",sector_id,arr_size);
+    const bool do_profile = recbProfileEnabled();
+    if (do_profile) initRecbProfileEvents();
+
     blockSize = 128;
     numBlocks = pair_atoms_size / blockSize + 1;
     // print_Hash_and_Pair
@@ -1918,11 +1968,13 @@ void recb_solver_GPU(
     // printf("arr size is %ld\n",pair_atoms_size);
     // hipLaunchKernelGGL(print_Hash_and_Pair, 1, 1, 0, 0,arr_size,0);
   
-    hipDeviceSynchronize();
+    if (do_profile) HANDLE_HIP(hipEventRecord(recb_evt_begin, 0));
     hipLaunchKernelGGL(calcExchangePairs, numBlocks, blockSize, 0, 0,
                       sector_id,pair_atoms_size
                       );
+    CHECK_FOR_ERROR();
     hipDeviceSynchronize();
+    if (do_profile) HANDLE_HIP(hipEventRecord(recb_evt_after_exchange, 0));
     // print_momo_and_more
     //  hipLaunchKernelGGL(print_momo_and_more, 1, 1, 0, 0
                       
@@ -1949,16 +2001,20 @@ void recb_solver_GPU(
     HANDLE_HIP(hipMemset(surface_type, 0xFF, surface_Hash->device_ptr()->capacity * sizeof(long int)));
     HANDLE_HIP(hipMemset(ghost_type, 0xFF, ghost_Hash->device_ptr()->capacity * sizeof(long int)));
 
-    hipDeviceSynchronize();
     hipLaunchKernelGGL(get_surface_and_ghost_type, 1, 2, 0, 0,surface_type,ghost_type);
+    CHECK_FOR_ERROR();
     hipDeviceSynchronize();
+    if (do_profile) HANDLE_HIP(hipEventRecord(recb_evt_after_type, 0));
 
     HANDLE_HIP(hipMemcpy(h_ghost_Hash, ghost_Hash->device_ptr()->keys, ghost_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
     HANDLE_HIP(hipMemcpy(h_surface_Hash, surface_Hash->device_ptr()->keys, surface_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
-    ghost_Hash->clear();
-    surface_Hash->clear();
     HANDLE_HIP(hipMemcpy(h_surface_type, surface_type, surface_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
     HANDLE_HIP(hipMemcpy(h_ghost_type, ghost_type, ghost_Hash->device_ptr()->capacity*sizeof(long int), hipMemcpyDeviceToHost));
+    if (do_profile) HANDLE_HIP(hipEventRecord(recb_evt_after_copy, 0));
+
+    ghost_Hash->clear();
+    surface_Hash->clear();
+    if (do_profile) HANDLE_HIP(hipEventRecord(recb_evt_after_clear, 0));
     // for(int i=0;i<surface_Hash->device_ptr()->capacity;i++){
     //   printf("%ld-%ld\t",h_surface_Hash[i],h_surface_type[i]);
     //   if(i%20 == 0)
@@ -1968,6 +2024,21 @@ void recb_solver_GPU(
     sizes[1]= surface_Hash->device_ptr()->capacity;
     hipFree(surface_type);
     hipFree(ghost_type);
+
+    if (do_profile) {
+      HANDLE_HIP(hipEventSynchronize(recb_evt_after_clear));
+      HANDLE_HIP(hipEventElapsedTime(&recb_ms_exchange, recb_evt_begin, recb_evt_after_exchange));
+      HANDLE_HIP(hipEventElapsedTime(&recb_ms_type, recb_evt_after_exchange, recb_evt_after_type));
+      HANDLE_HIP(hipEventElapsedTime(&recb_ms_copy, recb_evt_after_type, recb_evt_after_copy));
+      HANDLE_HIP(hipEventElapsedTime(&recb_ms_clear, recb_evt_after_copy, recb_evt_after_clear));
+      std::cout
+          << "[KMC_RECB_PROFILE] N=" << pair_atoms_size
+          << " exchange_ms=" << recb_ms_exchange
+          << " type_ms=" << recb_ms_type
+          << " copy_ms=" << recb_ms_copy
+          << " clear_ms=" << recb_ms_clear
+          << std::endl;
+    }
     // printf("cal exchange finished \n");
 }
 
@@ -2168,6 +2239,8 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
 
 void gpu_final(){
   using namespace gpuSimulate;
+
+  destroyRecbProfileEvents();
 
   // 释放GPU内存
   HANDLE_HIP(hipFree(d_sum_rates));
