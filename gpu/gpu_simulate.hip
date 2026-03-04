@@ -2079,6 +2079,14 @@ __global__ void get_surface_and_ghost_type(long int *surface_type,long int *ghos
         // printf("\n");
     }
 }
+__global__ void compute_types_for_keys(const long int* __restrict__ keys,
+                                      long int* __restrict__ out_types,
+                                      int capacity) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= capacity) return;
+    long int k = keys[tid];
+    if (k != -1 && k != -2) out_types[tid] = getType(k);
+}
 __global__ void get_surface_and_ghost_type1(long int *surface_type, long int *ghost_type) {
     _type_lattice_count tid = blockIdx.x * blockDim.x + threadIdx.x;
     
@@ -2153,7 +2161,16 @@ void recb_solver_GPU(
     HANDLE_HIP(hipMemset(surface_type, 0xFF, surface_Hash->device_ptr()->capacity * sizeof(long int)));
     HANDLE_HIP(hipMemset(ghost_type, 0xFF, ghost_Hash->device_ptr()->capacity * sizeof(long int)));
 
-    hipLaunchKernelGGL(get_surface_and_ghost_type, 1, 2, 0, 0,surface_type,ghost_type);
+    const int type_block = 256;
+    const int surface_cap = surface_Hash->device_ptr()->capacity;
+    const int ghost_cap = ghost_Hash->device_ptr()->capacity;
+    const int surface_grid = (surface_cap + type_block - 1) / type_block;
+    const int ghost_grid = (ghost_cap + type_block - 1) / type_block;
+    hipLaunchKernelGGL(compute_types_for_keys, surface_grid, type_block, 0, 0,
+                       surface_Hash->device_ptr()->keys, surface_type, surface_cap);
+    CHECK_FOR_ERROR();
+    hipLaunchKernelGGL(compute_types_for_keys, ghost_grid, type_block, 0, 0,
+                       ghost_Hash->device_ptr()->keys, ghost_type, ghost_cap);
     CHECK_FOR_ERROR();
     hipDeviceSynchronize();
     if (do_profile) HANDLE_HIP(hipEventRecord(recb_evt_after_type, 0));

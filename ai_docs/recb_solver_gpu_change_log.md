@@ -60,3 +60,22 @@
 - 不改变任何对外接口。
 - 交换失败会更倾向于“跳过本次交换”（并释放 busy），以保证集合不被破坏。
 
+## 变更 003：并行化 ghost/surface type 计算，移除 2 线程串行扫表
+
+### 修改文件
+- [gpu_simulate.hip](file:///Users/bytedance/Downloads/kmc_new/gpu/gpu_simulate.hip)
+
+### 修改内容
+- 新增并行核函数 `compute_types_for_keys(keys, out_types, capacity)`：
+  - 每个线程负责一个槽位 `keys[tid]`，若 key 非 `-1/-2` 则调用 `getType(key)` 写回 `out_types[tid]`。
+- `recb_solver_GPU` 中的 type 计算从：
+  - `get_surface_and_ghost_type<<<1,2>>>`（2 个线程串行遍历 capacity）
+  - 改为分别对 `surface` 与 `ghost` 启动并行 grid/block 的 kernel（默认 block=256）。
+
+### 为什么要这样改
+- 原实现的 type 计算阶段是典型串行瓶颈：即便 exchange kernel 很快，回传前仍要由 1~2 个线程遍历整个 hashset capacity，百万级下会直接拖垮整体吞吐。
+- 本轮改动保持“回传数据结构不变”（仍按槽位对齐的 keys/type 数组），只替换计算方式为并行，从而在不改 CPU 回写逻辑的前提下立即提升 type 阶段性能。
+
+### 对行为/接口的影响
+- 不改变对外接口、不改变 keys/type 的对齐语义。
+- 输出类型结果与原逻辑一致（仍对每个有效 key 调用 `getType`）。
