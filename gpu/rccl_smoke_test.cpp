@@ -3,7 +3,11 @@
 #ifdef KMC_RCCL_ENABLE
 
 #include <hip/hip_runtime.h>
+#if __has_include(<nccl.h>)
 #include <nccl.h>
+#else
+#include <rccl.h>
+#endif
 #include <cstdlib>
 #include <iostream>
 
@@ -71,4 +75,3 @@ void rccl_smoke_test() {
 void rccl_smoke_test() {}
 
 #endif
-

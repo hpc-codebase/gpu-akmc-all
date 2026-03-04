@@ -18,6 +18,7 @@
 #include <iostream>
 #include <mpi.h>
 #include "../gpu/gpu_simulate.h"
+#include "../gpu/gpu_comm.h"
 
 //#include <sys/sysinfo.h>
 
@@ -43,6 +44,8 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
     p_model->p_domain->sub_box_lattice_size[2]);
   }
   MPI_Barrier(SimulationDomain::comm_sim_pro.comm);
+  gpu_comm_init(SimulationDomain::comm_sim_pro.comm);
+  gpu_comm_sanity_allreduce(SimulationDomain::comm_sim_pro.comm);
   // 扇区的执行顺序是 0, 7, 2, 5, 3, 4, 1, 6
   time_total_start = MPI_Wtime();
   for (int64_t step = 1; step < time_steps; step++) { // time steps loop
@@ -126,6 +129,7 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
 
   p_event_hooks->onAllDone(); //空的函数
   gpu_final();
+  gpu_comm_finalize();
 
   // if(SimulationDomain::comm_sim_pro.own_rank == 0) output_time();
   MPI_Reduce(&time_total_end, &local_to_total, 1, MPI_DOUBLE, MPI_MIN, 0, SimulationDomain::comm_sim_pro.comm);

@@ -9,6 +9,8 @@ add_library(${KMC_GPU_LIB_NAME} STATIC
         gpuError.h
         DeviceVacRatesSolver.h
         DeviceVacRatesSolver.cpp
+        gpu_comm.cpp
+        gpu_comm.h
         rccl_smoke_test.cpp
         rccl_smoke_test.h
         )
@@ -21,7 +23,7 @@ target_include_directories(${KMC_GPU_LIB_NAME} PUBLIC
         )
 
 if(KMC_RCCL_ENABLE_FLAG)
-        find_path(KMC_NCCL_INCLUDE_DIR nccl.h
+        find_path(KMC_NCCL_INCLUDE_DIR NAMES nccl.h rccl.h
                 PATHS
                 ENV RCCL_ROOT
                 ENV ROCM_PATH
@@ -38,16 +40,14 @@ if(KMC_RCCL_ENABLE_FLAG)
                 /opt
                 PATH_SUFFIXES lib lib64)
         if(NOT KMC_NCCL_INCLUDE_DIR OR NOT KMC_NCCL_LIBRARY)
-                message(FATAL_ERROR "KMC_RCCL_ENABLE_FLAG=ON but nccl/rccl not found. Set RCCL_ROOT or ROCM_PATH.")
+                message(FATAL_ERROR "KMC_RCCL_ENABLE_FLAG=ON but NCCL/RCCL headers or libraries not found. Set RCCL_ROOT or ROCM_PATH.")
         endif()
         target_include_directories(${KMC_GPU_LIB_NAME} PRIVATE ${KMC_NCCL_INCLUDE_DIR})
         target_link_libraries(${KMC_GPU_LIB_NAME} PUBLIC ${KMC_NCCL_LIBRARY})
         target_compile_definitions(${KMC_GPU_LIB_NAME} PRIVATE KMC_RCCL_ENABLE=1)
 endif()
 
-target_link_libraries(${KMC_GPU_LIB_NAME} 
-        ${PKMC_LIB_NAME}
-        )
+target_link_libraries(${KMC_GPU_LIB_NAME} PUBLIC ${PKMC_LIB_NAME})
 
 # install bin and libs
 install(TARGETS ${KMC_GPU_LIB_NAME}
