@@ -699,6 +699,7 @@ __device__ int hash_set_insert_atom_op(GPUHashSet* set, long int key) {
 }
 
 __global__ void calcExchangeAtoms(dev_atom *atoms, const _type_lattice_count count){
+
     const _type_lattice_count tid = blockIdx.x * blockDim.x + threadIdx.x;//用这个来标志dev_atom中的原子数
     if(atoms == nullptr) return;
     if(tid < count){
@@ -1549,6 +1550,7 @@ __global__ void update_Pair_Atoms(int arr_size){
 }
 __global__ void calcExchangePairs(int sector_id,int arr_size
 ){
+  printf("begin calcExchangePairs\n");
   // print_g_Pair_Atoms(arr_size);
   // checkpointers();
   if(g_Pair_Atoms == nullptr)
