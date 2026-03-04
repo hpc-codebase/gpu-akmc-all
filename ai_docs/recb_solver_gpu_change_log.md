@@ -122,3 +122,21 @@
 ### 对行为/接口的影响
 - 不改变哈希表语义：清空后槽位仍为 `INIT_FLAG(-1)`。
 - 不改变任何对外接口。
+
+## 变更 006：增加 RCCL/NCCL 编译探测与最小运行烟囱测试
+
+### 修改文件
+- [config.cmake](file:///Users/bytedance/Downloads/kmc_new/config.cmake)
+- [gpu/CMakeLists.txt](file:///Users/bytedance/Downloads/kmc_new/gpu/CMakeLists.txt)
+- [gpu_simulate.h](file:///Users/bytedance/Downloads/kmc_new/gpu/gpu_simulate.h)
+- [gpu_simulate.hip](file:///Users/bytedance/Downloads/kmc_new/gpu/gpu_simulate.hip)
+- [rccl_smoke_test.cpp](file:///Users/bytedance/Downloads/kmc_new/gpu/rccl_smoke_test.cpp)
+- [rccl_smoke_test.h](file:///Users/bytedance/Downloads/kmc_new/gpu/rccl_smoke_test.h)
+- 文档：[gpu_comm_rccl_smoke_test.md](file:///Users/bytedance/Downloads/kmc_new/ai_docs/gpu_comm_rccl_smoke_test.md)
+
+### 修改内容
+- 新增 CMake 选项 `KMC_RCCL_ENABLE_FLAG`（默认 OFF），开启后在 `gpu` 静态库中查找并链接 `rccl/nccl`，并定义 `KMC_RCCL_ENABLE`。
+- 增加可选 smoke test：仅当运行时设置 `KMC_RCCL_SMOKE=1` 时执行 `ncclCommInitRank(1)` 与一个最小 `ncclAllReduce`，用于验证机器 RCCL/NCCL 运行环境。
+
+### 为什么要这样改
+- 在开始把 MPI 通信链路迁移到 RCCL/NCCL 之前，需要先确认编译链路与运行时库在目标机器上可用，避免“改了一大堆后才发现环境不通”。

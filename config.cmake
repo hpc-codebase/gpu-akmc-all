@@ -6,6 +6,7 @@ option(KMC_TEST_BUILD_ENABLE_FLAG "Enable test" OFF) # enable test
 option(KMC_TOOLS_BUILD_FLAG "Enable building tools" ON) # enable tools building
 option(KMC_TEST_MPI_ENABLE_FLAG "Enable MPI in test" OFF) # enable mpi in test, its value depends on option MPI_ENABLE_FLAG.
 option(KMC_HIP_ENABLE_FLAG "Use GPU" ON) # change this flag to OFF to disable GPU
+option(KMC_RCCL_ENABLE_FLAG "Enable RCCL/NCCL GPU communication" OFF)
 
 set(KMC_RAND "MT" CACHE STRING "random number generating algorithm") # random number generating
 # options are:

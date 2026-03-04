@@ -2305,6 +2305,9 @@ void initialize_gpu(int process_rank){
   HANDLE_HIP(hipGetDeviceCount(&gpu_count));
   HANDLE_HIP(hipSetDevice(process_rank % gpu_count));
   HANDLE_HIP(hipDeviceReset());
+#ifdef KMC_RCCL_ENABLE
+  rccl_smoke_test();
+#endif
 }
 
 void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain *_p_domain,

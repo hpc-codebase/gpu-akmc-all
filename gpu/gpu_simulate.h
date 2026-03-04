@@ -47,6 +47,8 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
                 std::vector<long int> pair_atoms
                 );
 
+void rccl_smoke_test();
+
 void exchange_lattices(dev_event* h_event);
 
 void add_surface(_type_lattice_id& surface_id,
