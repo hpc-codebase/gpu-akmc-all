@@ -529,6 +529,8 @@ template <class PKs, class Ins> void SubLattice::syncSimRegions(Ins &pk_inst, st
     if (gpu_comm_enabled()) {
       packer.transfer_buffer_to_GPU_device(reinterpret_cast<ChangeLattice_GPU*>(gpu_comm_default_recv_device_ptr()),
                                            num_receive[dim_id], dim_id, p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, cur_sector.id);
+      commForwardFromRecvPayload(reinterpret_cast<ChangeLattice_GPU*>(gpu_comm_default_recv_device_ptr()),
+                                 num_receive[dim_id] - 1, cur_sector.id);
       packer.onReceive2_gpu(receive_buff_gpu, recv_regions[dim_id], num_receive[dim_id], dim_id, exchange_ghost,
                       p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, cur_sector.id,
                       exchange_surface_x, exchange_surface_y, exchange_surface_z, p_domain);
@@ -710,6 +712,8 @@ template <class PKg, class Ins> void SubLattice::syncNextSectorGhostRegions(Ins 
     if (gpu_comm_enabled()) {
       packer.transfer_buffer_to_GPU2_device(reinterpret_cast<ChangeLattice_GPU*>(gpu_comm_default_recv_device_ptr()),
                                             num_receive[dim_id], dim_id, p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, next_sector.id);
+      commForwardFromRecvPayload(reinterpret_cast<ChangeLattice_GPU*>(gpu_comm_default_recv_device_ptr()),
+                                 num_receive[dim_id], next_sector.id);
       packer.onReceive2_gpu(receive_buff_gpu, num_receive[dim_id], dim_id, exchange_surface_x, exchange_surface_y, exchange_surface_z,
                 p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, next_sector.id, p_domain);
     } else {

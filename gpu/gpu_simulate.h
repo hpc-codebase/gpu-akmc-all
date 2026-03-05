@@ -4,6 +4,7 @@
 #include "hip/hip_runtime.h"
 #include <hip/hip_runtime.h>
 #include "gpuError.h"
+#include "gpu_comm.h"
 #include "DeviceVacRatesSolver.h"
 #include <cassert>
 #include <iostream>
@@ -98,6 +99,8 @@ int commSurfaceCapacity();
 void commClearSurfaceSector(int sect);
 void commInsertGhostId(int sector_id, long int id);
 void commInsertSurfaceId(long int id);
+
+void commForwardFromRecvPayload(const ChangeLattice_GPU *d_payload, int n, int sector_id);
 // __global__ void calcExchangePairs(dev_meta meta,long int *Pair_Atoms,
 //                             HIPHashSet *MoRe_Hash,HIPHashSet *MoMo_Hash,
 //                             HIPHashSet *Re_Hash,HIPHashSet *V_Hash,

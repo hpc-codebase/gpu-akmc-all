@@ -1544,6 +1544,47 @@ void commCompactSurfaceBucket(int bucket, long int *d_out, int *d_count) {
 int commSurfaceCapacity() {
   return gpuSimulate::comm_surface_capacity;
 }
+
+__global__ void forwardFromRecvPayloadKernel(const ChangeLattice_GPU *payload, int n, int sector_id) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  ChangeLattice_GPU c = payload[i];
+  long int id = getId(c.x, c.y, c.z);
+  if (isGhostLat(id)) {
+    int base = sector_id * 7;
+    for (int k = 0; k < 7; k++) {
+      const auto* r = &g_comm_ghost_regions[base + k];
+      if (r->x_low <= c.x && c.x < r->x_high && r->y_low <= c.y && c.y < r->y_high && r->z_low <= c.z && c.z < r->z_high) {
+        GPUHashSet* b = commBucketPtr(k);
+        if (b) hash_set_insert_atom_op(b, id);
+        break;
+      }
+    }
+  }
+  if (isSurfaceLat(id)) {
+    if (!g_comm_surface_offsets || !g_comm_surface_boxes || !g_comm_surface_buckets_ptr) return;
+    for (int b = 0; b < 24; b++) {
+      int start = g_comm_surface_offsets[b];
+      int end = g_comm_surface_offsets[b + 1];
+      for (int j = start; j < end; j++) {
+        CommBox box = g_comm_surface_boxes[j];
+        if (box.x_low <= c.x && c.x < box.x_high && box.y_low <= c.y && c.y < box.y_high && box.z_low <= c.z && c.z < box.z_high) {
+          GPUHashSet* set = g_comm_surface_buckets_ptr[b];
+          if (set) hash_set_insert_atom_op(set, id);
+          break;
+        }
+      }
+    }
+  }
+}
+
+void commForwardFromRecvPayload(const ChangeLattice_GPU *d_payload, int n, int sector_id) {
+  if (!d_payload) return;
+  if (n <= 0) return;
+  int blockSize = 256;
+  int blockNum = (n + blockSize - 1) / blockSize;
+  hipLaunchKernelGGL(forwardFromRecvPayloadKernel, blockNum, blockSize, 0, 0, d_payload, n, sector_id);
+}
 __global__ void printpointer(){
   if(g_MoMo_Hash == nullptr)
     printf("is a null\n");
