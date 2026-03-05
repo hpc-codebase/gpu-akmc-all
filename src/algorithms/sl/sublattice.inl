@@ -633,40 +633,36 @@ template <class PKg, class Ins> void SubLattice::syncNextSectorGhostRegions(Ins 
     // prepare data
     // note: the direction in sendLength, onSend and onReceive are not used (ignored).
     num_send[dim_id] = packer.sendLength2(dim_id, exchange_surface_x[next_sector.id], exchange_surface_y[next_sector.id], exchange_surface_z[next_sector.id]);
-    //num_send[dim_id] = packer.sendLength(send_regions[dim_id], dim_id, comm::DIR_LOWER);
-    assert(num_send[dim_id] >= 0); // todo remove
+    assert(num_send[dim_id] >= 0);
     if (gpu_comm_enabled()) {
-      static _type_lattice_id *d_ids = nullptr;
-      static size_t d_ids_cap = 0;
       static ChangeLattice_GPU *d_payload = nullptr;
       static size_t d_payload_cap = 0;
+      static long int *d_tmp_ids = nullptr;
+      static size_t d_tmp_ids_cap = 0;
+      static int *d_tmp_count = nullptr;
 
-      std::vector<_type_lattice_id> ids;
-      ids.reserve(static_cast<size_t>(num_send[dim_id]));
-      if (dim_id == 0) {
-        for (const auto& latticeId : exchange_surface_x[next_sector.id]) ids.push_back(latticeId);
-      } else if (dim_id == 1) {
-        for (const auto& latticeId : exchange_surface_y[next_sector.id]) ids.push_back(latticeId);
-      } else {
-        for (const auto& latticeId : exchange_surface_z[next_sector.id]) ids.push_back(latticeId);
+      if (!d_tmp_count) {
+        hipMalloc(reinterpret_cast<void**>(&d_tmp_count), sizeof(int));
+      }
+      if (d_tmp_ids_cap == 0) {
+        d_tmp_ids_cap = static_cast<size_t>(commSurfaceCapacity());
+        hipMalloc(reinterpret_cast<void**>(&d_tmp_ids), d_tmp_ids_cap * sizeof(long int));
       }
 
-      size_t need_ids = ids.size();
+      const int bucket = static_cast<int>(next_sector.id) * 3 + dim_id;
+      commCompactSurfaceBucket(bucket, d_tmp_ids, d_tmp_count);
+      int h_count = 0;
+      hipMemcpy(&h_count, d_tmp_count, sizeof(int), hipMemcpyDeviceToHost);
+
+      num_send[dim_id] = h_count;
       size_t need_payload = static_cast<size_t>(num_send[dim_id]);
-      if (need_ids > d_ids_cap) {
-        if (d_ids) hipFree(d_ids);
-        hipMalloc(reinterpret_cast<void**>(&d_ids), need_ids * sizeof(_type_lattice_id));
-        d_ids_cap = need_ids;
-      }
       if (need_payload > d_payload_cap) {
         if (d_payload) hipFree(d_payload);
         hipMalloc(reinterpret_cast<void**>(&d_payload), need_payload * sizeof(ChangeLattice_GPU));
         d_payload_cap = need_payload;
       }
-
-      if (need_ids > 0) {
-        hipMemcpy(d_ids, ids.data(), need_ids * sizeof(_type_lattice_id), hipMemcpyHostToDevice);
-        packChangeLatticeFromIds_Device(d_ids, d_payload, static_cast<int>(need_ids));
+      if (h_count > 0) {
+        packChangeLatticeFromIds_Device(reinterpret_cast<_type_lattice_id*>(d_tmp_ids), d_payload, h_count);
       }
       send_buff_gpu = d_payload;
     } else {

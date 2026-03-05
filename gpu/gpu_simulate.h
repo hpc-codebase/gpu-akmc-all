@@ -72,12 +72,28 @@ void transferBufferToGPU2_Device(ChangeLattice_GPU *d_buffer, int receive_len, c
 
 void packChangeLatticeFromIds_Device(const _type_lattice_id *d_ids, ChangeLattice_GPU *d_out, int n);
 
+struct CommBox {
+  _type_lattice_id x_low;
+  _type_lattice_id x_high;
+  _type_lattice_id y_low;
+  _type_lattice_id y_high;
+  _type_lattice_id z_low;
+  _type_lattice_id z_high;
+};
+
 void commSetGhostRegions(const comm::Region<comm::_type_lattice_size> *ghost_region, int n);
 void commInitGhostBuckets(int capacity);
 void commClearGhostBuckets();
 void commBuildGhostBucketsFromList(int sector_id, const long int *d_ids, int n);
 void commCompactGhostBucket(int bucket, long int *d_out, int *d_count);
 int commGhostCapacity();
+
+void commSetSurfaceBoxes(const CommBox *boxes, int boxes_count, const int *offsets, int offsets_count);
+void commInitSurfaceBuckets(int capacity);
+void commClearSurfaceBuckets();
+void commBuildSurfaceBucketsFromList(const long int *d_ids, int n);
+void commCompactSurfaceBucket(int bucket, long int *d_out, int *d_count);
+int commSurfaceCapacity();
 // __global__ void calcExchangePairs(dev_meta meta,long int *Pair_Atoms,
 //                             HIPHashSet *MoRe_Hash,HIPHashSet *MoMo_Hash,
 //                             HIPHashSet *Re_Hash,HIPHashSet *V_Hash,
