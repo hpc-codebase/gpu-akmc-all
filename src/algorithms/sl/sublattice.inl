@@ -13,6 +13,7 @@
 #include <cmath>
 #include <comm/comm.hpp>
 #include <comm/preset/sector_forwarding_region.h>
+#include <cstdlib>
 #include <logs/logs.h>
 #include <sys/time.h>
 #include <iostream>
@@ -21,6 +22,22 @@
 #include "../gpu/gpu_comm.h"
 
 //#include <sys/sysinfo.h>
+
+static inline bool kmcGpuCommHostExchangeEnabled() {
+  static int cached = -1;
+  if (cached != -1) return cached != 0;
+  const char* v = std::getenv("KMC_GPU_COMM_HOST_EXCHANGE");
+  cached = (v == nullptr || v[0] == '\0' || v[0] == '1') ? 1 : 0;
+  return cached != 0;
+}
+
+static inline bool kmcGpuCommD2HPayloadEnabled() {
+  static int cached = -1;
+  if (cached != -1) return cached != 0;
+  const char* v = std::getenv("KMC_GPU_COMM_D2H_PAYLOAD");
+  cached = (v == nullptr || v[0] == '\0' || v[0] == '1') ? 1 : 0;
+  return cached != 0;
+}
 
 template <class PKg, class PKs, class Ins, typename E>
 void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks *p_event_hooks) {
@@ -500,12 +517,15 @@ template <class PKs, class Ins> void SubLattice::syncSimRegions(Ins &pk_inst, st
       gpu_comm_send_recv_default(&numsend, 1, &numrecv, 1, sizeof(int), ranks_send[dim_id], ranks_recv[dim_id],
                                  SimulationDomain::comm_sim_pro.comm);
       assert(numrecv >= 0);
-      receive_buff_gpu = new ChangeLattice_GPU[numrecv];
+      receive_buff_gpu = nullptr;
       num_receive[dim_id] = numrecv;
       gpu_comm_send_recv_device_default(send_buff_gpu, static_cast<size_t>(numsend) * sizeof(ChangeLattice_GPU),
                                         nullptr, static_cast<size_t>(numrecv) * sizeof(ChangeLattice_GPU),
                                         ranks_send[dim_id], ranks_recv[dim_id], SimulationDomain::comm_sim_pro.comm);
-      hipMemcpy(receive_buff_gpu, gpu_comm_default_recv_device_ptr(), static_cast<size_t>(numrecv) * sizeof(ChangeLattice_GPU), hipMemcpyDeviceToHost);
+      if (kmcGpuCommD2HPayloadEnabled()) {
+        receive_buff_gpu = new ChangeLattice_GPU[numrecv];
+        hipMemcpy(receive_buff_gpu, gpu_comm_default_recv_device_ptr(), static_cast<size_t>(numrecv) * sizeof(ChangeLattice_GPU), hipMemcpyDeviceToHost);
+      }
     } else {
       MPI_Isend(send_buff, numsend, data_type, ranks_send[dim_id], SingleSideForwardingTag2,
                 SimulationDomain::comm_sim_pro.comm, &send_requests[dim_id]);
@@ -531,9 +551,16 @@ template <class PKs, class Ins> void SubLattice::syncSimRegions(Ins &pk_inst, st
                                            num_receive[dim_id], dim_id, p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, cur_sector.id);
       commForwardFromRecvPayload(reinterpret_cast<ChangeLattice_GPU*>(gpu_comm_default_recv_device_ptr()),
                                  num_receive[dim_id] - 1, cur_sector.id);
-      packer.onReceive2_gpu(receive_buff_gpu, recv_regions[dim_id], num_receive[dim_id], dim_id, exchange_ghost,
-                      p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, cur_sector.id,
-                      exchange_surface_x, exchange_surface_y, exchange_surface_z, p_domain);
+      if (kmcGpuCommD2HPayloadEnabled()) {
+        if (kmcGpuCommHostExchangeEnabled()) {
+          packer.onReceive2_gpu(receive_buff_gpu, recv_regions[dim_id], num_receive[dim_id], dim_id, exchange_ghost,
+                          p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, cur_sector.id,
+                          exchange_surface_x, exchange_surface_y, exchange_surface_z, p_domain);
+        } else {
+          packer.onReceive2_gpu_lattice_only(receive_buff_gpu, num_receive[dim_id], dim_id,
+                          p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, cur_sector.id);
+        }
+      }
     } else {
       packer.transfer_buffer_to_GPU(receive_buff, num_receive[dim_id], dim_id, p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, cur_sector.id);
       packer.onReceive2(receive_buff, recv_regions[dim_id], num_receive[dim_id], dim_id, exchange_ghost, 
@@ -544,7 +571,7 @@ template <class PKs, class Ins> void SubLattice::syncSimRegions(Ins &pk_inst, st
     // release buffer
     //if(num_send[dim_id] > 0) delete[] send_buff;
     if (gpu_comm_enabled()) {
-      delete[] receive_buff_gpu;
+      if (receive_buff_gpu) delete[] receive_buff_gpu;
     } else {
       delete[] send_buff;
       delete[] receive_buff;
@@ -714,8 +741,13 @@ template <class PKg, class Ins> void SubLattice::syncNextSectorGhostRegions(Ins 
                                             num_receive[dim_id], dim_id, p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, next_sector.id);
       commForwardFromRecvPayload(reinterpret_cast<ChangeLattice_GPU*>(gpu_comm_default_recv_device_ptr()),
                                  num_receive[dim_id], next_sector.id);
-      packer.onReceive2_gpu(receive_buff_gpu, num_receive[dim_id], dim_id, exchange_surface_x, exchange_surface_y, exchange_surface_z,
-                p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, next_sector.id, p_domain);
+      if (kmcGpuCommHostExchangeEnabled()) {
+        packer.onReceive2_gpu(receive_buff_gpu, num_receive[dim_id], dim_id, exchange_surface_x, exchange_surface_y, exchange_surface_z,
+                  p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, next_sector.id, p_domain);
+      } else {
+        packer.onReceive2_gpu_lattice_only(receive_buff_gpu, num_receive[dim_id], dim_id,
+                  p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, next_sector.id);
+      }
     } else {
       packer.transfer_buffer_to_GPU2(receive_buff,num_receive[dim_id], dim_id, p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, next_sector.id);
       packer.onReceive2(receive_buff, num_receive[dim_id], dim_id, exchange_surface_x, exchange_surface_y, exchange_surface_z,

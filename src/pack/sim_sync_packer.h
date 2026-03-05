@@ -45,6 +45,9 @@ public:
                 std::array<std::unordered_set<_type_lattice_id>, 8>& exchange_surface_z,
                 const comm::ColoredDomain *p_domain);
 
+  void onReceive2_gpu_lattice_only(ChangeLattice_GPU *buffer, const int receive_len, const int dimension,
+                const _type_lattice_count *sub_box_lattice_size, const _type_lattice_count *neighbour_local_sub_box, unsigned int id);
+
   void transfer_buffer_to_GPU(ChangeLattice *buffer, int receive_len, const int dimension,
                               const _type_lattice_count *sub_box_lattice_size, const _type_lattice_count *neighbour_local_sub_box, unsigned int id);
 

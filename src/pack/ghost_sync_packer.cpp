@@ -786,3 +786,197 @@ void GhostSyncPacker::onReceive2_gpu(ChangeLattice_GPU *buffer, const int receiv
   }
  
 }
+
+void GhostSyncPacker::onReceive2_gpu_lattice_only(ChangeLattice_GPU *buffer, const int receive_len, const int dimension,
+                                 const _type_lattice_count *sub_box_lattice_size, 
+                                 const _type_lattice_count *neighbour_local_sub_box, unsigned int next_id) {
+  int len = 0;
+  _type_lattice_id x, y, z;
+  _type_lattice_id latti_id;
+  if(dimension == 2){
+    for(len = 0; len < receive_len; len++){
+      x = buffer[len].x;
+      y = buffer[len].y;
+      if(next_id > 3){
+        buffer[len].z += sub_box_lattice_size[dimension];
+      } else {
+        buffer[len].z -= sub_box_lattice_size[dimension] + (neighbour_local_sub_box[dimension] - sub_box_lattice_size[dimension]);
+      }
+      z = buffer[len].z;
+      latti_id = lats->getId(x, y, z);
+      if (lats->vac_hash.count(latti_id)) {
+        lats->vac_hash.erase(latti_id);
+      } else if (lats->re_hash.count(latti_id)) {
+        lats->re_hash.erase(latti_id);
+      } else if (lats->mn_hash.count(latti_id)) {
+        lats->mn_hash.erase(latti_id);
+      } else if (lats->ni_hash.count(latti_id)) {
+        lats->ni_hash.erase(latti_id);
+      } else if (lats->si_hash.count(latti_id)) {
+        lats->si_hash.erase(latti_id);
+      } else if (lats->momo_hash.count(latti_id)) {
+        lats->momo_hash.erase(latti_id);
+      } else if (lats->more_hash.count(latti_id)) {
+        lats->more_hash.erase(latti_id);
+      } else if (lats->rere_hash.count(latti_id)) {
+        lats->rere_hash.erase(latti_id);
+      }
+
+      switch (static_cast<LatticeTypes::lat_type>(buffer[len].type))
+      {
+        case LatticeTypes::V:
+          lats->vac_hash.emplace(std::make_pair(latti_id, VacancyHash{}));
+          break;
+        case LatticeTypes::Re:
+          lats->re_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::Mn:
+          lats->mn_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::Ni:
+          lats->ni_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::Si:
+          lats->si_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::MoMo:
+          lats->momo_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::MoRe:
+          lats->more_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::ReRe:
+          lats->rere_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::Mo:
+          break;
+        default:
+          break;
+      }
+    }
+  } else if(dimension == 1) {
+    for(len = 0; len < receive_len; len++) {
+      x = buffer[len].x;
+      if(next_id == 2 || next_id == 3 || next_id == 6 || next_id == 7){
+        buffer[len].y += sub_box_lattice_size[dimension];
+      }else{
+        buffer[len].y -= sub_box_lattice_size[dimension] + (neighbour_local_sub_box[dimension] - sub_box_lattice_size[dimension]);
+      }
+      y = buffer[len].y;
+      z = buffer[len].z;
+      latti_id = lats->getId(x, y, z);
+      if (lats->vac_hash.count(latti_id)) {
+        lats->vac_hash.erase(latti_id);
+      } else if (lats->re_hash.count(latti_id)) {
+        lats->re_hash.erase(latti_id);
+      } else if (lats->mn_hash.count(latti_id)) {
+        lats->mn_hash.erase(latti_id);
+      } else if (lats->ni_hash.count(latti_id)) {
+        lats->ni_hash.erase(latti_id);
+      } else if (lats->si_hash.count(latti_id)) {
+        lats->si_hash.erase(latti_id);
+      } else if (lats->momo_hash.count(latti_id)) {
+        lats->momo_hash.erase(latti_id);
+      } else if (lats->more_hash.count(latti_id)) {
+        lats->more_hash.erase(latti_id);
+      } else if (lats->rere_hash.count(latti_id)) {
+        lats->rere_hash.erase(latti_id);
+      }
+
+      switch (static_cast<LatticeTypes::lat_type>(buffer[len].type))
+      {
+        case LatticeTypes::V:
+          lats->vac_hash.emplace(std::make_pair(latti_id, VacancyHash{}));
+          break;
+        case LatticeTypes::Re:
+          lats->re_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::Mn:
+          lats->mn_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::Ni:
+          lats->ni_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::Si:
+          lats->si_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::MoMo:
+          lats->momo_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::MoRe:
+          lats->more_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::ReRe:
+          lats->rere_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::Mo:
+          break;
+        default:
+          break;
+      }
+    }
+  } else if(dimension == 0) {
+    for(len = 0; len < receive_len; len++) {
+      if(next_id % 2 == 1) {
+        buffer[len].x += BCC_DBX * (sub_box_lattice_size[dimension]);
+      } else {
+        buffer[len].x -= BCC_DBX * (sub_box_lattice_size[dimension] + (neighbour_local_sub_box[dimension] - sub_box_lattice_size[dimension]));
+      }
+      x = buffer[len].x;
+      y = buffer[len].y;
+      z = buffer[len].z;
+      latti_id = lats->getId(x, y, z);
+      if (lats->vac_hash.count(latti_id)) {
+        lats->vac_hash.erase(latti_id);
+      } else if (lats->re_hash.count(latti_id)) {
+        lats->re_hash.erase(latti_id);
+      } else if (lats->mn_hash.count(latti_id)) {
+        lats->mn_hash.erase(latti_id);
+      } else if (lats->ni_hash.count(latti_id)) {
+        lats->ni_hash.erase(latti_id);
+      } else if (lats->si_hash.count(latti_id)) {
+        lats->si_hash.erase(latti_id);
+      } else if (lats->momo_hash.count(latti_id)) {
+        lats->momo_hash.erase(latti_id);
+      } else if (lats->more_hash.count(latti_id)) {
+        lats->more_hash.erase(latti_id);
+      } else if (lats->rere_hash.count(latti_id)) {
+        lats->rere_hash.erase(latti_id);
+      }
+
+      switch (static_cast<LatticeTypes::lat_type>(buffer[len].type))
+      {
+        case LatticeTypes::V:
+          lats->vac_hash.emplace(std::make_pair(latti_id, VacancyHash{}));
+          break;
+        case LatticeTypes::Re:
+          lats->re_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::Mn:
+          lats->mn_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::Ni:
+          lats->ni_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::Si:
+          lats->si_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::MoMo:
+          lats->momo_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::MoRe:
+          lats->more_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::ReRe:
+          lats->rere_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::Mo:
+          break;
+        default:
+          break;
+      }
+    }
+  } else {
+    assert(false);
+  }
+}

@@ -150,6 +150,8 @@ namespace gpuSimulate {
 
 
 }
+__device__ _type_lattice_id getId(_type_lattice_size x,_type_lattice_size y,_type_lattice_size z);
+
 __device__ void printHashTableKernel(GPUHashSet* table, int max_entries, bool verbose) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {  // 仅由第一个线程执行
         printf("=== GPU Hash Table Info ===\n");
@@ -1545,6 +1547,9 @@ int commSurfaceCapacity() {
   return gpuSimulate::comm_surface_capacity;
 }
 
+__device__ int isGhostLat(_type_lattice_id lid);
+__device__ int isSurfaceLat(_type_lattice_id lid);
+
 __global__ void forwardFromRecvPayloadKernel(const ChangeLattice_GPU *payload, int n, int sector_id) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
@@ -2114,7 +2119,7 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
     int randomNumber = (sum % 14 + 14) % 14;  // 确保结果在0-13之间
 
     if(randomNumber < 0 || randomNumber >= 14){
-        printf("%ld : random num generate error %ld\n",tid,randomNumber);
+        printf("%ld : random num generate error %d\n",(long)tid,randomNumber);
       }
     getRandomLattice(x,y,z,temp_x,temp_y,temp_z,randomNumber);
     randomLattice.id = getId(temp_x,temp_y,temp_z);

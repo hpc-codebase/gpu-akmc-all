@@ -1,0 +1,4 @@
+- [x] 接收侧 device 存储转发已接入 syncSimRegions 与 syncNextSectorGhostRegions
+- [x] vacancy event 增量已写入 device buckets，且清理点与 sector 开始对齐
+- [x] 迁移步骤与变更记录文档已同步更新，描述清晰且无矛盾
+- [x] `KMC_GPU_COMM=0/1` 均可编译（至少无 IDE 诊断错误）
