@@ -409,8 +409,6 @@ template <class PKs, class Ins> void SubLattice::syncSimRegions(Ins &pk_inst, st
   ChangeLattice *receive_buff;
   ChangeLattice_GPU *send_buff_gpu;
   ChangeLattice_GPU *receive_buff_gpu;
-  ChangeLattice_GPU *send_buff_gpu;
-  ChangeLattice_GPU *receive_buff_gpu;
   MPI_Status status;
 
   MPI_Status send_statuses[comm::DIMENSION_SIZE];
@@ -568,6 +566,8 @@ template <class PKg, class Ins> void SubLattice::syncNextSectorGhostRegions(Ins 
   int num_receive[comm::DIMENSION_SIZE];
   ChangeLattice *send_buff;
   ChangeLattice *receive_buff;
+  ChangeLattice_GPU *send_buff_gpu;
+  ChangeLattice_GPU *receive_buff_gpu;
 
   MPI_Status status;
   MPI_Status send_statuses[comm::DIMENSION_SIZE];

@@ -180,6 +180,67 @@ void* gpu_comm_default_recv_device_ptr() {
   return g_default_buf.d_recv;
 }
 
+void gpu_comm_send_recv_device(GpuCommBuffer& buf,
+                               const void* send_dev, size_t send_bytes,
+                               void* recv_dev, size_t recv_bytes,
+                               int peer_send, int peer_recv,
+                               MPI_Comm comm) {
+  if (!gpu_comm_enabled()) return;
+  if (!g_inited) gpu_comm_init(comm);
+
+  if (send_bytes > buf.send_cap) {
+    if (buf.d_send) hipFree(buf.d_send);
+    hipError_t err = hipMalloc(&buf.d_send, send_bytes);
+    if (err != hipSuccess) {
+      std::cerr << "HIP malloc failed (send): " << hipGetErrorString(err) << std::endl;
+      std::abort();
+    }
+    buf.send_cap = send_bytes;
+  }
+
+  if (recv_bytes > buf.recv_cap) {
+    if (buf.d_recv) hipFree(buf.d_recv);
+    hipError_t err = hipMalloc(&buf.d_recv, recv_bytes);
+    if (err != hipSuccess) {
+      std::cerr << "HIP malloc failed (recv): " << hipGetErrorString(err) << std::endl;
+      std::abort();
+    }
+    buf.recv_cap = recv_bytes;
+  }
+
+  if (send_bytes > 0 && send_dev != buf.d_send) {
+    hipError_t err = hipMemcpyAsync(buf.d_send, send_dev, send_bytes, hipMemcpyDeviceToDevice, g_stream);
+    if (err != hipSuccess) {
+      std::cerr << "HIP memcpy D2D failed: " << hipGetErrorString(err) << std::endl;
+      std::abort();
+    }
+  }
+
+  void* recv_target = recv_dev ? recv_dev : buf.d_recv;
+
+  CHECK_NCCL(ncclGroupStart());
+  if (send_bytes > 0) {
+    CHECK_NCCL(ncclSend(buf.d_send, send_bytes, ncclChar, peer_send, g_comm, g_stream));
+  }
+  if (recv_bytes > 0) {
+    CHECK_NCCL(ncclRecv(recv_target, recv_bytes, ncclChar, peer_recv, g_comm, g_stream));
+  }
+  CHECK_NCCL(ncclGroupEnd());
+
+  hipError_t err = hipStreamSynchronize(g_stream);
+  if (err != hipSuccess) {
+    std::cerr << "HIP stream sync failed: " << hipGetErrorString(err) << std::endl;
+    std::abort();
+  }
+}
+
+void gpu_comm_send_recv_device_default(const void* send_dev, size_t send_bytes,
+                                       void* recv_dev, size_t recv_bytes,
+                                       int peer_send, int peer_recv,
+                                       MPI_Comm comm) {
+  gpu_comm_send_recv_device(g_default_buf, send_dev, send_bytes, recv_dev, recv_bytes, peer_send, peer_recv, comm);
+}
+
 #else
 
 bool gpu_comm_enabled() { return false; }
@@ -190,5 +251,7 @@ void gpu_comm_buffer_free(GpuCommBuffer&) {}
 void gpu_comm_send_recv(GpuCommBuffer&, const void*, size_t, void*, size_t, size_t, int, int, MPI_Comm) {}
 void gpu_comm_send_recv_default(const void*, size_t, void*, size_t, size_t, int, int, MPI_Comm) {}
 void* gpu_comm_default_recv_device_ptr() { return nullptr; }
+void gpu_comm_send_recv_device(GpuCommBuffer&, const void*, size_t, void*, size_t, int, int, MPI_Comm) {}
+void gpu_comm_send_recv_device_default(const void*, size_t, void*, size_t, int, int, MPI_Comm) {}
 
 #endif
