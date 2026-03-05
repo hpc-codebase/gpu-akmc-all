@@ -95,12 +95,84 @@ void gpu_comm_sanity_allreduce(MPI_Comm comm) {
   }
 }
 
+void gpu_comm_buffer_free(GpuCommBuffer& buf) {
+  if (buf.d_send) { hipFree(buf.d_send); buf.d_send = nullptr; }
+  if (buf.d_recv) { hipFree(buf.d_recv); buf.d_recv = nullptr; }
+  buf.send_cap = 0;
+  buf.recv_cap = 0;
+}
+
+void gpu_comm_send_recv(GpuCommBuffer& buf,
+                        const void* send_host, size_t send_count,
+                        void* recv_host, size_t recv_count,
+                        size_t type_size,
+                        int peer_send, int peer_recv,
+                        MPI_Comm comm) {
+  if (!gpu_comm_enabled()) return;
+  if (!g_inited) gpu_comm_init(comm);
+
+  size_t send_bytes = send_count * type_size;
+  size_t recv_bytes = recv_count * type_size;
+
+  if (send_bytes > buf.send_cap) {
+    if (buf.d_send) hipFree(buf.d_send);
+    hipError_t err = hipMalloc(&buf.d_send, send_bytes);
+    if (err != hipSuccess) {
+      std::cerr << "HIP malloc failed (send): " << hipGetErrorString(err) << std::endl;
+      std::abort();
+    }
+    buf.send_cap = send_bytes;
+  }
+
+  if (recv_bytes > buf.recv_cap) {
+    if (buf.d_recv) hipFree(buf.d_recv);
+    hipError_t err = hipMalloc(&buf.d_recv, recv_bytes);
+    if (err != hipSuccess) {
+      std::cerr << "HIP malloc failed (recv): " << hipGetErrorString(err) << std::endl;
+      std::abort();
+    }
+    buf.recv_cap = recv_bytes;
+  }
+
+  if (send_bytes > 0) {
+    hipError_t err = hipMemcpyAsync(buf.d_send, send_host, send_bytes, hipMemcpyHostToDevice, g_stream);
+    if (err != hipSuccess) {
+      std::cerr << "HIP memcpy H2D failed: " << hipGetErrorString(err) << std::endl;
+      std::abort();
+    }
+  }
+
+  CHECK_NCCL(ncclGroupStart());
+  if (send_bytes > 0) {
+    CHECK_NCCL(ncclSend(buf.d_send, send_bytes, ncclChar, peer_send, g_comm, g_stream));
+  }
+  if (recv_bytes > 0) {
+    CHECK_NCCL(ncclRecv(buf.d_recv, recv_bytes, ncclChar, peer_recv, g_comm, g_stream));
+  }
+  CHECK_NCCL(ncclGroupEnd());
+
+  if (recv_bytes > 0) {
+    hipError_t err = hipMemcpyAsync(recv_host, buf.d_recv, recv_bytes, hipMemcpyDeviceToHost, g_stream);
+    if (err != hipSuccess) {
+      std::cerr << "HIP memcpy D2H failed: " << hipGetErrorString(err) << std::endl;
+      std::abort();
+    }
+  }
+
+  hipError_t err = hipStreamSynchronize(g_stream);
+  if (err != hipSuccess) {
+    std::cerr << "HIP stream sync failed: " << hipGetErrorString(err) << std::endl;
+    std::abort();
+  }
+}
+
 #else
 
 bool gpu_comm_enabled() { return false; }
 void gpu_comm_init(MPI_Comm) {}
 void gpu_comm_finalize() {}
 void gpu_comm_sanity_allreduce(MPI_Comm) {}
+void gpu_comm_buffer_free(GpuCommBuffer&) {}
+void gpu_comm_send_recv(GpuCommBuffer&, const void*, size_t, void*, size_t, size_t, int, int, MPI_Comm) {}
 
 #endif
-
