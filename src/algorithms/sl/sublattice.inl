@@ -425,45 +425,62 @@ template <class PKs, class Ins> void SubLattice::syncSimRegions(Ins &pk_inst, st
     // dim_id = comm::DIMENSION_SIZE - 1 - d;
 
     if (gpu_comm_enabled()) {
-      num_send[dim_id] = packer.sendLength2_gpu(dim_id, exchange_ghost, exchange_surface_x[next_sector.id], &send_count_gpu);
-      assert(num_send[dim_id] >= 0);
-      static _type_lattice_id *d_ids = nullptr;
-      static size_t d_ids_cap = 0;
       static ChangeLattice_GPU *d_payload = nullptr;
       static size_t d_payload_cap = 0;
+      static long int *d_tmp_ids = nullptr;
+      static size_t d_tmp_ids_cap = 0;
+      static int *d_tmp_count = nullptr;
 
-      std::vector<_type_lattice_id> ids;
-      ids.reserve(static_cast<size_t>(num_send[dim_id] - 1));
+      if (!d_tmp_count) {
+        hipMalloc(reinterpret_cast<void**>(&d_tmp_count), sizeof(int));
+      }
+
+      int buckets[4] = {0, 0, 0, 0};
+      int nb = 0;
       if (dim_id == 0) {
-        for (const auto& latticeId : exchange_ghost[6]) ids.push_back(latticeId);
-        for (const auto& latticeId : exchange_ghost[5]) ids.push_back(latticeId);
-        for (const auto& latticeId : exchange_ghost[3]) ids.push_back(latticeId);
-        for (const auto& latticeId : exchange_ghost[2]) ids.push_back(latticeId);
+        buckets[0] = 6; buckets[1] = 5; buckets[2] = 3; buckets[3] = 2; nb = 4;
       } else if (dim_id == 1) {
-        for (const auto& latticeId : exchange_ghost[4]) ids.push_back(latticeId);
-        for (const auto& latticeId : exchange_ghost[1]) ids.push_back(latticeId);
+        buckets[0] = 4; buckets[1] = 1; nb = 2;
       } else {
-        for (const auto& latticeId : exchange_ghost[0]) ids.push_back(latticeId);
+        buckets[0] = 0; nb = 1;
       }
 
-      size_t need_ids = ids.size();
-      size_t need_payload = static_cast<size_t>(num_send[dim_id]);
-      if (need_ids > d_ids_cap) {
-        if (d_ids) hipFree(d_ids);
-        hipMalloc(reinterpret_cast<void**>(&d_ids), need_ids * sizeof(_type_lattice_id));
-        d_ids_cap = need_ids;
+      int h_counts[4] = {0, 0, 0, 0};
+      int total_ids = 0;
+      for (int bi = 0; bi < nb; bi++) {
+        if (static_cast<size_t>(d_tmp_ids_cap) == 0) {
+          d_tmp_ids_cap = static_cast<size_t>(commGhostCapacity());
+          hipMalloc(reinterpret_cast<void**>(&d_tmp_ids), d_tmp_ids_cap * sizeof(long int));
+        }
+        commCompactGhostBucket(buckets[bi], d_tmp_ids, d_tmp_count);
+        hipMemcpy(&h_counts[bi], d_tmp_count, sizeof(int), hipMemcpyDeviceToHost);
+        total_ids += h_counts[bi];
       }
+
+      send_count_gpu.x = (nb >= 1) ? h_counts[0] : 0;
+      send_count_gpu.y = (nb >= 2) ? h_counts[1] : 0;
+      send_count_gpu.z = (nb >= 3) ? h_counts[2] : 0;
+      send_count_gpu.type = 0;
+
+      num_send[dim_id] = total_ids + 1;
+      assert(num_send[dim_id] >= 0);
+
+      size_t need_payload = static_cast<size_t>(num_send[dim_id]);
       if (need_payload > d_payload_cap) {
         if (d_payload) hipFree(d_payload);
         hipMalloc(reinterpret_cast<void**>(&d_payload), need_payload * sizeof(ChangeLattice_GPU));
         d_payload_cap = need_payload;
       }
 
-      if (need_ids > 0) {
-        hipMemcpy(d_ids, ids.data(), need_ids * sizeof(_type_lattice_id), hipMemcpyHostToDevice);
-        packChangeLatticeFromIds_Device(d_ids, d_payload, static_cast<int>(need_ids));
+      int offset = 0;
+      for (int bi = 0; bi < nb; bi++) {
+        int cnt = h_counts[bi];
+        if (cnt <= 0) continue;
+        commCompactGhostBucket(buckets[bi], d_tmp_ids, d_tmp_count);
+        packChangeLatticeFromIds_Device(reinterpret_cast<_type_lattice_id*>(d_tmp_ids), d_payload + offset, cnt);
+        offset += cnt;
       }
-      hipMemcpy(d_payload + (need_payload - 1), &send_count_gpu, sizeof(ChangeLattice_GPU), hipMemcpyHostToDevice);
+      hipMemcpy(d_payload + offset, &send_count_gpu, sizeof(ChangeLattice_GPU), hipMemcpyHostToDevice);
       send_buff_gpu = d_payload;
     } else {
       num_send[dim_id] = packer.sendLength2(dim_id, exchange_ghost, exchange_surface_x[next_sector.id], &send_count);

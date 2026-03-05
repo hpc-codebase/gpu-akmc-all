@@ -16,6 +16,14 @@ __device__ static dev_meta *g_meta;
 __device__ static GPUHashSet *g_Busy_Set;
 __device__ static GPUHashSet *g_surface_Hash;
 __device__ static GPUHashSet *g_ghost_Hash;
+__device__ static GPUHashSet *g_comm_ghost_bucket0;
+__device__ static GPUHashSet *g_comm_ghost_bucket1;
+__device__ static GPUHashSet *g_comm_ghost_bucket2;
+__device__ static GPUHashSet *g_comm_ghost_bucket3;
+__device__ static GPUHashSet *g_comm_ghost_bucket4;
+__device__ static GPUHashSet *g_comm_ghost_bucket5;
+__device__ static GPUHashSet *g_comm_ghost_bucket6;
+__device__ static comm::Region<comm::_type_lattice_size> *g_comm_ghost_regions;
 __device__ static long int  *g_Pair_Atoms;
 static long int arr_size;
 static long int pair_atoms_size;
@@ -66,6 +74,15 @@ namespace gpuSimulate {
     HIPHashSet *Busy_Set;
     HIPHashSet *ghost_Hash;
     HIPHashSet *surface_Hash;
+    HIPHashSet *comm_ghost_bucket0;
+    HIPHashSet *comm_ghost_bucket1;
+    HIPHashSet *comm_ghost_bucket2;
+    HIPHashSet *comm_ghost_bucket3;
+    HIPHashSet *comm_ghost_bucket4;
+    HIPHashSet *comm_ghost_bucket5;
+    HIPHashSet *comm_ghost_bucket6;
+    comm::Region<comm::_type_lattice_size> *d_comm_ghost_regions;
+    int comm_ghost_capacity;
 
     long int *Pair_Atoms;
     long int *d_Pair_Atoms;
@@ -1155,6 +1172,7 @@ void selectAndPerformEventGPU(double excepted_rand, int rank, _type_lattice_coun
                               std::array<std::unordered_set<_type_lattice_id>, 8>& exchange_surface_z,
                               std::array<comm::Region<comm::_type_lattice_size>, 56>& ghost_region){
   using namespace gpuSimulate;
+  commSetGhostRegions(&ghost_region[0], 56);
 
   blockSize = 1;
   numBlocks = 1;
@@ -1211,6 +1229,147 @@ __global__ void setGlobalPointer(dev_meta *meta,
 
    
   }
+}
+
+__global__ void setCommGhostPointers(GPUHashSet *b0, GPUHashSet *b1, GPUHashSet *b2, GPUHashSet *b3, GPUHashSet *b4, GPUHashSet *b5, GPUHashSet *b6,
+                                     comm::Region<comm::_type_lattice_size> *ghost_regions) {
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    g_comm_ghost_bucket0 = b0;
+    g_comm_ghost_bucket1 = b1;
+    g_comm_ghost_bucket2 = b2;
+    g_comm_ghost_bucket3 = b3;
+    g_comm_ghost_bucket4 = b4;
+    g_comm_ghost_bucket5 = b5;
+    g_comm_ghost_bucket6 = b6;
+    g_comm_ghost_regions = ghost_regions;
+  }
+}
+
+static __device__ __forceinline__ GPUHashSet* commBucketPtr(int idx) {
+  switch (idx) {
+    case 0: return g_comm_ghost_bucket0;
+    case 1: return g_comm_ghost_bucket1;
+    case 2: return g_comm_ghost_bucket2;
+    case 3: return g_comm_ghost_bucket3;
+    case 4: return g_comm_ghost_bucket4;
+    case 5: return g_comm_ghost_bucket5;
+    case 6: return g_comm_ghost_bucket6;
+    default: return nullptr;
+  }
+}
+
+__global__ void bucketizeGhostIdsKernel(const long int *ids, int n, int sector_id) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  long int id = ids[i];
+  _type_lattice_id x = id % g_meta->size_x;
+  _type_lattice_id y = (id / g_meta->size_x) % g_meta->size_y;
+  _type_lattice_id z = id / (g_meta->size_x * g_meta->size_y);
+  int base = sector_id * 7;
+  for (int k = 0; k < 7; k++) {
+    auto r = g_comm_ghost_regions[base + k];
+    if (r.x_low <= x && x < r.x_high && r.y_low <= y && y < r.y_high && r.z_low <= z && z < r.z_high) {
+      GPUHashSet* b = commBucketPtr(k);
+      if (b) hash_set_insert_atom_op(b, id);
+      break;
+    }
+  }
+}
+
+__global__ void compactHashSetKernel(GPUHashSet *set, long int *out, int *out_count) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (!set) return;
+  if (i >= set->capacity) return;
+  long int key = set->keys[i];
+  if (key == set->empty_flag || key == set->tombstone_flag) return;
+  int pos = atomicAdd(out_count, 1);
+  out[pos] = key;
+}
+
+void commSetGhostRegions(const comm::Region<comm::_type_lattice_size> *ghost_region, int n) {
+  if (!ghost_region) return;
+  if (n <= 0) return;
+  if (gpuSimulate::d_comm_ghost_regions == nullptr) {
+    HANDLE_HIP(hipMalloc(reinterpret_cast<void**>(&gpuSimulate::d_comm_ghost_regions), static_cast<size_t>(n) * sizeof(comm::Region<comm::_type_lattice_size>)));
+  }
+  HANDLE_HIP(hipMemcpy(gpuSimulate::d_comm_ghost_regions, ghost_region, static_cast<size_t>(n) * sizeof(comm::Region<comm::_type_lattice_size>), hipMemcpyHostToDevice));
+  hipLaunchKernelGGL(setCommGhostPointers, 1, 1, 0, 0,
+                     gpuSimulate::comm_ghost_bucket0 ? gpuSimulate::comm_ghost_bucket0->device_ptr() : nullptr,
+                     gpuSimulate::comm_ghost_bucket1 ? gpuSimulate::comm_ghost_bucket1->device_ptr() : nullptr,
+                     gpuSimulate::comm_ghost_bucket2 ? gpuSimulate::comm_ghost_bucket2->device_ptr() : nullptr,
+                     gpuSimulate::comm_ghost_bucket3 ? gpuSimulate::comm_ghost_bucket3->device_ptr() : nullptr,
+                     gpuSimulate::comm_ghost_bucket4 ? gpuSimulate::comm_ghost_bucket4->device_ptr() : nullptr,
+                     gpuSimulate::comm_ghost_bucket5 ? gpuSimulate::comm_ghost_bucket5->device_ptr() : nullptr,
+                     gpuSimulate::comm_ghost_bucket6 ? gpuSimulate::comm_ghost_bucket6->device_ptr() : nullptr,
+                     gpuSimulate::d_comm_ghost_regions);
+  hipDeviceSynchronize();
+}
+
+void commInitGhostBuckets(int capacity) {
+  if (capacity <= 0) return;
+  gpuSimulate::comm_ghost_capacity = capacity * 2;
+  if (!gpuSimulate::comm_ghost_bucket0) gpuSimulate::comm_ghost_bucket0 = new HIPHashSet(capacity);
+  if (!gpuSimulate::comm_ghost_bucket1) gpuSimulate::comm_ghost_bucket1 = new HIPHashSet(capacity);
+  if (!gpuSimulate::comm_ghost_bucket2) gpuSimulate::comm_ghost_bucket2 = new HIPHashSet(capacity);
+  if (!gpuSimulate::comm_ghost_bucket3) gpuSimulate::comm_ghost_bucket3 = new HIPHashSet(capacity);
+  if (!gpuSimulate::comm_ghost_bucket4) gpuSimulate::comm_ghost_bucket4 = new HIPHashSet(capacity);
+  if (!gpuSimulate::comm_ghost_bucket5) gpuSimulate::comm_ghost_bucket5 = new HIPHashSet(capacity);
+  if (!gpuSimulate::comm_ghost_bucket6) gpuSimulate::comm_ghost_bucket6 = new HIPHashSet(capacity);
+  hipLaunchKernelGGL(setCommGhostPointers, 1, 1, 0, 0,
+                     gpuSimulate::comm_ghost_bucket0->device_ptr(),
+                     gpuSimulate::comm_ghost_bucket1->device_ptr(),
+                     gpuSimulate::comm_ghost_bucket2->device_ptr(),
+                     gpuSimulate::comm_ghost_bucket3->device_ptr(),
+                     gpuSimulate::comm_ghost_bucket4->device_ptr(),
+                     gpuSimulate::comm_ghost_bucket5->device_ptr(),
+                     gpuSimulate::comm_ghost_bucket6->device_ptr(),
+                     gpuSimulate::d_comm_ghost_regions);
+  hipDeviceSynchronize();
+}
+
+void commClearGhostBuckets() {
+  if (gpuSimulate::comm_ghost_bucket0) gpuSimulate::comm_ghost_bucket0->clear();
+  if (gpuSimulate::comm_ghost_bucket1) gpuSimulate::comm_ghost_bucket1->clear();
+  if (gpuSimulate::comm_ghost_bucket2) gpuSimulate::comm_ghost_bucket2->clear();
+  if (gpuSimulate::comm_ghost_bucket3) gpuSimulate::comm_ghost_bucket3->clear();
+  if (gpuSimulate::comm_ghost_bucket4) gpuSimulate::comm_ghost_bucket4->clear();
+  if (gpuSimulate::comm_ghost_bucket5) gpuSimulate::comm_ghost_bucket5->clear();
+  if (gpuSimulate::comm_ghost_bucket6) gpuSimulate::comm_ghost_bucket6->clear();
+}
+
+void commBuildGhostBucketsFromList(int sector_id, const long int *d_ids, int n) {
+  if (!d_ids) return;
+  if (n <= 0) return;
+  int blockSize = 256;
+  int blockNum = (n + blockSize - 1) / blockSize;
+  hipLaunchKernelGGL(bucketizeGhostIdsKernel, blockNum, blockSize, 0, 0, d_ids, n, sector_id);
+  hipDeviceSynchronize();
+}
+
+void commCompactGhostBucket(int bucket, long int *d_out, int *d_count) {
+  if (!d_out || !d_count) return;
+  HANDLE_HIP(hipMemset(d_count, 0, sizeof(int)));
+  HIPHashSet *b = nullptr;
+  switch (bucket) {
+    case 0: b = gpuSimulate::comm_ghost_bucket0; break;
+    case 1: b = gpuSimulate::comm_ghost_bucket1; break;
+    case 2: b = gpuSimulate::comm_ghost_bucket2; break;
+    case 3: b = gpuSimulate::comm_ghost_bucket3; break;
+    case 4: b = gpuSimulate::comm_ghost_bucket4; break;
+    case 5: b = gpuSimulate::comm_ghost_bucket5; break;
+    case 6: b = gpuSimulate::comm_ghost_bucket6; break;
+    default: b = nullptr; break;
+  }
+  if (!b) return;
+  int cap = gpuSimulate::comm_ghost_capacity;
+  int blockSize = 256;
+  int blockNum = (cap + blockSize - 1) / blockSize;
+  hipLaunchKernelGGL(compactHashSetKernel, blockNum, blockSize, 0, 0, b->device_ptr(), d_out, d_count);
+  hipDeviceSynchronize();
+}
+
+int commGhostCapacity() {
+  return gpuSimulate::comm_ghost_capacity;
 }
 __global__ void printpointer(){
   if(g_MoMo_Hash == nullptr)
@@ -2199,6 +2358,11 @@ void recb_solver_GPU(
     HANDLE_HIP(hipMemcpy(&h_surface_count, d_surface_count, sizeof(int), hipMemcpyDeviceToHost));
     HANDLE_HIP(hipMemcpy(&h_ghost_count, d_ghost_count, sizeof(int), hipMemcpyDeviceToHost));
 
+    commClearGhostBuckets();
+    if (h_ghost_count > 0) {
+      commBuildGhostBucketsFromList(sector_id, d_ghost_list, h_ghost_count);
+    }
+
     const int type_block = 256;
     if (h_surface_count > 0) {
       const int grid = (h_surface_count + type_block - 1) / type_block;
@@ -2413,6 +2577,7 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
   ghost_Hash = new HIPHashSet(ghost_size);
   surface_capacity = surface_size * 2;
   ghost_capacity = ghost_size * 2;
+  commInitGhostBuckets(ghost_size);
   HANDLE_HIP(hipMalloc((void**)&d_surface_list, surface_capacity * sizeof(long int)));
   HANDLE_HIP(hipMalloc((void**)&d_ghost_list, ghost_capacity * sizeof(long int)));
   HANDLE_HIP(hipMalloc((void**)&d_surface_list_type, surface_capacity * sizeof(long int)));
@@ -2498,6 +2663,14 @@ void gpu_final(){
 
   delete ghost_Hash;
   delete surface_Hash;
+  delete comm_ghost_bucket0;
+  delete comm_ghost_bucket1;
+  delete comm_ghost_bucket2;
+  delete comm_ghost_bucket3;
+  delete comm_ghost_bucket4;
+  delete comm_ghost_bucket5;
+  delete comm_ghost_bucket6;
+  if (d_comm_ghost_regions) HANDLE_HIP(hipFree(d_comm_ghost_regions));
 
   delete g_Busy_Set;
   hipFree(d_meta);

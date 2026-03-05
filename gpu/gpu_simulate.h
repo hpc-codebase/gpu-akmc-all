@@ -71,6 +71,13 @@ void transferBufferToGPU2_Device(ChangeLattice_GPU *d_buffer, int receive_len, c
   const _type_lattice_count *sub_box_lattice_size, const _type_lattice_count *neighbour_local_sub_box, unsigned int next_id);
 
 void packChangeLatticeFromIds_Device(const _type_lattice_id *d_ids, ChangeLattice_GPU *d_out, int n);
+
+void commSetGhostRegions(const comm::Region<comm::_type_lattice_size> *ghost_region, int n);
+void commInitGhostBuckets(int capacity);
+void commClearGhostBuckets();
+void commBuildGhostBucketsFromList(int sector_id, const long int *d_ids, int n);
+void commCompactGhostBucket(int bucket, long int *d_out, int *d_count);
+int commGhostCapacity();
 // __global__ void calcExchangePairs(dev_meta meta,long int *Pair_Atoms,
 //                             HIPHashSet *MoRe_Hash,HIPHashSet *MoMo_Hash,
 //                             HIPHashSet *Re_Hash,HIPHashSet *V_Hash,
