@@ -94,6 +94,10 @@ void commClearSurfaceBuckets();
 void commBuildSurfaceBucketsFromList(const long int *d_ids, int n);
 void commCompactSurfaceBucket(int bucket, long int *d_out, int *d_count);
 int commSurfaceCapacity();
+
+void commClearSurfaceSector(int sect);
+void commInsertGhostId(int sector_id, long int id);
+void commInsertSurfaceId(long int id);
 // __global__ void calcExchangePairs(dev_meta meta,long int *Pair_Atoms,
 //                             HIPHashSet *MoRe_Hash,HIPHashSet *MoMo_Hash,
 //                             HIPHashSet *Re_Hash,HIPHashSet *V_Hash,

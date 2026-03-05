@@ -56,6 +56,10 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
       double sector_time = 0.0;
       p_model->clear_exchange_ghost();
       p_model->clear_exchange_surface((*sec_meta.sector_itl).id);
+      if (gpu_comm_enabled()) {
+        commClearGhostBuckets();
+        commClearSurfaceSector((*sec_meta.sector_itl).id);
+      }
       // if(SimulationDomain::comm_sim_pro.own_rank == 0) kiwi::logs::v(" ", " step is : {} sect is : {} starting !!!.\n", step, sect);
 
       for(int ir = 0; ir < 1; ir++) {

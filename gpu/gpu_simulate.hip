@@ -1214,6 +1214,12 @@ void selectAndPerformEventGPU(double excepted_rand, int rank, _type_lattice_coun
   }
   if (lattice_list->meta.isSurfaceLat(h_event->from_id)) add_surface(h_event->from_id, exchange_surface_x, exchange_surface_y, exchange_surface_z);
   if (lattice_list->meta.isSurfaceLat(h_event->to_id)) add_surface(h_event->to_id, exchange_surface_x, exchange_surface_y, exchange_surface_z);
+
+  if (gpu_comm_enabled()) {
+    if (lattice_list->meta.isGhostLat(h_event->to_id)) commInsertGhostId(static_cast<int>(sector_id), h_event->to_id);
+    if (lattice_list->meta.isSurfaceLat(h_event->from_id)) commInsertSurfaceId(h_event->from_id);
+    if (lattice_list->meta.isSurfaceLat(h_event->to_id)) commInsertSurfaceId(h_event->to_id);
+  }
 }
 __global__ void setGlobalPointer(dev_meta *meta,
                             GPUHashSet *MoRe_Hash,GPUHashSet *MoMo_Hash,
@@ -1277,8 +1283,23 @@ __global__ void bucketizeGhostIdsKernel(const long int *ids, int n, int sector_i
   _type_lattice_id z = id / (g_meta->size_x * g_meta->size_y);
   int base = sector_id * 7;
   for (int k = 0; k < 7; k++) {
-    auto r = g_comm_ghost_regions[base + k];
-    if (r.x_low <= x && x < r.x_high && r.y_low <= y && y < r.y_high && r.z_low <= z && z < r.z_high) {
+    const auto* r = &g_comm_ghost_regions[base + k];
+    if (r->x_low <= x && x < r->x_high && r->y_low <= y && y < r->y_high && r->z_low <= z && z < r->z_high) {
+      GPUHashSet* b = commBucketPtr(k);
+      if (b) hash_set_insert_atom_op(b, id);
+      break;
+    }
+  }
+}
+
+__global__ void insertGhostIdKernel(long int id, int sector_id) {
+  _type_lattice_id x = id % g_meta->size_x;
+  _type_lattice_id y = (id / g_meta->size_x) % g_meta->size_y;
+  _type_lattice_id z = id / (g_meta->size_x * g_meta->size_y);
+  int base = sector_id * 7;
+  for (int k = 0; k < 7; k++) {
+    const auto* r = &g_comm_ghost_regions[base + k];
+    if (r->x_low <= x && x < r->x_high && r->y_low <= y && y < r->y_high && r->z_low <= z && z < r->z_high) {
       GPUHashSet* b = commBucketPtr(k);
       if (b) hash_set_insert_atom_op(b, id);
       break;
@@ -1356,6 +1377,10 @@ void commBuildGhostBucketsFromList(int sector_id, const long int *d_ids, int n) 
   hipDeviceSynchronize();
 }
 
+void commInsertGhostId(int sector_id, long int id) {
+  hipLaunchKernelGGL(insertGhostIdKernel, 1, 1, 0, 0, id, sector_id);
+}
+
 void commCompactGhostBucket(int bucket, long int *d_out, int *d_count) {
   if (!d_out || !d_count) return;
   HANDLE_HIP(hipMemset(d_count, 0, sizeof(int)));
@@ -1394,6 +1419,25 @@ __global__ void bucketizeSurfaceIdsKernel(const long int *ids, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
   long int id = ids[i];
+  _type_lattice_id x = id % g_meta->size_x;
+  _type_lattice_id y = (id / g_meta->size_x) % g_meta->size_y;
+  _type_lattice_id z = id / (g_meta->size_x * g_meta->size_y);
+  if (!g_comm_surface_offsets || !g_comm_surface_boxes || !g_comm_surface_buckets_ptr) return;
+  for (int b = 0; b < 24; b++) {
+    int start = g_comm_surface_offsets[b];
+    int end = g_comm_surface_offsets[b + 1];
+    for (int j = start; j < end; j++) {
+      CommBox box = g_comm_surface_boxes[j];
+      if (box.x_low <= x && x < box.x_high && box.y_low <= y && y < box.y_high && box.z_low <= z && z < box.z_high) {
+        GPUHashSet* set = g_comm_surface_buckets_ptr[b];
+        if (set) hash_set_insert_atom_op(set, id);
+        break;
+      }
+    }
+  }
+}
+
+__global__ void insertSurfaceIdKernel(long int id) {
   _type_lattice_id x = id % g_meta->size_x;
   _type_lattice_id y = (id / g_meta->size_x) % g_meta->size_y;
   _type_lattice_id z = id / (g_meta->size_x * g_meta->size_y);
@@ -1462,6 +1506,15 @@ void commClearSurfaceBuckets() {
   }
 }
 
+void commClearSurfaceSector(int sect) {
+  if (sect < 0 || sect >= 8) return;
+  int base = sect * 3;
+  for (int i = 0; i < 3; i++) {
+    int idx = base + i;
+    if (gpuSimulate::comm_surface_buckets[idx]) gpuSimulate::comm_surface_buckets[idx]->clear();
+  }
+}
+
 void commBuildSurfaceBucketsFromList(const long int *d_ids, int n) {
   if (!d_ids) return;
   if (n <= 0) return;
@@ -1469,6 +1522,10 @@ void commBuildSurfaceBucketsFromList(const long int *d_ids, int n) {
   int blockNum = (n + blockSize - 1) / blockSize;
   hipLaunchKernelGGL(bucketizeSurfaceIdsKernel, blockNum, blockSize, 0, 0, d_ids, n);
   hipDeviceSynchronize();
+}
+
+void commInsertSurfaceId(long int id) {
+  hipLaunchKernelGGL(insertSurfaceIdKernel, 1, 1, 0, 0, id);
 }
 
 void commCompactSurfaceBucket(int bucket, long int *d_out, int *d_count) {
@@ -2711,8 +2768,8 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
                                                  p_domain->local_split_coord, p_domain->local_sub_box_lattice_region);
         for (auto &r : regs) {
           CommBox b;
-          b.x_low = BCC_DBX * r.x_low;
-          b.x_high = BCC_DBX * r.x_high;
+          b.x_low = 2 * r.x_low;
+          b.x_high = 2 * r.x_high;
           b.y_low = r.y_low;
           b.y_high = r.y_high;
           b.z_low = r.z_low;
