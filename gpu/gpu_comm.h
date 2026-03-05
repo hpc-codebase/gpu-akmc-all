@@ -24,3 +24,11 @@ void gpu_comm_send_recv(GpuCommBuffer& buf,
                         size_t type_size,
                         int peer_send, int peer_recv,
                         MPI_Comm comm);
+
+void gpu_comm_send_recv_default(const void* send_host, size_t send_count,
+                               void* recv_host, size_t recv_count,
+                               size_t type_size,
+                               int peer_send, int peer_recv,
+                               MPI_Comm comm);
+
+void* gpu_comm_default_recv_device_ptr();

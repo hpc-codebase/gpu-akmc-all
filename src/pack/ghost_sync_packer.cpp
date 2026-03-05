@@ -142,6 +142,41 @@ void GhostSyncPacker::onSend2(ChangeLattice *buffer, const int send_len, const i
   assert(len == send_len);
 }
 
+void GhostSyncPacker::onSend2_gpu(ChangeLattice_GPU *buffer, const int send_len, const int dimension,
+                              std::unordered_set<_type_lattice_id>& now_exchange_surface_x, 
+                              std::unordered_set<_type_lattice_id>& now_exchange_surface_y,
+                              std::unordered_set<_type_lattice_id>& now_exchange_surface_z) {
+
+  int len = 0;
+
+  if(dimension == 0) {
+    for (const auto& pair : now_exchange_surface_x) {
+      buffer[len].x = pair % lats->meta.size_x;
+      buffer[len].y = (pair / lats->meta.size_x) % lats->meta.size_y;
+      buffer[len].z = pair / (lats->meta.size_x * lats->meta.size_y);
+      buffer[len].type = static_cast<int>(lats->getType(pair));
+      len++;
+    }
+  } else if(dimension == 1) {
+    for (const auto& pair : now_exchange_surface_y) {
+      buffer[len].x = pair % lats->meta.size_x;
+      buffer[len].y = (pair / lats->meta.size_x) % lats->meta.size_y;
+      buffer[len].z = pair / (lats->meta.size_x * lats->meta.size_y);
+      buffer[len].type = static_cast<int>(lats->getType(pair));
+      len++;
+    }
+  }else {
+    for (const auto& pair : now_exchange_surface_z) {
+      buffer[len].x = pair % lats->meta.size_x;
+      buffer[len].y = (pair / lats->meta.size_x) % lats->meta.size_y;
+      buffer[len].z = pair / (lats->meta.size_x * lats->meta.size_y);
+      buffer[len].type = static_cast<int>(lats->getType(pair));
+      len++;
+    }
+  }
+  assert(len == send_len);
+}
+
 void GhostSyncPacker::onReceive(pack_date_type *buffer, const std::vector<comm::Region<pack_region_type>> recv_regions,
                                 const unsigned long receive_len, const int dimension, const int direction) {
   unsigned long len = 0;
@@ -266,6 +301,12 @@ void GhostSyncPacker::transfer_buffer_to_GPU2(ChangeLattice *buffer, int receive
                                           const _type_lattice_count *sub_box_lattice_size, const _type_lattice_count *neighbour_local_sub_box, unsigned int next_id
 ) {
       transferBufferToGPU2(buffer, receive_len, dimension,sub_box_lattice_size,neighbour_local_sub_box,next_id);
+}
+
+void GhostSyncPacker::transfer_buffer_to_GPU2_device(ChangeLattice_GPU *d_buffer, int receive_len, const int dimension,
+                                          const _type_lattice_count *sub_box_lattice_size, const _type_lattice_count *neighbour_local_sub_box, unsigned int next_id
+) {
+      transferBufferToGPU2_Device(d_buffer, receive_len, dimension,sub_box_lattice_size,neighbour_local_sub_box,next_id);
 }
 
 void GhostSyncPacker::onReceive2(ChangeLattice *buffer, const int receive_len, const int dimension,
@@ -500,6 +541,243 @@ void GhostSyncPacker::onReceive2(ChangeLattice *buffer, const int receive_len, c
             } else {
               auto it_from = exchange_surface_z[sect].find(latti_id);
               if(it_from == exchange_surface_z[sect].end()) exchange_surface_z[sect].emplace(latti_id);
+            }
+          }
+        }
+      }
+    }
+  }
+ 
+}
+
+void GhostSyncPacker::onReceive2_gpu(ChangeLattice_GPU *buffer, const int receive_len, const int dimension,
+                                 std::array<std::unordered_set<_type_lattice_id>, 8>& exchange_surface_x,
+                                 std::array<std::unordered_set<_type_lattice_id>, 8>& exchange_surface_y,
+                                 std::array<std::unordered_set<_type_lattice_id>, 8>& exchange_surface_z,
+                                 const _type_lattice_count *sub_box_lattice_size, 
+                                 const _type_lattice_count *neighbour_local_sub_box, unsigned int next_id,
+                                 const comm::ColoredDomain *p_domain) {
+  
+  int len = 0;
+
+  _type_lattice_id x, y, z;
+  _type_lattice_id latti_id;
+  if(dimension == 2){
+    for(len = 0; len < receive_len; len++){
+      x = buffer[len].x;
+      y = buffer[len].y;
+      if(next_id > 3){
+        buffer[len].z += sub_box_lattice_size[dimension];
+      } else {
+        buffer[len].z -= sub_box_lattice_size[dimension] + (neighbour_local_sub_box[dimension] - sub_box_lattice_size[dimension]);
+      }
+      z = buffer[len].z;
+      latti_id = lats->getId(x, y, z);
+      if (lats->vac_hash.count(latti_id)) {
+        lats->vac_hash.erase(latti_id);
+      } else if (lats->re_hash.count(latti_id)) {
+        lats->re_hash.erase(latti_id);
+      } else if (lats->mn_hash.count(latti_id)) {
+        lats->mn_hash.erase(latti_id);
+      } else if (lats->ni_hash.count(latti_id)) {
+        lats->ni_hash.erase(latti_id);
+      } else if (lats->si_hash.count(latti_id)) {
+        lats->si_hash.erase(latti_id);
+      } else if (lats->momo_hash.count(latti_id)) {
+        lats->momo_hash.erase(latti_id);
+      } else if (lats->more_hash.count(latti_id)) {
+        lats->more_hash.erase(latti_id);
+      } else if (lats->rere_hash.count(latti_id)) {
+        lats->rere_hash.erase(latti_id);
+      }
+
+      switch (static_cast<LatticeTypes::lat_type>(buffer[len].type))
+      {
+        case LatticeTypes::V:
+          lats->vac_hash.emplace(std::make_pair(latti_id, VacancyHash{}));
+          break;
+        case LatticeTypes::Re:
+          lats->re_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::Mn:
+          lats->mn_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::Ni:
+          lats->ni_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::Si:
+          lats->si_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::MoMo:
+          lats->momo_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::MoRe:
+          lats->more_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::ReRe:
+          lats->rere_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::Mo:
+          break;
+        default:
+          break;
+      }
+    }
+  } else if(dimension == 1) {
+    for(len = 0; len < receive_len; len++) {
+      x = buffer[len].x;
+      if(next_id == 2 || next_id == 3 || next_id == 6 || next_id == 7){
+        buffer[len].y += sub_box_lattice_size[dimension];
+      }else{
+        buffer[len].y -= sub_box_lattice_size[dimension] + (neighbour_local_sub_box[dimension] - sub_box_lattice_size[dimension]);
+      }
+      y = buffer[len].y;
+      z = buffer[len].z;
+      latti_id = lats->getId(x, y, z);
+      if (lats->vac_hash.count(latti_id)) {
+        lats->vac_hash.erase(latti_id);
+      } else if (lats->re_hash.count(latti_id)) {
+        lats->re_hash.erase(latti_id);
+      } else if (lats->mn_hash.count(latti_id)) {
+        lats->mn_hash.erase(latti_id);
+      } else if (lats->ni_hash.count(latti_id)) {
+        lats->ni_hash.erase(latti_id);
+      } else if (lats->si_hash.count(latti_id)) {
+        lats->si_hash.erase(latti_id);
+      } else if (lats->momo_hash.count(latti_id)) {
+        lats->momo_hash.erase(latti_id);
+      } else if (lats->more_hash.count(latti_id)) {
+        lats->more_hash.erase(latti_id);
+      } else if (lats->rere_hash.count(latti_id)) {
+        lats->rere_hash.erase(latti_id);
+      }
+
+      switch (static_cast<LatticeTypes::lat_type>(buffer[len].type))
+      {
+        case LatticeTypes::V:
+          lats->vac_hash.emplace(std::make_pair(latti_id, VacancyHash{}));
+          break;
+        case LatticeTypes::Re:
+          lats->re_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::Mn:
+          lats->mn_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::Ni:
+          lats->ni_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::Si:
+          lats->si_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::MoMo:
+          lats->momo_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::MoRe:
+          lats->more_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::ReRe:
+          lats->rere_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::Mo:
+          break;
+        default:
+          break;
+      }
+    }
+  } else if(dimension == 0) {
+    for(len = 0; len < receive_len; len++) {
+      if(next_id % 2 == 1) {
+        buffer[len].x += BCC_DBX * (sub_box_lattice_size[dimension]);
+      } else {
+        buffer[len].x -= BCC_DBX * (sub_box_lattice_size[dimension] + (neighbour_local_sub_box[dimension] - sub_box_lattice_size[dimension]));
+      }
+      x = buffer[len].x;
+      y = buffer[len].y;
+      z = buffer[len].z;
+      latti_id = lats->getId(x, y, z);
+      if (lats->vac_hash.count(latti_id)) {
+        lats->vac_hash.erase(latti_id);
+      } else if (lats->re_hash.count(latti_id)) {
+        lats->re_hash.erase(latti_id);
+      } else if (lats->mn_hash.count(latti_id)) {
+        lats->mn_hash.erase(latti_id);
+      } else if (lats->ni_hash.count(latti_id)) {
+        lats->ni_hash.erase(latti_id);
+      } else if (lats->si_hash.count(latti_id)) {
+        lats->si_hash.erase(latti_id);
+      } else if (lats->momo_hash.count(latti_id)) {
+        lats->momo_hash.erase(latti_id);
+      } else if (lats->more_hash.count(latti_id)) {
+        lats->more_hash.erase(latti_id);
+      } else if (lats->rere_hash.count(latti_id)) {
+        lats->rere_hash.erase(latti_id);
+      }
+
+      switch (static_cast<LatticeTypes::lat_type>(buffer[len].type))
+      {
+        case LatticeTypes::V:
+          lats->vac_hash.emplace(std::make_pair(latti_id, VacancyHash{}));
+          break;
+        case LatticeTypes::Re:
+          lats->re_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::Mn:
+          lats->mn_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::Ni:
+          lats->ni_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::Si:
+          lats->si_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::MoMo:
+          lats->momo_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::MoRe:
+          lats->more_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::ReRe:
+          lats->rere_hash.emplace(latti_id);
+          break;
+        case LatticeTypes::Mo:
+          break;
+        default:
+          break;
+      }
+    }
+  } else {
+    assert(false);
+  }
+
+  const int dims[comm::DIMENSION_SIZE] = {comm::DIM_X, comm::DIM_Y, comm::DIM_Z};
+  std::array<std::vector<comm::Region<comm::_type_lattice_coord>>, comm::DIMENSION_SIZE> send_regions;
+  for (int sect = 0; sect < 8; sect++) {
+    for (int d = 1; d < comm::DIMENSION_SIZE; d++) {
+      send_regions[d] = comm::fwCommSectorSendRegion(sect, dims[d], p_domain->lattice_size_ghost,
+                                                     p_domain->local_split_coord, p_domain->local_sub_box_lattice_region);
+      for (auto &r : send_regions[d]) {
+        _type_lattice_size x_low = BCC_DBX * r.x_low;
+        _type_lattice_size y_low = r.y_low;
+        _type_lattice_size z_low = r.z_low;
+        _type_lattice_size x_high = BCC_DBX * r.x_high;
+        _type_lattice_size y_high = r.y_high;
+        _type_lattice_size z_high = r.z_high;
+
+        for(len = 0; len < receive_len; len++) {
+          x = buffer[len].x;
+          y = buffer[len].y;
+          z = buffer[len].z;
+          if(x_low <= x && x < x_high && y_low <= y && y < y_high && z_low <= z && z < z_high){
+            _type_lattice_id latti_id2 = lats->getId(x, y, z);
+            if(d == 0) {
+              auto it_from = exchange_surface_x[sect].find(latti_id2);
+              if(it_from == exchange_surface_x[sect].end()) exchange_surface_x[sect].emplace(latti_id2);
+            } else if(d == 1) {
+              auto it_from = exchange_surface_y[sect].find(latti_id2);
+              if(it_from == exchange_surface_y[sect].end()) exchange_surface_y[sect].emplace(latti_id2);
+            } else {
+              auto it_from = exchange_surface_z[sect].find(latti_id2);
+              if(it_from == exchange_surface_z[sect].end()) exchange_surface_z[sect].emplace(latti_id2);
             }
           }
         }

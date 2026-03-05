@@ -28,6 +28,7 @@ static void check_nccl(ncclResult_t r, const char* file, int line) {
 static ncclComm_t g_comm{};
 static hipStream_t g_stream{};
 static bool g_inited = false;
+static GpuCommBuffer g_default_buf{};
 
 bool gpu_comm_enabled() {
   return env_enabled("KMC_GPU_COMM");
@@ -54,6 +55,7 @@ void gpu_comm_init(MPI_Comm comm) {
 
 void gpu_comm_finalize() {
   if (!g_inited) return;
+  gpu_comm_buffer_free(g_default_buf);
   hipStreamDestroy(g_stream);
   ncclCommDestroy(g_comm);
   g_inited = false;
@@ -166,6 +168,18 @@ void gpu_comm_send_recv(GpuCommBuffer& buf,
   }
 }
 
+void gpu_comm_send_recv_default(const void* send_host, size_t send_count,
+                               void* recv_host, size_t recv_count,
+                               size_t type_size,
+                               int peer_send, int peer_recv,
+                               MPI_Comm comm) {
+  gpu_comm_send_recv(g_default_buf, send_host, send_count, recv_host, recv_count, type_size, peer_send, peer_recv, comm);
+}
+
+void* gpu_comm_default_recv_device_ptr() {
+  return g_default_buf.d_recv;
+}
+
 #else
 
 bool gpu_comm_enabled() { return false; }
@@ -174,5 +188,7 @@ void gpu_comm_finalize() {}
 void gpu_comm_sanity_allreduce(MPI_Comm) {}
 void gpu_comm_buffer_free(GpuCommBuffer&) {}
 void gpu_comm_send_recv(GpuCommBuffer&, const void*, size_t, void*, size_t, size_t, int, int, MPI_Comm) {}
+void gpu_comm_send_recv_default(const void*, size_t, void*, size_t, size_t, int, int, MPI_Comm) {}
+void* gpu_comm_default_recv_device_ptr() { return nullptr; }
 
 #endif

@@ -41,6 +41,11 @@ public:
                std::unordered_set<_type_lattice_id>& now_exchange_surface_y,
                std::unordered_set<_type_lattice_id>& now_exchange_surface_z);
 
+  void onSend2_gpu(ChangeLattice_GPU buffer[], const int send_len, const int dimension,
+               std::unordered_set<_type_lattice_id>& now_exchange_surface_x, 
+               std::unordered_set<_type_lattice_id>& now_exchange_surface_y,
+               std::unordered_set<_type_lattice_id>& now_exchange_surface_z);
+
   void onReceive(pack_date_type buffer[], const std::vector<comm::Region<pack_region_type>> recv_regions,
                  const unsigned long receive_len, const int dimension, const int direction) override;
 
@@ -52,7 +57,18 @@ public:
                   const _type_lattice_count *neighbour_local_sub_box, unsigned int next_id,
                   const comm::ColoredDomain *p_domain);
 
+  void onReceive2_gpu(ChangeLattice_GPU buffer[], const int receive_len, const int dimension,
+                  std::array<std::unordered_set<_type_lattice_id>, 8>& exchange_surface_x,
+                  std::array<std::unordered_set<_type_lattice_id>, 8>& exchange_surface_y,
+                  std::array<std::unordered_set<_type_lattice_id>, 8>& exchange_surface_z,
+                  const _type_lattice_count *sub_box_lattice_size, 
+                  const _type_lattice_count *neighbour_local_sub_box, unsigned int next_id,
+                  const comm::ColoredDomain *p_domain);
+
   void transfer_buffer_to_GPU2(ChangeLattice *buffer, int receive_len, const int dimension,
+                              const _type_lattice_count *sub_box_lattice_size, const _type_lattice_count *neighbour_local_sub_box, unsigned int next_id);
+
+  void transfer_buffer_to_GPU2_device(ChangeLattice_GPU *d_buffer, int receive_len, const int dimension,
                               const _type_lattice_count *sub_box_lattice_size, const _type_lattice_count *neighbour_local_sub_box, unsigned int next_id);
 
   static inline MPI_Datatype getMPI_DataType() { return mpi_types::_mpi_type_lattice_data; }

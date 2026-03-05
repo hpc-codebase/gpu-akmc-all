@@ -401,11 +401,16 @@ template <class PKs, class Ins> void SubLattice::syncSimRegions(Ins &pk_inst, st
   //     ranks_recv);
   // printf("22222222222\n");
   ChangeLattice send_count;
+  ChangeLattice_GPU send_count_gpu;
   const MPI_Datatype data_type = packer.getMPI_DataTypeChange();
   int num_send[comm::DIMENSION_SIZE];
   int num_receive[comm::DIMENSION_SIZE];
   ChangeLattice *send_buff;
   ChangeLattice *receive_buff;
+  ChangeLattice_GPU *send_buff_gpu;
+  ChangeLattice_GPU *receive_buff_gpu;
+  ChangeLattice_GPU *send_buff_gpu;
+  ChangeLattice_GPU *receive_buff_gpu;
   MPI_Status status;
 
   MPI_Status send_statuses[comm::DIMENSION_SIZE];
@@ -421,51 +426,43 @@ template <class PKs, class Ins> void SubLattice::syncSimRegions(Ins &pk_inst, st
     // }
     // dim_id = comm::DIMENSION_SIZE - 1 - d;
 
-    num_send[dim_id] = packer.sendLength2(dim_id, exchange_ghost, exchange_surface_x[next_sector.id], &send_count);
-    assert(num_send[dim_id] >= 0); // todo remove
-    //kiwi::logs::v(" ", "00000000000000000000000000000 .\n" );
-    //if(num_send[dim_id] > 0){
-    send_buff = new ChangeLattice[num_send[dim_id]];
-    // 将这次要发送的数据复制到send_buff
-    // printf("d:%d 3333333333\n",d);
-    packer.onSend2(send_buff, exchange_ghost, dim_id, exchange_surface_x[next_sector.id], &send_count);
+    if (gpu_comm_enabled()) {
+      num_send[dim_id] = packer.sendLength2_gpu(dim_id, exchange_ghost, exchange_surface_x[next_sector.id], &send_count_gpu);
+      assert(num_send[dim_id] >= 0);
+      send_buff_gpu = new ChangeLattice_GPU[num_send[dim_id]];
+      packer.onSend2_gpu(send_buff_gpu, exchange_ghost, dim_id, exchange_surface_x[next_sector.id], &send_count_gpu);
+    } else {
+      num_send[dim_id] = packer.sendLength2(dim_id, exchange_ghost, exchange_surface_x[next_sector.id], &send_count);
+      assert(num_send[dim_id] >= 0);
+      send_buff = new ChangeLattice[num_send[dim_id]];
+      packer.onSend2(send_buff, exchange_ghost, dim_id, exchange_surface_x[next_sector.id], &send_count);
+    }
 
-    // send and received data.
     int &numsend = num_send[dim_id];
-
-    // 将send_buff中的数据单向发送到send_ranks[dim_id]进程中
-    MPI_Isend(send_buff, numsend, data_type, ranks_send[dim_id], SingleSideForwardingTag2,
-              SimulationDomain::comm_sim_pro.comm, &send_requests[dim_id]);
-    //}
-    // MPI_Barrier(SimulationDomain::comm_sim_pro.comm);
-    // kiwi::logs::v(" ", "1111111111111111111111111111 .\n" );
     int numrecv = 0;
-    // printf("d:%d 44444444\n",d);
-    // int flag;
-    // test the status of neighbor process. 测试邻居进程的状态
-    //MPI_Iprobe(ranks_recv[dim_id], SingleSideForwardingTag2, SimulationDomain::comm_sim_pro.comm, &flag, &status);
-    MPI_Probe(ranks_recv[dim_id], SingleSideForwardingTag2, SimulationDomain::comm_sim_pro.comm, &status);
-    //kiwi::logs::v(" ", "333333333333333333333333333333333 .\n" );
-    //assert(status.MPI_SOURCE == ranks_recv[dim_id]);
-    //assert(status.MPI_TAG == SingleSideForwardingTag2);
-    // test the data length to be received. 获取要接收的数据的量的大小
-    //if(flag){
-    // printf("d:%d 5555555555\n",d);
-    MPI_Get_count(&status, data_type, &numrecv);
-    // initialize receive buffer via receiving size.
-    // the receiving length is get bt MPI_Probe from its neighbour process.
-    assert(numrecv >= 0);  // todo remove
-    //kiwi::logs::v(" ", "2222222222222222222222222222222 .\n");
-    //if(numrecv > 0){
-    // 从recv_ranks[dim_id]进程接收数据到receive_buff中
-    // printf("d:%d 666666666\n",d);
-    receive_buff = new ChangeLattice[numrecv];
-    num_receive[dim_id] = numrecv;
-    MPI_Irecv(receive_buff, numrecv, data_type, ranks_recv[dim_id],
-              SingleSideForwardingTag2, SimulationDomain::comm_sim_pro.comm, &recv_requests[dim_id]);
 
-    MPI_Wait(&send_requests[dim_id], &send_statuses[dim_id]);
-    MPI_Wait(&recv_requests[dim_id], &recv_statuses[dim_id]);
+    if (gpu_comm_enabled()) {
+      gpu_comm_send_recv_default(&numsend, 1, &numrecv, 1, sizeof(int), ranks_send[dim_id], ranks_recv[dim_id],
+                                 SimulationDomain::comm_sim_pro.comm);
+      assert(numrecv >= 0);
+      receive_buff_gpu = new ChangeLattice_GPU[numrecv];
+      num_receive[dim_id] = numrecv;
+      gpu_comm_send_recv_default(send_buff_gpu, static_cast<size_t>(numsend), receive_buff_gpu, static_cast<size_t>(numrecv),
+                                 sizeof(ChangeLattice_GPU), ranks_send[dim_id], ranks_recv[dim_id],
+                                 SimulationDomain::comm_sim_pro.comm);
+    } else {
+      MPI_Isend(send_buff, numsend, data_type, ranks_send[dim_id], SingleSideForwardingTag2,
+                SimulationDomain::comm_sim_pro.comm, &send_requests[dim_id]);
+      MPI_Probe(ranks_recv[dim_id], SingleSideForwardingTag2, SimulationDomain::comm_sim_pro.comm, &status);
+      MPI_Get_count(&status, data_type, &numrecv);
+      assert(numrecv >= 0);
+      receive_buff = new ChangeLattice[numrecv];
+      num_receive[dim_id] = numrecv;
+      MPI_Irecv(receive_buff, numrecv, data_type, ranks_recv[dim_id], SingleSideForwardingTag2,
+                SimulationDomain::comm_sim_pro.comm, &recv_requests[dim_id]);
+      MPI_Wait(&send_requests[dim_id], &send_statuses[dim_id]);
+      MPI_Wait(&recv_requests[dim_id], &recv_statuses[dim_id]);
+    }
     //将接收到的数据存到_lattices中，也就是更新全局的lattices信息
     // int receive_len = recv_regions[dim_id];
     // printf("start transfer\n");
@@ -473,15 +470,28 @@ template <class PKs, class Ins> void SubLattice::syncSimRegions(Ins &pk_inst, st
     // for(int i=0;i<num_receive[dim_id];i++)
     //   printf("r_buffer (%ld,%ld,%ld)\t",receive_buff[i].x,receive_buff[i].y,receive_buff[i].z);
     // printf("\n");
-    packer.transfer_buffer_to_GPU(receive_buff, num_receive[dim_id], dim_id, p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, cur_sector.id);
-    packer.onReceive2(receive_buff, recv_regions[dim_id], num_receive[dim_id], dim_id, exchange_ghost, 
-                      p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, cur_sector.id, 
+    if (gpu_comm_enabled()) {
+      packer.transfer_buffer_to_GPU_device(reinterpret_cast<ChangeLattice_GPU*>(gpu_comm_default_recv_device_ptr()),
+                                           num_receive[dim_id], dim_id, p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, cur_sector.id);
+      packer.onReceive2_gpu(receive_buff_gpu, recv_regions[dim_id], num_receive[dim_id], dim_id, exchange_ghost,
+                      p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, cur_sector.id,
                       exchange_surface_x, exchange_surface_y, exchange_surface_z, p_domain);
+    } else {
+      packer.transfer_buffer_to_GPU(receive_buff, num_receive[dim_id], dim_id, p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, cur_sector.id);
+      packer.onReceive2(receive_buff, recv_regions[dim_id], num_receive[dim_id], dim_id, exchange_ghost, 
+                        p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, cur_sector.id, 
+                        exchange_surface_x, exchange_surface_y, exchange_surface_z, p_domain);
+    }
 
     // release buffer
     //if(num_send[dim_id] > 0) delete[] send_buff;
-    delete[] send_buff;
-    delete[] receive_buff;
+    if (gpu_comm_enabled()) {
+      delete[] send_buff_gpu;
+      delete[] receive_buff_gpu;
+    } else {
+      delete[] send_buff;
+      delete[] receive_buff;
+    }
     //if(numrecv > 0) delete[] receive_buff;
   
   }
@@ -572,29 +582,39 @@ template <class PKg, class Ins> void SubLattice::syncNextSectorGhostRegions(Ins 
     num_send[dim_id] = packer.sendLength2(dim_id, exchange_surface_x[next_sector.id], exchange_surface_y[next_sector.id], exchange_surface_z[next_sector.id]);
     //num_send[dim_id] = packer.sendLength(send_regions[dim_id], dim_id, comm::DIR_LOWER);
     assert(num_send[dim_id] >= 0); // todo remove
-    send_buff = new ChangeLattice[num_send[dim_id]];
-    packer.onSend2(send_buff, num_send[dim_id], dim_id, exchange_surface_x[next_sector.id], exchange_surface_y[next_sector.id], exchange_surface_z[next_sector.id]);
+    if (gpu_comm_enabled()) {
+      send_buff_gpu = new ChangeLattice_GPU[num_send[dim_id]];
+      packer.onSend2_gpu(send_buff_gpu, num_send[dim_id], dim_id, exchange_surface_x[next_sector.id], exchange_surface_y[next_sector.id], exchange_surface_z[next_sector.id]);
+    } else {
+      send_buff = new ChangeLattice[num_send[dim_id]];
+      packer.onSend2(send_buff, num_send[dim_id], dim_id, exchange_surface_x[next_sector.id], exchange_surface_y[next_sector.id], exchange_surface_z[next_sector.id]);
+    }
     //packer.onSend(send_buff, send_regions[dim_id], num_send[dim_id], dim_id, comm::DIR_LOWER);
     // send and received data.
     int &numsend = num_send[dim_id];
     int numrecv = 0;
-    MPI_Isend(send_buff, numsend, data_type, ranks_send[dim_id], SingleSideForwardingTag2,
-              SimulationDomain::comm_sim_pro.comm, &send_requests[dim_id]);
-    // test the status of neighbor process.
-    MPI_Probe(ranks_recv[dim_id], SingleSideForwardingTag2, SimulationDomain::comm_sim_pro.comm, &status);
-    // test the data length to be received.
-    MPI_Get_count(&status, data_type, &numrecv);
-    // initialize receive buffer via receiving size.
-    // the receiving length is get bt MPI_Probe from its neighbour process.
-    assert(numrecv >= 0);  // todo remove
-    receive_buff = new ChangeLattice[numrecv];
-    num_receive[dim_id] = numrecv;
-    MPI_Irecv(receive_buff, numrecv, data_type, ranks_recv[dim_id],
-              SingleSideForwardingTag2, SimulationDomain::comm_sim_pro.comm, &recv_requests[dim_id]);
-
-    // data received.
-    MPI_Wait(&send_requests[dim_id], &send_statuses[dim_id]);
-    MPI_Wait(&recv_requests[dim_id], &recv_statuses[dim_id]);
+    if (gpu_comm_enabled()) {
+      gpu_comm_send_recv_default(&numsend, 1, &numrecv, 1, sizeof(int), ranks_send[dim_id], ranks_recv[dim_id],
+                                 SimulationDomain::comm_sim_pro.comm);
+      assert(numrecv >= 0);
+      receive_buff_gpu = new ChangeLattice_GPU[numrecv];
+      num_receive[dim_id] = numrecv;
+      gpu_comm_send_recv_default(send_buff_gpu, static_cast<size_t>(numsend), receive_buff_gpu, static_cast<size_t>(numrecv),
+                                 sizeof(ChangeLattice_GPU), ranks_send[dim_id], ranks_recv[dim_id],
+                                 SimulationDomain::comm_sim_pro.comm);
+    } else {
+      MPI_Isend(send_buff, numsend, data_type, ranks_send[dim_id], SingleSideForwardingTag2,
+                SimulationDomain::comm_sim_pro.comm, &send_requests[dim_id]);
+      MPI_Probe(ranks_recv[dim_id], SingleSideForwardingTag2, SimulationDomain::comm_sim_pro.comm, &status);
+      MPI_Get_count(&status, data_type, &numrecv);
+      assert(numrecv >= 0);
+      receive_buff = new ChangeLattice[numrecv];
+      num_receive[dim_id] = numrecv;
+      MPI_Irecv(receive_buff, numrecv, data_type, ranks_recv[dim_id], SingleSideForwardingTag2,
+                SimulationDomain::comm_sim_pro.comm, &recv_requests[dim_id]);
+      MPI_Wait(&send_requests[dim_id], &send_statuses[dim_id]);
+      MPI_Wait(&recv_requests[dim_id], &recv_statuses[dim_id]);
+    }
 
     int receive_len = num_receive[dim_id];
 
@@ -602,17 +622,29 @@ template <class PKg, class Ins> void SubLattice::syncNextSectorGhostRegions(Ins 
     // for(int i=0;i<num_receive[dim_id];i++)
     //   printf("ss_buffer (%ld,%ld,%ld)\t",receive_buff[i].x,receive_buff[i].y,receive_buff[i].z);
     // printf("\n");
-    packer.transfer_buffer_to_GPU2(receive_buff,num_receive[dim_id], dim_id, p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, next_sector.id);
-    packer.onReceive2(receive_buff, num_receive[dim_id], dim_id, exchange_surface_x, exchange_surface_y, exchange_surface_z,
+    if (gpu_comm_enabled()) {
+      packer.transfer_buffer_to_GPU2_device(reinterpret_cast<ChangeLattice_GPU*>(gpu_comm_default_recv_device_ptr()),
+                                            num_receive[dim_id], dim_id, p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, next_sector.id);
+      packer.onReceive2_gpu(receive_buff_gpu, num_receive[dim_id], dim_id, exchange_surface_x, exchange_surface_y, exchange_surface_z,
                 p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, next_sector.id, p_domain);
+    } else {
+      packer.transfer_buffer_to_GPU2(receive_buff,num_receive[dim_id], dim_id, p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, next_sector.id);
+      packer.onReceive2(receive_buff, num_receive[dim_id], dim_id, exchange_surface_x, exchange_surface_y, exchange_surface_z,
+                  p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, next_sector.id, p_domain);
+    }
 
     //在这里把receive_buff传给GPU
     //然后让gpu去更新gpu端的hashset
     
     //packer.onReceive(receive_buff, recv_regions[dim_id], num_receive[dim_id], dim_id, comm::DIR_LOWER);
     // release buffer
-    delete[] send_buff;
-    delete[] receive_buff;
+    if (gpu_comm_enabled()) {
+      delete[] send_buff_gpu;
+      delete[] receive_buff_gpu;
+    } else {
+      delete[] send_buff;
+      delete[] receive_buff;
+    }
   }
 
   // all finished

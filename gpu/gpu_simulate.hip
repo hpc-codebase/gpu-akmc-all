@@ -3058,3 +3058,46 @@ void transferBufferToGPU2(ChangeLattice *buffer, int receive_len, const int dime
     // // hipLaunchKernelGGL(print_g_Pair_Atoms,1,1,0,0,arr_size);
     // hipDeviceSynchronize();
 }
+
+void transferBufferToGPU_Device(ChangeLattice_GPU *d_buffer, int receive_len, const int dimension,
+                          const _type_lattice_count *sub_box_lattice_size, const _type_lattice_count *neighbour_local_sub_box, unsigned int id){
+      int blockSize = 128;
+      int blockNum = (receive_len)/blockSize + 1;
+      hipLaunchKernelGGL(update_hash_set, blockNum, blockSize, 0, 0, 
+        d_buffer,
+        receive_len,
+        dimension,
+        id,
+        sub_box_lattice_size[0],
+        sub_box_lattice_size[1],
+        sub_box_lattice_size[2],
+        neighbour_local_sub_box[0],
+        neighbour_local_sub_box[1],
+        neighbour_local_sub_box[2]
+      );
+      hipDeviceSynchronize();
+      hipLaunchKernelGGL(update_Pair_Atoms, 1, 1, 0, 0, pair_atoms_size
+                      );
+}
+
+void transferBufferToGPU2_Device(ChangeLattice_GPU *d_buffer, int receive_len, const int dimension,
+                          const _type_lattice_count *sub_box_lattice_size, const _type_lattice_count *neighbour_local_sub_box, unsigned int next_id){
+    int blockSize = 128;
+    int blockNum = (receive_len)/blockSize + 1;
+    hipDeviceSynchronize();
+    hipLaunchKernelGGL(update_hash_set2,blockNum, blockSize, 0, 0, 
+      d_buffer,
+      receive_len,
+      dimension,
+      next_id,
+      sub_box_lattice_size[0],
+      sub_box_lattice_size[1],
+      sub_box_lattice_size[2],
+      neighbour_local_sub_box[0],
+      neighbour_local_sub_box[1],
+      neighbour_local_sub_box[2]
+    );
+    hipDeviceSynchronize();
+    hipLaunchKernelGGL(update_Pair_Atoms, 1, 1, 0, 0, pair_atoms_size
+                      );
+}

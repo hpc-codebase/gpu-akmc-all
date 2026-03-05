@@ -37,15 +37,32 @@ public:
                 std::array<std::unordered_set<_type_lattice_id>, 8>& exchange_surface_z,
                 const comm::ColoredDomain *p_domain);
 
+  void onReceive2_gpu(ChangeLattice_GPU *buffer, std::vector<comm::Region<pack_region_type>> recv_regions,
+                const int receive_len, const int dimension, std::array<std::unordered_set<_type_lattice_id>, 7>& exchange_ghost,
+                 const _type_lattice_count *sub_box_lattice_size, const _type_lattice_count *neighbour_local_sub_box, unsigned int id, 
+                std::array<std::unordered_set<_type_lattice_id>, 8>& exchange_surface_x,
+                std::array<std::unordered_set<_type_lattice_id>, 8>& exchange_surface_y,
+                std::array<std::unordered_set<_type_lattice_id>, 8>& exchange_surface_z,
+                const comm::ColoredDomain *p_domain);
+
   void transfer_buffer_to_GPU(ChangeLattice *buffer, int receive_len, const int dimension,
+                              const _type_lattice_count *sub_box_lattice_size, const _type_lattice_count *neighbour_local_sub_box, unsigned int id);
+
+  void transfer_buffer_to_GPU_device(ChangeLattice_GPU *d_buffer, int receive_len, const int dimension,
                               const _type_lattice_count *sub_box_lattice_size, const _type_lattice_count *neighbour_local_sub_box, unsigned int id);
 
 
   const int sendLength2(const int dimension, std::array<std::unordered_set<_type_lattice_id>, 7>& exchange_ghost,
                         std::unordered_set<_type_lattice_id>& now_exchange_surface_x, ChangeLattice *send_count);
 
+  const int sendLength2_gpu(const int dimension, std::array<std::unordered_set<_type_lattice_id>, 7>& exchange_ghost,
+                        std::unordered_set<_type_lattice_id>& now_exchange_surface_x, ChangeLattice_GPU *send_count);
+
   void onSend2(ChangeLattice *buffer, std::array<std::unordered_set<_type_lattice_id>, 7>& exchange_ghost, const int dimension, 
                std::unordered_set<_type_lattice_id>& now_exchange_surface_x, ChangeLattice *send_count);
+
+  void onSend2_gpu(ChangeLattice_GPU *buffer, std::array<std::unordered_set<_type_lattice_id>, 7>& exchange_ghost, const int dimension, 
+               std::unordered_set<_type_lattice_id>& now_exchange_surface_x, ChangeLattice_GPU *send_count);
 
   static inline MPI_Datatype getMPI_DataType() { return mpi_types::_mpi_type_lattice_data; }
   
