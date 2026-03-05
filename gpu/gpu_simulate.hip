@@ -3101,3 +3101,23 @@ void transferBufferToGPU2_Device(ChangeLattice_GPU *d_buffer, int receive_len, c
     hipLaunchKernelGGL(update_Pair_Atoms, 1, 1, 0, 0, pair_atoms_size
                       );
 }
+
+__global__ void packChangeLatticeFromIdsKernel(const _type_lattice_id *ids, ChangeLattice_GPU *out, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  _type_lattice_id id = ids[i];
+  _type_lattice_id x = id % g_meta->size_x;
+  _type_lattice_id y = (id / g_meta->size_x) % g_meta->size_y;
+  _type_lattice_id z = id / (g_meta->size_x * g_meta->size_y);
+  out[i].x = x;
+  out[i].y = y;
+  out[i].z = z;
+  out[i].type = static_cast<int>(getType(id));
+}
+
+void packChangeLatticeFromIds_Device(const _type_lattice_id *d_ids, ChangeLattice_GPU *d_out, int n) {
+  int blockSize = 256;
+  int blockNum = (n + blockSize - 1) / blockSize;
+  hipLaunchKernelGGL(packChangeLatticeFromIdsKernel, blockNum, blockSize, 0, 0, d_ids, d_out, n);
+  hipDeviceSynchronize();
+}

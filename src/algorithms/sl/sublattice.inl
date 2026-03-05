@@ -427,8 +427,44 @@ template <class PKs, class Ins> void SubLattice::syncSimRegions(Ins &pk_inst, st
     if (gpu_comm_enabled()) {
       num_send[dim_id] = packer.sendLength2_gpu(dim_id, exchange_ghost, exchange_surface_x[next_sector.id], &send_count_gpu);
       assert(num_send[dim_id] >= 0);
-      send_buff_gpu = new ChangeLattice_GPU[num_send[dim_id]];
-      packer.onSend2_gpu(send_buff_gpu, exchange_ghost, dim_id, exchange_surface_x[next_sector.id], &send_count_gpu);
+      static _type_lattice_id *d_ids = nullptr;
+      static size_t d_ids_cap = 0;
+      static ChangeLattice_GPU *d_payload = nullptr;
+      static size_t d_payload_cap = 0;
+
+      std::vector<_type_lattice_id> ids;
+      ids.reserve(static_cast<size_t>(num_send[dim_id] - 1));
+      if (dim_id == 0) {
+        for (const auto& latticeId : exchange_ghost[6]) ids.push_back(latticeId);
+        for (const auto& latticeId : exchange_ghost[5]) ids.push_back(latticeId);
+        for (const auto& latticeId : exchange_ghost[3]) ids.push_back(latticeId);
+        for (const auto& latticeId : exchange_ghost[2]) ids.push_back(latticeId);
+      } else if (dim_id == 1) {
+        for (const auto& latticeId : exchange_ghost[4]) ids.push_back(latticeId);
+        for (const auto& latticeId : exchange_ghost[1]) ids.push_back(latticeId);
+      } else {
+        for (const auto& latticeId : exchange_ghost[0]) ids.push_back(latticeId);
+      }
+
+      size_t need_ids = ids.size();
+      size_t need_payload = static_cast<size_t>(num_send[dim_id]);
+      if (need_ids > d_ids_cap) {
+        if (d_ids) hipFree(d_ids);
+        hipMalloc(reinterpret_cast<void**>(&d_ids), need_ids * sizeof(_type_lattice_id));
+        d_ids_cap = need_ids;
+      }
+      if (need_payload > d_payload_cap) {
+        if (d_payload) hipFree(d_payload);
+        hipMalloc(reinterpret_cast<void**>(&d_payload), need_payload * sizeof(ChangeLattice_GPU));
+        d_payload_cap = need_payload;
+      }
+
+      if (need_ids > 0) {
+        hipMemcpy(d_ids, ids.data(), need_ids * sizeof(_type_lattice_id), hipMemcpyHostToDevice);
+        packChangeLatticeFromIds_Device(d_ids, d_payload, static_cast<int>(need_ids));
+      }
+      hipMemcpy(d_payload + (need_payload - 1), &send_count_gpu, sizeof(ChangeLattice_GPU), hipMemcpyHostToDevice);
+      send_buff_gpu = d_payload;
     } else {
       num_send[dim_id] = packer.sendLength2(dim_id, exchange_ghost, exchange_surface_x[next_sector.id], &send_count);
       assert(num_send[dim_id] >= 0);
@@ -445,9 +481,10 @@ template <class PKs, class Ins> void SubLattice::syncSimRegions(Ins &pk_inst, st
       assert(numrecv >= 0);
       receive_buff_gpu = new ChangeLattice_GPU[numrecv];
       num_receive[dim_id] = numrecv;
-      gpu_comm_send_recv_default(send_buff_gpu, static_cast<size_t>(numsend), receive_buff_gpu, static_cast<size_t>(numrecv),
-                                 sizeof(ChangeLattice_GPU), ranks_send[dim_id], ranks_recv[dim_id],
-                                 SimulationDomain::comm_sim_pro.comm);
+      gpu_comm_send_recv_device_default(send_buff_gpu, static_cast<size_t>(numsend) * sizeof(ChangeLattice_GPU),
+                                        nullptr, static_cast<size_t>(numrecv) * sizeof(ChangeLattice_GPU),
+                                        ranks_send[dim_id], ranks_recv[dim_id], SimulationDomain::comm_sim_pro.comm);
+      hipMemcpy(receive_buff_gpu, gpu_comm_default_recv_device_ptr(), static_cast<size_t>(numrecv) * sizeof(ChangeLattice_GPU), hipMemcpyDeviceToHost);
     } else {
       MPI_Isend(send_buff, numsend, data_type, ranks_send[dim_id], SingleSideForwardingTag2,
                 SimulationDomain::comm_sim_pro.comm, &send_requests[dim_id]);
@@ -484,7 +521,6 @@ template <class PKs, class Ins> void SubLattice::syncSimRegions(Ins &pk_inst, st
     // release buffer
     //if(num_send[dim_id] > 0) delete[] send_buff;
     if (gpu_comm_enabled()) {
-      delete[] send_buff_gpu;
       delete[] receive_buff_gpu;
     } else {
       delete[] send_buff;
@@ -583,8 +619,39 @@ template <class PKg, class Ins> void SubLattice::syncNextSectorGhostRegions(Ins 
     //num_send[dim_id] = packer.sendLength(send_regions[dim_id], dim_id, comm::DIR_LOWER);
     assert(num_send[dim_id] >= 0); // todo remove
     if (gpu_comm_enabled()) {
-      send_buff_gpu = new ChangeLattice_GPU[num_send[dim_id]];
-      packer.onSend2_gpu(send_buff_gpu, num_send[dim_id], dim_id, exchange_surface_x[next_sector.id], exchange_surface_y[next_sector.id], exchange_surface_z[next_sector.id]);
+      static _type_lattice_id *d_ids = nullptr;
+      static size_t d_ids_cap = 0;
+      static ChangeLattice_GPU *d_payload = nullptr;
+      static size_t d_payload_cap = 0;
+
+      std::vector<_type_lattice_id> ids;
+      ids.reserve(static_cast<size_t>(num_send[dim_id]));
+      if (dim_id == 0) {
+        for (const auto& latticeId : exchange_surface_x[next_sector.id]) ids.push_back(latticeId);
+      } else if (dim_id == 1) {
+        for (const auto& latticeId : exchange_surface_y[next_sector.id]) ids.push_back(latticeId);
+      } else {
+        for (const auto& latticeId : exchange_surface_z[next_sector.id]) ids.push_back(latticeId);
+      }
+
+      size_t need_ids = ids.size();
+      size_t need_payload = static_cast<size_t>(num_send[dim_id]);
+      if (need_ids > d_ids_cap) {
+        if (d_ids) hipFree(d_ids);
+        hipMalloc(reinterpret_cast<void**>(&d_ids), need_ids * sizeof(_type_lattice_id));
+        d_ids_cap = need_ids;
+      }
+      if (need_payload > d_payload_cap) {
+        if (d_payload) hipFree(d_payload);
+        hipMalloc(reinterpret_cast<void**>(&d_payload), need_payload * sizeof(ChangeLattice_GPU));
+        d_payload_cap = need_payload;
+      }
+
+      if (need_ids > 0) {
+        hipMemcpy(d_ids, ids.data(), need_ids * sizeof(_type_lattice_id), hipMemcpyHostToDevice);
+        packChangeLatticeFromIds_Device(d_ids, d_payload, static_cast<int>(need_ids));
+      }
+      send_buff_gpu = d_payload;
     } else {
       send_buff = new ChangeLattice[num_send[dim_id]];
       packer.onSend2(send_buff, num_send[dim_id], dim_id, exchange_surface_x[next_sector.id], exchange_surface_y[next_sector.id], exchange_surface_z[next_sector.id]);
@@ -599,9 +666,10 @@ template <class PKg, class Ins> void SubLattice::syncNextSectorGhostRegions(Ins 
       assert(numrecv >= 0);
       receive_buff_gpu = new ChangeLattice_GPU[numrecv];
       num_receive[dim_id] = numrecv;
-      gpu_comm_send_recv_default(send_buff_gpu, static_cast<size_t>(numsend), receive_buff_gpu, static_cast<size_t>(numrecv),
-                                 sizeof(ChangeLattice_GPU), ranks_send[dim_id], ranks_recv[dim_id],
-                                 SimulationDomain::comm_sim_pro.comm);
+      gpu_comm_send_recv_device_default(send_buff_gpu, static_cast<size_t>(numsend) * sizeof(ChangeLattice_GPU),
+                                        nullptr, static_cast<size_t>(numrecv) * sizeof(ChangeLattice_GPU),
+                                        ranks_send[dim_id], ranks_recv[dim_id], SimulationDomain::comm_sim_pro.comm);
+      hipMemcpy(receive_buff_gpu, gpu_comm_default_recv_device_ptr(), static_cast<size_t>(numrecv) * sizeof(ChangeLattice_GPU), hipMemcpyDeviceToHost);
     } else {
       MPI_Isend(send_buff, numsend, data_type, ranks_send[dim_id], SingleSideForwardingTag2,
                 SimulationDomain::comm_sim_pro.comm, &send_requests[dim_id]);
@@ -639,7 +707,6 @@ template <class PKg, class Ins> void SubLattice::syncNextSectorGhostRegions(Ins 
     //packer.onReceive(receive_buff, recv_regions[dim_id], num_receive[dim_id], dim_id, comm::DIR_LOWER);
     // release buffer
     if (gpu_comm_enabled()) {
-      delete[] send_buff_gpu;
       delete[] receive_buff_gpu;
     } else {
       delete[] send_buff;
