@@ -32,6 +32,7 @@ void recb_solver_GPU(
                     int *sizes
                   );
 double calculate_GPU(_type_lattice_id *vac_idArray,  const _type_lattice_count& vac_count);
+double calculate_GPU_region(int x_low, int x_high, int y_low, int y_high, int z_low, int z_high);
 
 void selectAndPerformEventGPU(double excepted_rand, int rank, _type_lattice_count step, int sect,
                               std::array<std::unordered_set<_type_lattice_id>, 7>& exchange_ghost, const unsigned int sector_id,

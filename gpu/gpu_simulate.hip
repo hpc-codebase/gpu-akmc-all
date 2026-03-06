@@ -56,6 +56,13 @@ namespace gpuSimulate {
     _type_lattice_count vacHostArrayCapacity;
     _type_lattice_count HostAtomCapacity;
 
+    long int *d_vac_all;
+    long int *d_vac_sector;
+    int *d_vac_count_all;
+    int *d_vac_count_sector;
+    int vac_capacity_all;
+    int vac_capacity_sector;
+
     double *sum_rates;
     dev_event* h_event;
 
@@ -1177,6 +1184,93 @@ __global__ void selectEventGPU(dev_Vacancy *deviceVacancyInfo, dev_nnLattice *de
   }
 }
 
+__global__ void apply_selected_event_kernel(const dev_event* ev, int sector_id) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+  dev_event e = ev[0];
+  long int from_id = e.from_id;
+  long int to_id = e.to_id;
+  LatticeTypes::lat_type to_type = static_cast<LatticeTypes::lat_type>(e.to_type._type);
+
+  hash_set_remove_atom_op(g_V_Hash, from_id);
+  hash_set_insert_atom_op(g_V_Hash, to_id);
+
+  switch (to_type) {
+    case LatticeTypes::MoRe:
+      hash_set_remove_atom_op(g_MoRe_Hash, to_id);
+      hash_set_insert_atom_op(g_MoRe_Hash, from_id);
+      break;
+    case LatticeTypes::MoMo:
+      hash_set_remove_atom_op(g_MoMo_Hash, to_id);
+      hash_set_insert_atom_op(g_MoMo_Hash, from_id);
+      break;
+    case LatticeTypes::Re:
+      hash_set_remove_atom_op(g_Re_Hash, to_id);
+      hash_set_insert_atom_op(g_Re_Hash, from_id);
+      break;
+    case LatticeTypes::V:
+      break;
+    case LatticeTypes::Mo:
+      break;
+    default:
+      break;
+  }
+
+  if (isGhostLat(to_id)) {
+    _type_lattice_id x = to_id % g_meta->size_x;
+    _type_lattice_id y = (to_id / g_meta->size_x) % g_meta->size_y;
+    _type_lattice_id z = to_id / (g_meta->size_x * g_meta->size_y);
+    int base = sector_id * 7;
+    for (int k = 0; k < 7; k++) {
+      const auto* r = &g_comm_ghost_regions[base + k];
+      if (r->x_low <= x && x < r->x_high && r->y_low <= y && y < r->y_high && r->z_low <= z && z < r->z_high) {
+        GPUHashSet* b = commBucketPtr(k);
+        if (b) hash_set_insert_atom_op(b, to_id);
+        break;
+      }
+    }
+  }
+
+  if (isSurfaceLat(from_id)) {
+    _type_lattice_id x = from_id % g_meta->size_x;
+    _type_lattice_id y = (from_id / g_meta->size_x) % g_meta->size_y;
+    _type_lattice_id z = from_id / (g_meta->size_x * g_meta->size_y);
+    if (g_comm_surface_offsets && g_comm_surface_boxes && g_comm_surface_buckets_ptr) {
+      for (int b = 0; b < 24; b++) {
+        int start = g_comm_surface_offsets[b];
+        int end = g_comm_surface_offsets[b + 1];
+        for (int j = start; j < end; j++) {
+          CommBox box = g_comm_surface_boxes[j];
+          if (box.x_low <= x && x < box.x_high && box.y_low <= y && y < box.y_high && box.z_low <= z && z < box.z_high) {
+            GPUHashSet* set = g_comm_surface_buckets_ptr[b];
+            if (set) hash_set_insert_atom_op(set, from_id);
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  if (isSurfaceLat(to_id)) {
+    _type_lattice_id x = to_id % g_meta->size_x;
+    _type_lattice_id y = (to_id / g_meta->size_x) % g_meta->size_y;
+    _type_lattice_id z = to_id / (g_meta->size_x * g_meta->size_y);
+    if (g_comm_surface_offsets && g_comm_surface_boxes && g_comm_surface_buckets_ptr) {
+      for (int b = 0; b < 24; b++) {
+        int start = g_comm_surface_offsets[b];
+        int end = g_comm_surface_offsets[b + 1];
+        for (int j = start; j < end; j++) {
+          CommBox box = g_comm_surface_boxes[j];
+          if (box.x_low <= x && x < box.x_high && box.y_low <= y && y < box.y_high && box.z_low <= z && z < box.z_high) {
+            GPUHashSet* set = g_comm_surface_buckets_ptr[b];
+            if (set) hash_set_insert_atom_op(set, to_id);
+            break;
+          }
+        }
+      }
+    }
+  }
+}
+
 void selectAndPerformEventGPU(double excepted_rand, int rank, _type_lattice_count step, int sect,
                               std::array<std::unordered_set<_type_lattice_id>, 7>& exchange_ghost, const unsigned int sector_id,
                               std::array<std::unordered_set<_type_lattice_id>, 8>& exchange_surface_x, 
@@ -1196,9 +1290,13 @@ void selectAndPerformEventGPU(double excepted_rand, int rank, _type_lattice_coun
                      *sum_rates * excepted_rand);
 
   CHECK_FOR_ERROR();
+  if (gpu_comm_enabled()) {
+    hipLaunchKernelGGL(apply_selected_event_kernel, 1, 1, 0, 0, d_event, static_cast<int>(sector_id));
+    CHECK_FOR_ERROR();
+    return;
+  }
 
   HANDLE_HIP(hipMemcpy(h_event, d_event, sizeof(dev_event), hipMemcpyDeviceToHost));
-  // kiwi::logs::v(" ", " excepted_rate is : {} step is : {} sect is : {} from_id is : {} to_id is : {}. \n", *sum_rates * excepted_rand, step, sect, h_event->from_id, h_event->to_id);
   to_x = h_event->to_id % lattice_list->meta.size_x;
   to_y = (h_event->to_id / lattice_list->meta.size_x) % lattice_list->meta.size_y;
   to_z = h_event->to_id / (lattice_list->meta.size_x * lattice_list->meta.size_y);
@@ -1216,12 +1314,6 @@ void selectAndPerformEventGPU(double excepted_rand, int rank, _type_lattice_coun
   }
   if (lattice_list->meta.isSurfaceLat(h_event->from_id)) add_surface(h_event->from_id, exchange_surface_x, exchange_surface_y, exchange_surface_z);
   if (lattice_list->meta.isSurfaceLat(h_event->to_id)) add_surface(h_event->to_id, exchange_surface_x, exchange_surface_y, exchange_surface_z);
-
-  if (gpu_comm_enabled()) {
-    if (lattice_list->meta.isGhostLat(h_event->to_id)) commInsertGhostId(static_cast<int>(sector_id), h_event->to_id);
-    if (lattice_list->meta.isSurfaceLat(h_event->from_id)) commInsertSurfaceId(h_event->from_id);
-    if (lattice_list->meta.isSurfaceLat(h_event->to_id)) commInsertSurfaceId(h_event->to_id);
-  }
 }
 __global__ void setGlobalPointer(dev_meta *meta,
                             GPUHashSet *MoRe_Hash,GPUHashSet *MoMo_Hash,
@@ -2485,6 +2577,77 @@ __global__ void compact_valid_keys(const long int* __restrict__ keys,
     int idx = atomicAdd(out_count, 1);
     out_keys[idx] = k;
 }
+
+__global__ void filter_ids_in_region(const long int* __restrict__ in_ids,
+                                     int in_count,
+                                     int x_low, int x_high,
+                                     int y_low, int y_high,
+                                     int z_low, int z_high,
+                                     long int* __restrict__ out_ids,
+                                     int* __restrict__ out_count) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= in_count) return;
+  long int id = in_ids[tid];
+  _type_lattice_id x = id % g_meta->size_x;
+  _type_lattice_id y = (id / g_meta->size_x) % g_meta->size_y;
+  _type_lattice_id z = id / (g_meta->size_x * g_meta->size_y);
+  if (x_low <= x && x < x_high && y_low <= y && y < y_high && z_low <= z && z < z_high) {
+    int idx = atomicAdd(out_count, 1);
+    out_ids[idx] = id;
+  }
+}
+
+__global__ void build_nn_info_from_vac_list(const long int* __restrict__ vac_ids,
+                                           int vac_count,
+                                           dev_Vacancy* __restrict__ out_vac,
+                                           dev_nnLattice* __restrict__ out_nn) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= vac_count) return;
+  long int vid = vac_ids[i];
+  _type_lattice_id x = vid % g_meta->size_x;
+  _type_lattice_id y = (vid / g_meta->size_x) % g_meta->size_y;
+  _type_lattice_id z = vid / (g_meta->size_x * g_meta->size_y);
+  out_vac[i].id = static_cast<int>(vid);
+
+  dev_Lattice nn1[8];
+  dev_Lattice nn2[6];
+  get1nn(x, y, z, nn1);
+  get2nn(x, y, z, nn2);
+
+  int base = i * NN_TOTAL;
+  for (int j = 0; j < 8; j++) {
+    out_nn[base + j].id = static_cast<int>(nn1[j].id);
+    out_nn[base + j].type = nn1[j].type;
+  }
+  for (int j = 0; j < 6; j++) {
+    out_nn[base + 8 + j].id = static_cast<int>(nn2[j].id);
+    out_nn[base + 8 + j].type = nn2[j].type;
+  }
+
+  for (int b = 0; b < 8; b++) {
+    long int nid = nn1[b].id;
+    _type_lattice_id nx = nid % g_meta->size_x;
+    _type_lattice_id ny = (nid / g_meta->size_x) % g_meta->size_y;
+    _type_lattice_id nz = nid / (g_meta->size_x * g_meta->size_y);
+
+    dev_Lattice t1[8];
+    dev_Lattice t2[6];
+    get1nn(nx, ny, nz, t1);
+    get2nn(nx, ny, nz, t2);
+
+    int off1 = base + 14 + b * 8;
+    for (int j = 0; j < 8; j++) {
+      out_nn[off1 + j].id = static_cast<int>(t1[j].id);
+      out_nn[off1 + j].type = t1[j].type;
+    }
+
+    int off2 = base + 78 + b * 6;
+    for (int j = 0; j < 6; j++) {
+      out_nn[off2 + j].id = static_cast<int>(t2[j].id);
+      out_nn[off2 + j].type = t2[j].type;
+    }
+  }
+}
 __global__ void compute_types_for_list(const long int* __restrict__ list,
                                       long int* __restrict__ out_types,
                                       int count) {
@@ -2602,11 +2765,11 @@ void recb_solver_GPU(
     hipDeviceSynchronize();
     if (do_profile) HANDLE_HIP(hipEventRecord(recb_evt_after_type, 0));
 
-    if (h_ghost_count > 0) {
+    if (h_ghost_count > 0 && h_ghost_Hash && h_ghost_type) {
       HANDLE_HIP(hipMemcpy(h_ghost_Hash, d_ghost_list, h_ghost_count * sizeof(long int), hipMemcpyDeviceToHost));
       HANDLE_HIP(hipMemcpy(h_ghost_type, d_ghost_list_type, h_ghost_count * sizeof(long int), hipMemcpyDeviceToHost));
     }
-    if (h_surface_count > 0) {
+    if (h_surface_count > 0 && h_surface_Hash && h_surface_type) {
       HANDLE_HIP(hipMemcpy(h_surface_Hash, d_surface_list, h_surface_count * sizeof(long int), hipMemcpyDeviceToHost));
       HANDLE_HIP(hipMemcpy(h_surface_type, d_surface_list_type, h_surface_count * sizeof(long int), hipMemcpyDeviceToHost));
     }
@@ -2620,8 +2783,10 @@ void recb_solver_GPU(
     //   if(i%20 == 0)
     //   printf("\n");
     // }
-    sizes[0]= h_ghost_count;
-    sizes[1]= h_surface_count;
+    if (sizes) {
+      sizes[0]= h_ghost_count;
+      sizes[1]= h_surface_count;
+    }
 
     if (do_profile) {
       HANDLE_HIP(hipEventSynchronize(recb_evt_after_clear));
@@ -2687,6 +2852,64 @@ double calculate_GPU(_type_lattice_id *vac_idArray,  const _type_lattice_count& 
   return *sum_rates;
 }
 
+double calculate_GPU_region(int x_low, int x_high, int y_low, int y_high, int z_low, int z_high) {
+  using namespace gpuSimulate;
+  HANDLE_HIP(hipMemset(d_sum_rates, 0, sizeof(double)));
+  *sum_rates = 0;
+
+  HANDLE_HIP(hipMemset(d_vac_count_all, 0, sizeof(int)));
+  const int compact_block = 256;
+  const int vac_grid = (vac_capacity_all + compact_block - 1) / compact_block;
+  hipLaunchKernelGGL(compact_valid_keys, vac_grid, compact_block, 0, 0,
+                     V_Hash->device_ptr()->keys, vac_capacity_all, d_vac_all, d_vac_count_all);
+  CHECK_FOR_ERROR();
+  hipDeviceSynchronize();
+
+  int h_vac_all = 0;
+  HANDLE_HIP(hipMemcpy(&h_vac_all, d_vac_count_all, sizeof(int), hipMemcpyDeviceToHost));
+  if (h_vac_all <= 0) return 0.0;
+
+  HANDLE_HIP(hipMemset(d_vac_count_sector, 0, sizeof(int)));
+  const int filter_block = 256;
+  const int filter_grid = (h_vac_all + filter_block - 1) / filter_block;
+  hipLaunchKernelGGL(filter_ids_in_region, filter_grid, filter_block, 0, 0,
+                     d_vac_all, h_vac_all,
+                     x_low, x_high, y_low, y_high, z_low, z_high,
+                     d_vac_sector, d_vac_count_sector);
+  CHECK_FOR_ERROR();
+  hipDeviceSynchronize();
+
+  int h_vac_sector = 0;
+  HANDLE_HIP(hipMemcpy(&h_vac_sector, d_vac_count_sector, sizeof(int), hipMemcpyDeviceToHost));
+  if (h_vac_sector <= 0) return 0.0;
+
+  currentVacCount = h_vac_sector;
+  if (static_cast<_type_lattice_count>(h_vac_sector) > vacHostArrayCapacity) {
+    vacHostArrayCapacity = static_cast<_type_lattice_count>(h_vac_sector);
+    HANDLE_HIP(hipFree(deviceVacancyInfo));
+    HANDLE_HIP(hipFree(deviceNeighbourInfo));
+    HANDLE_HIP(hipMalloc((void**)&deviceVacancyInfo, vacHostArrayCapacity * sizeof(dev_Vacancy)));
+    HANDLE_HIP(hipMalloc((void**)&deviceNeighbourInfo, vacHostArrayCapacity * NN_TOTAL * sizeof(dev_nnLattice)));
+  }
+
+  blockSize = 128;
+  numBlocks = (h_vac_sector + blockSize - 1) / blockSize;
+  hipLaunchKernelGGL(build_nn_info_from_vac_list, numBlocks, blockSize, 0, 0,
+                     d_vac_sector, h_vac_sector, deviceVacancyInfo, deviceNeighbourInfo);
+  CHECK_FOR_ERROR();
+
+  hipLaunchKernelGGL(calcRatesGPU, numBlocks, blockSize, 0, 0,
+                     deviceVacancyInfo,
+                     deviceNeighbourInfo,
+                     d_sum_rates,
+                     h_config[0],
+                     h_config[1],
+                     h_vac_sector);
+  CHECK_FOR_ERROR();
+  HANDLE_HIP(hipMemcpy(sum_rates, d_sum_rates, sizeof(double), hipMemcpyDeviceToHost));
+  return *sum_rates;
+}
+
 void initialize_gpu(int process_rank){
   int gpu_count;
   HANDLE_HIP(hipGetDeviceCount(&gpu_count));
@@ -2740,7 +2963,7 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
   HANDLE_HIP(hipMalloc((void**)&d_sum_rates, sizeof(double)));
   HANDLE_HIP(hipMalloc((void**)&d_event, sizeof(dev_event)));
   
-  vacHostArrayCapacity = lattice_list->vac_hash.size() / 6 + 1;
+  vacHostArrayCapacity = lattice_list->vac_hash.size() + 1;
   HostAtomCapacity = lattice_list->momo_hash.size()
                       + lattice_list->more_hash.size()
                       +lattice_list->rere_hash.size();
@@ -2787,6 +3010,13 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
                                     );
   // printf("init gpu_info msg end\n");
   HANDLE_HIP(hipMemcpy(d_Pair_Atoms, Pair_Atoms,pair_atoms.size()*sizeof(long int), hipMemcpyHostToDevice));
+
+  vac_capacity_all = V_Hash->capacity();
+  vac_capacity_sector = vac_capacity_all;
+  HANDLE_HIP(hipMalloc((void**)&d_vac_all, vac_capacity_all * sizeof(long int)));
+  HANDLE_HIP(hipMalloc((void**)&d_vac_sector, vac_capacity_sector * sizeof(long int)));
+  HANDLE_HIP(hipMalloc((void**)&d_vac_count_all, sizeof(int)));
+  HANDLE_HIP(hipMalloc((void**)&d_vac_count_sector, sizeof(int)));
 
   int ghost_size = (meta.regions[1] + meta.ghost_x - meta.regions[0])*(meta.regions[3] + meta.ghost_y - meta.regions[2]) * (meta.regions[5] + meta.ghost_z - meta.regions[4])
                     - (meta.regions[1] - meta.regions[0])*(meta.regions[3] - meta.regions[2]) * (meta.regions[5] - meta.regions[4])
@@ -2885,6 +3115,10 @@ void gpu_final(){
 
   HANDLE_HIP(hipFree(deviceVacancyInfo));
   HANDLE_HIP(hipFree(deviceNeighbourInfo));
+  HANDLE_HIP(hipFree(d_vac_all));
+  HANDLE_HIP(hipFree(d_vac_sector));
+  HANDLE_HIP(hipFree(d_vac_count_all));
+  HANDLE_HIP(hipFree(d_vac_count_sector));
 
   hipHostFree(h_event);
   hipHostFree(sum_rates);

@@ -121,6 +121,7 @@ public:
 
     // 返回设备端指针
     GPUHashSet* device_ptr() { return d_table; }
+    int capacity() const { return h_table.capacity; }
     
 };
 

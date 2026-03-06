@@ -82,7 +82,11 @@ int ABVIModel::initGPUHashSet(const comm::Region<comm::_type_lattice_size> regio
   //暂时没用到
   return 1;
 }
-_type_rate ABVIModel::calcRatesGPU(const comm::Region<comm::_type_lattice_size> region, int sect) {
+_type_rate ABVIModel::calcRatesGPU(const comm::Region<comm::_type_lattice_size> region, int sect) {  if (gpu_comm_enabled()) {
+    return calculate_GPU_region(BCC_DBX * region.x_low, BCC_DBX * region.x_high,
+                                region.y_low, region.y_high,
+                                region.z_low, region.z_high);
+  }
   _type_lattice_id *vac_idArray;
   vac_idArray = (_type_lattice_id *)malloc(box->lattice_list->vac_hash.size() * sizeof(_type_lattice_id));
   _type_lattice_count vac_count = 0;
@@ -265,6 +269,14 @@ void ABVIModel::recb_solver(std::vector<_type_lattice_id>id, const lat_region& r
     // HIPHashSet *Busy_Set;
     // long int *h_ghost_Hash;
     // long int *h_surface_Hash;
+    if (gpu_comm_enabled()) {
+      long int *h_ghost = nullptr;
+      long int *h_surface = nullptr;
+      long int *h_ghost_type = nullptr;
+      long int *h_surface_type = nullptr;
+      recb_solver_GPU(sector_id, 0, h_ghost, h_surface, h_ghost_type, h_surface_type, nullptr);
+      return;
+    }
     long int arr_size = box->lattice_list->more_hash.size() + box->lattice_list->momo_hash.size();
     int sizes[2];
     recb_solver_GPU(
