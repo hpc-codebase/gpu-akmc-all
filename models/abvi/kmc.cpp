@@ -83,6 +83,7 @@ int ABVIModel::initGPUHashSet(const comm::Region<comm::_type_lattice_size> regio
   return 1;
 }
 _type_rate ABVIModel::calcRatesGPU(const comm::Region<comm::_type_lattice_size> region, int sect) {  if (gpu_comm_enabled()) {
+    int BCC_DBX = 2;
     return calculate_GPU_region(BCC_DBX * region.x_low, BCC_DBX * region.x_high,
                                 region.y_low, region.y_high,
                                 region.z_low, region.z_high);

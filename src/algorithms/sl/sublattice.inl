@@ -46,6 +46,9 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
   MPI_Barrier(SimulationDomain::comm_sim_pro.comm);
   gpu_comm_init(SimulationDomain::comm_sim_pro.comm);
   gpu_comm_sanity_allreduce(SimulationDomain::comm_sim_pro.comm);
+  if (gpu_comm_enabled()) {
+    commSetGhostRegions(&p_model->ghost_region[0], 56);
+  }
   // 扇区的执行顺序是 0, 7, 2, 5, 3, 4, 1, 6
   time_total_start = MPI_Wtime();
   for (int64_t step = 1; step < time_steps; step++) { // time steps loop

@@ -158,6 +158,9 @@ namespace gpuSimulate {
 
 }
 __device__ _type_lattice_id getId(_type_lattice_size x,_type_lattice_size y,_type_lattice_size z);
+__device__ int isGhostLat(_type_lattice_id lid);
+__device__ int isSurfaceLat(_type_lattice_id lid);
+static __device__ __forceinline__ GPUHashSet* commBucketPtr(int idx);
 
 __device__ void printHashTableKernel(GPUHashSet* table, int max_entries, bool verbose) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {  // 仅由第一个线程执行
@@ -2617,11 +2620,11 @@ __global__ void build_nn_info_from_vac_list(const long int* __restrict__ vac_ids
   int base = i * NN_TOTAL;
   for (int j = 0; j < 8; j++) {
     out_nn[base + j].id = static_cast<int>(nn1[j].id);
-    out_nn[base + j].type = nn1[j].type;
+    out_nn[base + j].type._type = nn1[j].type;
   }
   for (int j = 0; j < 6; j++) {
     out_nn[base + 8 + j].id = static_cast<int>(nn2[j].id);
-    out_nn[base + 8 + j].type = nn2[j].type;
+    out_nn[base + 8 + j].type._type = nn2[j].type;
   }
 
   for (int b = 0; b < 8; b++) {
@@ -2638,13 +2641,13 @@ __global__ void build_nn_info_from_vac_list(const long int* __restrict__ vac_ids
     int off1 = base + 14 + b * 8;
     for (int j = 0; j < 8; j++) {
       out_nn[off1 + j].id = static_cast<int>(t1[j].id);
-      out_nn[off1 + j].type = t1[j].type;
+      out_nn[off1 + j].type._type = t1[j].type;
     }
 
     int off2 = base + 78 + b * 6;
     for (int j = 0; j < 6; j++) {
       out_nn[off2 + j].id = static_cast<int>(t2[j].id);
-      out_nn[off2 + j].type = t2[j].type;
+      out_nn[off2 + j].type._type = t2[j].type;
     }
   }
 }
