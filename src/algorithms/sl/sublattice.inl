@@ -24,6 +24,7 @@
 
 template <class PKg, class PKs, class Ins, typename E>
 void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks *p_event_hooks) {
+  std::cout<<"start time loop"<<std::endl;
   const int64_t time_steps = ceil(time_limit / T); // T 是写死的3e-7，time_limit是config.yaml文件中的physics_time
   double time_total_start, time_total_end;
   double time_start, time_end;
