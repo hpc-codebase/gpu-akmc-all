@@ -11,6 +11,7 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <cstdint>
 
 static bool env_enabled(const char* name) {
   const char* v = std::getenv(name);
@@ -29,9 +30,32 @@ static ncclComm_t g_comm{};
 static hipStream_t g_stream{};
 static bool g_inited = false;
 static GpuCommBuffer g_default_buf{};
+static GpuCommProfileStats g_profile_stats{};
+static bool g_profile_cached = false;
+static bool g_profile_enabled = false;
+
+static bool profile_enabled() {
+  if (g_profile_cached) return g_profile_enabled;
+  const char* v = std::getenv("KMC_RECB_PROFILE");
+  g_profile_enabled = (v != nullptr && v[0] != '\0' && v[0] != '0');
+  g_profile_cached = true;
+  return g_profile_enabled;
+}
 
 bool gpu_comm_enabled() {
   return env_enabled("KMC_GPU_COMM");
+}
+
+bool gpu_comm_profile_enabled() {
+  return profile_enabled();
+}
+
+GpuCommProfileStats gpu_comm_profile_get_stats() {
+  return g_profile_stats;
+}
+
+void gpu_comm_profile_reset() {
+  g_profile_stats = GpuCommProfileStats{};
 }
 
 void gpu_comm_init(MPI_Comm comm) {
@@ -113,6 +137,10 @@ void gpu_comm_send_recv(GpuCommBuffer& buf,
   if (!gpu_comm_enabled()) return;
   if (!g_inited) gpu_comm_init(comm);
 
+  const bool do_profile = profile_enabled();
+  double t0 = 0.0;
+  if (do_profile) t0 = MPI_Wtime();
+
   size_t send_bytes = send_count * type_size;
   size_t recv_bytes = recv_count * type_size;
 
@@ -166,6 +194,14 @@ void gpu_comm_send_recv(GpuCommBuffer& buf,
     std::cerr << "HIP stream sync failed: " << hipGetErrorString(err) << std::endl;
     std::abort();
   }
+
+  if (do_profile) {
+    double t1 = MPI_Wtime();
+    g_profile_stats.bytes_send += static_cast<unsigned long long>(send_bytes);
+    g_profile_stats.bytes_recv += static_cast<unsigned long long>(recv_bytes);
+    g_profile_stats.calls += 1;
+    g_profile_stats.time_sec += (t1 - t0);
+  }
 }
 
 void gpu_comm_send_recv_default(const void* send_host, size_t send_count,
@@ -187,6 +223,10 @@ void gpu_comm_send_recv_device(GpuCommBuffer& buf,
                                MPI_Comm comm) {
   if (!gpu_comm_enabled()) return;
   if (!g_inited) gpu_comm_init(comm);
+
+  const bool do_profile = profile_enabled();
+  double t0 = 0.0;
+  if (do_profile) t0 = MPI_Wtime();
 
   if (recv_bytes > buf.recv_cap) {
     if (buf.d_recv) hipFree(buf.d_recv);
@@ -227,6 +267,14 @@ void gpu_comm_send_recv_device(GpuCommBuffer& buf,
   if (err != hipSuccess) {
     std::cerr << "HIP stream sync failed: " << hipGetErrorString(err) << std::endl;
     std::abort();
+  }
+
+  if (do_profile) {
+    double t1 = MPI_Wtime();
+    g_profile_stats.bytes_send += static_cast<unsigned long long>(send_bytes);
+    g_profile_stats.bytes_recv += static_cast<unsigned long long>(recv_bytes);
+    g_profile_stats.calls += 1;
+    g_profile_stats.time_sec += (t1 - t0);
   }
 }
 

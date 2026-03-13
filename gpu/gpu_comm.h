@@ -43,3 +43,14 @@ void gpu_comm_send_recv_device_default(const void* send_dev, size_t send_bytes,
                                        void* recv_dev, size_t recv_bytes,
                                        int peer_send, int peer_recv,
                                        MPI_Comm comm);
+
+struct GpuCommProfileStats {
+    unsigned long long bytes_send = 0;
+    unsigned long long bytes_recv = 0;
+    unsigned long long calls = 0;
+    double time_sec = 0.0;
+};
+
+bool gpu_comm_profile_enabled();
+GpuCommProfileStats gpu_comm_profile_get_stats();
+void gpu_comm_profile_reset();

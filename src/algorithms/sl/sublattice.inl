@@ -47,13 +47,16 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
   MPI_Barrier(SimulationDomain::comm_sim_pro.comm);
   gpu_comm_init(SimulationDomain::comm_sim_pro.comm);
   gpu_comm_sanity_allreduce(SimulationDomain::comm_sim_pro.comm);
+  if (gpu_comm_profile_enabled()) {
+    gpu_comm_profile_reset();
+  }
   if (gpu_comm_enabled()) {
     commSetGhostRegions(&p_model->ghost_region[0], 56);
   }
   // 扇区的执行顺序是 0, 7, 2, 5, 3, 4, 1, 6
   time_total_start = MPI_Wtime();
-  for (int64_t step = 1; step < time_steps; step++) { // time steps loop
-    
+  // for (int64_t step = 1; step < time_steps; step++) { // time steps loop
+  for (int64_t step = 1; step < 2; step++) {
   //if (step % 100 == 0) kiwi::logs::v(" ", " step is : {} .\n", step);
     for (int sect = 0; sect < SECTORS_NUM; sect++) {      // sector loop SECTORS_NUM = 8 依据同步子域算法，在每个进程的区域内再进行子域的划分(一个8个子域)
       const double step_threshold_time = static_cast<double>(step + 1) * T - sec_meta.sector_itl->evolution_time; 
@@ -162,6 +165,38 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
 
   MPI_Reduce(&time_commu_total, &local_to_total, 1, MPI_DOUBLE, MPI_SUM, 0, SimulationDomain::comm_sim_pro.comm);
   if(SimulationDomain::comm_sim_pro.own_rank == 0) kiwi::logs::v(" ", " communicate time is : {} s. \n", local_to_total / SimulationDomain::comm_sim_pro.all_ranks);
+
+  if (gpu_comm_profile_enabled()) {
+    const GpuCommProfileStats stats = gpu_comm_profile_get_stats();
+    unsigned long long bytes_send_sum = 0;
+    unsigned long long bytes_recv_sum = 0;
+    unsigned long long calls_sum = 0;
+    double comm_time_sum = 0.0;
+    MPI_Reduce(&stats.bytes_send, &bytes_send_sum, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, SimulationDomain::comm_sim_pro.comm);
+    MPI_Reduce(&stats.bytes_recv, &bytes_recv_sum, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, SimulationDomain::comm_sim_pro.comm);
+    MPI_Reduce(&stats.calls, &calls_sum, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, SimulationDomain::comm_sim_pro.comm);
+    MPI_Reduce(&stats.time_sec, &comm_time_sum, 1, MPI_DOUBLE, MPI_SUM, 0, SimulationDomain::comm_sim_pro.comm);
+
+    const double comm_ratio = (time_total_end > 0.0) ? (time_commu_total / time_total_end) : 0.0;
+    double comm_ratio_sum = 0.0;
+    MPI_Reduce(&comm_ratio, &comm_ratio_sum, 1, MPI_DOUBLE, MPI_SUM, 0, SimulationDomain::comm_sim_pro.comm);
+
+    if (SimulationDomain::comm_sim_pro.own_rank == 0) {
+      const unsigned long long bytes_total = bytes_send_sum + bytes_recv_sum;
+      const double bw = (comm_time_sum > 0.0) ? (static_cast<double>(bytes_total) / comm_time_sum) : 0.0;
+      const double avg_comm_ratio = comm_ratio_sum / SimulationDomain::comm_sim_pro.all_ranks;
+      const double avg_eff = 1.0 - avg_comm_ratio;
+      std::cout
+          << "[KMC_RECB_PROFILE] GPU_COMM bytes_send=" << bytes_send_sum
+          << " bytes_recv=" << bytes_recv_sum
+          << " calls=" << calls_sum
+          << " time_s=" << comm_time_sum
+          << " bandwidth_Bps=" << bw
+          << " avg_comm_ratio=" << avg_comm_ratio
+          << " avg_parallel_eff=" << avg_eff
+          << std::endl;
+    }
+  }
 }
 
 template <typename E> int SubLattice::initGPUHashSetWrapper(ModelAdapter<E> *p_model, const type_sector_id sector_id, int sect){

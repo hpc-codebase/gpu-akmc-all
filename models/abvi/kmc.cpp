@@ -278,6 +278,8 @@ void ABVIModel::recb_solver(std::vector<_type_lattice_id>id, const lat_region& r
       recb_solver_GPU(sector_id, 0, h_ghost, h_surface, h_ghost_type, h_surface_type, nullptr);
       return;
     }
+
+    
     long int arr_size = box->lattice_list->more_hash.size() + box->lattice_list->momo_hash.size();
     int sizes[2];
     recb_solver_GPU(
