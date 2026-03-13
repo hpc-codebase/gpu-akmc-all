@@ -2,6 +2,7 @@ vendor
 pkg.dep.cmake
 coverage
 
+build/
 # General for mac
 .DS_Store
 .AppleDouble
