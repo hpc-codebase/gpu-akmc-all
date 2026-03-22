@@ -14,6 +14,33 @@
 #define NN_TOTAL 126
 #define RE_SCALE_SIZE 1.2
 #define STREAM_SIZE 4
+#define BUCKET_SIZE 64
+
+// 定义一个可以在 Device 端使用的哈希函数对象 (Functor)
+struct DeviceHasher {
+    unsigned int m_seed;
+
+    __host__ __device__ DeviceHasher() : m_seed(0) {}
+    __host__ __device__ DeviceHasher(unsigned int seed) : m_seed(seed) {}
+
+    __host__ __device__ __forceinline__ unsigned int operator()(long int k) const {
+        unsigned long long int h = (unsigned long long int)k;
+        h ^= m_seed;
+        
+        // 64 位的雪崩混合运算
+        h ^= h >> 33;
+        h *= 0xff51afd7ed558ccdULL;
+        h ^= h >> 33;
+        h *= 0xc4ceb9fe1a85ec53ULL;
+        h ^= h >> 33;
+        
+        // 最终转回 32 位用于数组取模
+        return (unsigned int)h;
+    }
+};
+__device__ __forceinline__ long int atomic_load_relaxed(const long int* addr) {
+    return *reinterpret_cast<volatile const long int*>(addr);
+}
 
 struct dev_Vacancy {
     // LatticeTypes type;
@@ -102,6 +129,8 @@ struct GPUHashSet {
     int capacity;  // 哈希表总容量
     long int empty_flag;  // 空槽标记值
     long int tombstone_flag;  // 删除标记值
+    unsigned int num_buckets;//桶的数量
+    DeviceHasher hasher;    // 哈希函数对象
 };
 
 class HIPHashSet {
@@ -121,7 +150,8 @@ public:
 
     // 返回设备端指针
     GPUHashSet* device_ptr() { return d_table; }
-    int capacity() const { return h_table.capacity; }
+    unsigned int get_num_buckets() const { return h_table.num_buckets; }
+    int get_capacity() const { return h_table.capacity; }
     
 };
 

@@ -3,6 +3,8 @@
 
 #include "hip/hip_runtime.h"
 #include <hip/hip_runtime.h>
+#include <hip/hip_cooperative_groups.h>
+
 #include "gpuError.h"
 #include "gpu_comm.h"
 #include "DeviceVacRatesSolver.h"
@@ -102,6 +104,16 @@ void commInsertGhostId(int sector_id, long int id);
 void commInsertSurfaceId(long int id);
 
 void commForwardFromRecvPayload(const ChangeLattice_GPU *d_payload, int n, int sector_id);
+// 线程事务状态机结构体
+struct AtomTx {
+    _type_lattice_id src_id;   // 原原子ID
+    _type_lattice_id dst_id;   // 目标位置ID
+    bool active;               // 是否仍在活跃（活没干完）
+    // bool locked_src;           // 是否成功锁住自己
+    // bool locked_dst;           // 是否成功锁住目标
+    bool success;              // 本轮物理交换是否成功
+    int op_type;               // 反应类型：1-移动，2-身份转换...
+};
 // __global__ void calcExchangePairs(dev_meta meta,long int *Pair_Atoms,
 //                             HIPHashSet *MoRe_Hash,HIPHashSet *MoMo_Hash,
 //                             HIPHashSet *Re_Hash,HIPHashSet *V_Hash,

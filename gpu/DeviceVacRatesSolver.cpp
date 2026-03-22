@@ -16,17 +16,44 @@ HIPHashSet::HIPHashSet(const std::unordered_set<long int>& cpu_set) {
     h_table.empty_flag = INIT_FLAG;
     h_table.tombstone_flag = TOMBSTONE;
 
+    auto remainder = h_table.capacity % BUCKET_SIZE;
+    if (remainder) {
+        h_table.capacity += (BUCKET_SIZE - remainder);
+    }
+    h_table.num_buckets = h_table.capacity / BUCKET_SIZE;
+    // 初始化哈希函数,使用固定种子 2
+    h_table.hasher = DeviceHasher(2);
+
     // **分配主机端数组，并初始化**
     long int* h_keys = new long int[h_table.capacity];
-    memset(h_keys, INIT_FLAG, h_table.capacity * sizeof(long int));
+    memset(h_keys, INIT_FLAG, h_table.capacity * sizeof(long int));// INIT_FLAG=-1, 但C++ 中，对于非 0 和非 -1 的数组初始化，应使用 std::fill_n
 
     // **填充哈希表**
     for (const auto& key : cpu_set) {
-        int index = key % h_table.capacity;
-        while (h_keys[index] != INIT_FLAG && h_keys[index] != TOMBSTONE) {
-            index = (index + 1) % h_table.capacity;
+        unsigned int buck_num = h_table.hasher(key) % h_table.num_buckets;
+        int loop_count = 0;
+        bool inserted = false;
+
+        while (loop_count <= h_table.num_buckets) {
+            int base_index = buck_num * BUCKET_SIZE;    
+            
+            // 在当前桶内的 64 个槽位中找空位
+            for(int i = 0; i < BUCKET_SIZE; i++) {
+                if(h_keys[base_index + i] == INIT_FLAG || h_keys[base_index + i] == TOMBSTONE) {
+                    h_keys[base_index + i] = key;
+                    inserted = true;
+                    break;
+                }
+            }
+            if (inserted) break; // 插入成功，处理下一个 key
+
+            // 桶满了，线性探测下一个桶
+            buck_num = (buck_num + 1) % h_table.num_buckets;
+            loop_count++;
         }
-        h_keys[index] = key;
+        if (!inserted) {
+            std::cerr << "Fatal Error: CPU Hash Table is fully saturated!" << std::endl;
+        }
     }
 
     // **分配设备端 keys 数组**
@@ -69,17 +96,44 @@ HIPHashSet::HIPHashSet(const std::unordered_set<long int>& cpu_set,int size){
     h_table.empty_flag = INIT_FLAG;
     h_table.tombstone_flag = TOMBSTONE;
 
+    auto remainder = h_table.capacity % BUCKET_SIZE;
+    if (remainder) {
+        h_table.capacity += (BUCKET_SIZE - remainder);
+    }
+    h_table.num_buckets = h_table.capacity / BUCKET_SIZE;
+
     // **分配主机端数组，并初始化**
     long int* h_keys = new long int[h_table.capacity];
     memset(h_keys, INIT_FLAG, h_table.capacity * sizeof(long int));
 
-    // **填充哈希表**
+    // 初始化哈希函数，使用固定种子 2
+    h_table.hasher = DeviceHasher(2);
+
     for (const auto& key : cpu_set) {
-        int index = key % h_table.capacity;
-        while (h_keys[index] != INIT_FLAG && h_keys[index] != TOMBSTONE) {
-            index = (index + 1) % h_table.capacity;
+        unsigned int buck_num = h_table.hasher(key) % h_table.num_buckets;
+        int loop_count = 0;
+        bool inserted = false;
+
+        while (loop_count <= h_table.num_buckets) {
+            int base_index = buck_num * BUCKET_SIZE;    
+            
+            // 在当前桶内的 64 个槽位中找空位
+            for(int i = 0; i < BUCKET_SIZE; i++) {
+                if(h_keys[base_index + i] == INIT_FLAG || h_keys[base_index + i] == TOMBSTONE) {
+                    h_keys[base_index + i] = key;
+                    inserted = true;
+                    break;
+                }
+            }
+            if (inserted) break; // 插入成功，处理下一个 key
+
+            // 桶满了，线性探测下一个桶
+            buck_num = (buck_num + 1) % h_table.num_buckets;
+            loop_count++;
         }
-        h_keys[index] = key;
+        if (!inserted) {
+            std::cerr << "Fatal Error: CPU Hash Table is fully saturated!" << std::endl;
+        }
     }
 
     // **分配设备端 keys 数组**
@@ -121,6 +175,14 @@ HIPHashSet::HIPHashSet(int size) {
   h_table.capacity = size * 2;
   h_table.empty_flag = INIT_FLAG;
   h_table.tombstone_flag = TOMBSTONE;
+
+  auto remainder = h_table.capacity % BUCKET_SIZE;
+  if (remainder) {
+    h_table.capacity += (BUCKET_SIZE - remainder);
+  }
+  h_table.num_buckets = h_table.capacity / BUCKET_SIZE;
+
+  h_table.hasher = DeviceHasher(2); // 使用固定种子 2
 
   // 分配主机端 keys 数组，并初始化为 INIT_FLAG
   long int* h_keys = new long int[h_table.capacity];
