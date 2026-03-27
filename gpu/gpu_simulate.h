@@ -109,8 +109,6 @@ struct AtomTx {
     _type_lattice_id src_id;   // 原原子ID
     _type_lattice_id dst_id;   // 目标位置ID
     bool active;               // 是否仍在活跃（活没干完）
-    // bool locked_src;           // 是否成功锁住自己
-    // bool locked_dst;           // 是否成功锁住目标
     bool success;              // 本轮物理交换是否成功
     int op_type;               // 反应类型：1-移动，2-身份转换...
 };
