@@ -53,10 +53,12 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
   if (gpu_comm_enabled()) {
     commSetGhostRegions(&p_model->ghost_region[0], 56);
   }
+  MPI_Barrier(SimulationDomain::comm_sim_pro.comm);
   // 扇区的执行顺序是 0, 7, 2, 5, 3, 4, 1, 6
   time_total_start = MPI_Wtime();
+  const int64_t TEST_STEPS = 100;
   // for (int64_t step = 1; step < time_steps; step++) { // time steps loop
-  for (int64_t step = 1; step <100; step++) {
+  for (int64_t step = 1; step <=TEST_STEPS; step++) {
   //if (step % 100 == 0) kiwi::logs::v(" ", " step is : {} .\n", step);
     for (int sect = 0; sect < SECTORS_NUM; sect++) {      // sector loop SECTORS_NUM = 8 依据同步子域算法，在每个进程的区域内再进行子域的划分(一个8个子域)
       const double step_threshold_time = static_cast<double>(step + 1) * T - sec_meta.sector_itl->evolution_time; 
@@ -67,7 +69,7 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
         commClearGhostBuckets();
         commClearSurfaceSector((*sec_meta.sector_itl).id);
       }
-      // if(SimulationDomain::comm_sim_pro.own_rank == 0) kiwi::logs::v(" ", " step is : {} sect is : {} starting !!!.\n", step, sect);
+      if(SimulationDomain::comm_sim_pro.own_rank == 0) kiwi::logs::v(" ", " step is : {} sect is : {} starting !!!.\n", step, sect);
 
       for(int ir = 0; ir < 1; ir++) {
         //TODO:对这个地方的代码GPU化
@@ -136,6 +138,7 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
     // std::exit(1);
 
   }
+  MPI_Barrier(SimulationDomain::comm_sim_pro.comm);
   time_total_end = MPI_Wtime() - time_total_start;
 
   p_event_hooks->onAllDone(); //空的函数
@@ -151,6 +154,11 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
 
   MPI_Reduce(&time_total_end, &local_to_total, 1, MPI_DOUBLE, MPI_MAX, 0, SimulationDomain::comm_sim_pro.comm);
   if(SimulationDomain::comm_sim_pro.own_rank == 0) kiwi::logs::v(" ", " total time is : {} s. \n", local_to_total);
+
+   if(SimulationDomain::comm_sim_pro.own_rank == 0) {
+      kiwi::logs::v(" ", " >>> [Benchmark] Total Time for {} steps is : {} s. \n", TEST_STEPS, local_to_total);
+      kiwi::logs::v(" ", " >>> [Benchmark] Average Time per Step is : {} s. \n", local_to_total / TEST_STEPS);
+  }
   //  MPI_Reduce(&time_vac_calculate_total, &local_to_total, 1, MPI_DOUBLE, MPI_SUM, 0, SimulationDomain::comm_sim_pro.comm);
   // if(SimulationDomain::comm_sim_pro.own_rank == 0) kiwi::logs::v(" ", " vac_calculate time is : {} s. \n", local_to_total / SimulationDomain::comm_sim_pro.all_ranks);
 

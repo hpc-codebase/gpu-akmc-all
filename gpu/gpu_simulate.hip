@@ -2525,13 +2525,13 @@ __device__ __noinline__ void perform_batch_update_tiled(AtomTx& tx, TileType til
     bool is_type1 = (tx.op_type == 1);
   if (tile.any(is_type1)) {
       // Step 1: 尝试插入 Dst (必须是空位)
-      int ins_res = tiled_insert_op(g_MoMo_Hash, tx.dst_id, tile, is_type1,3);
+      int ins_res = tiled_insert_op(g_MoMo_Hash, tx.dst_id, tile, is_type1,16);
       bool dst_inserted = (is_type1 && ins_res == 1);
 
       // Step 2: 只有插入成功，才移除 Src
       int rem_res = 0;
       if (tile.any(dst_inserted)) {
-          rem_res = tiled_remove_op(g_MoMo_Hash, tx.src_id, tile, dst_inserted,3);
+          rem_res = tiled_remove_op(g_MoMo_Hash, tx.src_id, tile, dst_inserted,16);
       }
       bool src_removed = (dst_inserted && rem_res == 1);
 
@@ -2539,7 +2539,7 @@ __device__ __noinline__ void perform_batch_update_tiled(AtomTx& tx, TileType til
       // 必须回滚 Dst (删除刚刚插入的)
       bool need_rollback = (dst_inserted && !src_removed);
       if (tile.any(need_rollback)) {
-        tiled_remove_op(g_MoMo_Hash, tx.dst_id, tile, need_rollback,3);
+        tiled_remove_op(g_MoMo_Hash, tx.dst_id, tile, need_rollback,16);
       }
 
       // 只有两步都成功才算成功
@@ -2555,15 +2555,15 @@ __device__ __noinline__ void perform_batch_update_tiled(AtomTx& tx, TileType til
   bool is_type2 = (tx.op_type == 2);
   if (tile.any(is_type2)) {
       // Step 1: 尝试插入 MoRe (Dst) - 这是最关键的一步，如果满/冲突则直接放弃
-      int ins_more_res = tiled_insert_op(g_MoRe_Hash, tx.dst_id, tile, is_type2,3);
+      int ins_more_res = tiled_insert_op(g_MoRe_Hash, tx.dst_id, tile, is_type2,16);
       bool more_inserted = (is_type2 && ins_more_res == 1);
 
       // Step 2: 只有插入成功，才去销毁旧原料 (Re 和 MoMo)
       int rem_re_res = 0;
       int rem_momo_res = 0;
       if (tile.any(more_inserted)) {
-          rem_re_res = tiled_remove_op(g_Re_Hash, tx.dst_id, tile, more_inserted,3);
-          rem_momo_res = tiled_remove_op(g_MoMo_Hash, tx.src_id, tile, more_inserted,3);
+          rem_re_res = tiled_remove_op(g_Re_Hash, tx.dst_id, tile, more_inserted,16);
+          rem_momo_res = tiled_remove_op(g_MoMo_Hash, tx.src_id, tile, more_inserted,16);
       }
       bool re_removed = (more_inserted && rem_re_res == 1);
       bool momo_removed = (more_inserted && rem_momo_res == 1);
@@ -2578,7 +2578,7 @@ __device__ __noinline__ void perform_batch_update_tiled(AtomTx& tx, TileType til
          // 撤销 MoRe
         bool need_revert_more = more_inserted && !(re_removed && momo_removed);
         if (tile.any(need_revert_more)) {
-            int res1 = tiled_remove_op(g_MoRe_Hash, tx.dst_id, tile, need_revert_more,3);
+            int res1 = tiled_remove_op(g_MoRe_Hash, tx.dst_id, tile, need_revert_more,16);
             // 如果撤销插入失败，会导致原子变多 (Duplicate)
             // if (need_revert_more && res1 != 1) {
             //     printf("[DUPLICATE] Type2 Revert MoRe failed at dst_id %ld! (res=%d)\n", tx.dst_id, res1);
@@ -2588,7 +2588,7 @@ __device__ __noinline__ void perform_batch_update_tiled(AtomTx& tx, TileType til
         // 撤销误删的 Re
         bool need_restore_re = more_inserted && re_removed && !momo_removed;
         if (tile.any(need_restore_re)) {
-            int res2 = tiled_insert_op(g_Re_Hash, tx.dst_id, tile, need_restore_re,3);
+            int res2 = tiled_insert_op(g_Re_Hash, tx.dst_id, tile, need_restore_re,16);
             // if (need_restore_re && res2 != 1) {
             //     printf("[FATAL LEAK] Type2 Restore Re failed at dst_id %ld! Re LOST! (res=%d)\n", tx.dst_id, res2);
             // }
@@ -2597,8 +2597,7 @@ __device__ __noinline__ void perform_batch_update_tiled(AtomTx& tx, TileType til
         // 撤销误删的 MoMo (这是最容易导致丢失的地方！)
         bool need_restore_momo = more_inserted && !re_removed && momo_removed;
         if (tile.any(need_restore_momo)) {
-            int res3 = tiled_insert_op(g_MoMo_Hash, tx.src_id, tile, need_restore_momo,3);
-            // 抓到了！插不回去了！
+            int res3 = tiled_insert_op(g_MoMo_Hash, tx.src_id, tile, need_restore_momo,16);
             // if (need_restore_momo && res3 != 1) {
             //     printf("[FATAL LEAK] Type2 Restore MoMo failed at src_id %ld! MoMo LOST! (res=%d). Slot stolen by another thread?\n", tx.src_id, res3);
             // }
@@ -2612,20 +2611,20 @@ __device__ __noinline__ void perform_batch_update_tiled(AtomTx& tx, TileType til
   bool is_type3 = (tx.op_type == 3);
   if (tile.any(is_type3)) {
       // Step 1: Insert Dst
-      int ins_res = tiled_insert_op(g_MoRe_Hash, tx.dst_id, tile, is_type3,3);
+      int ins_res = tiled_insert_op(g_MoRe_Hash, tx.dst_id, tile, is_type3,16);
       bool dst_inserted = (is_type3 && ins_res == 1);
       
       // Step 2: Remove Src
       int rem_res = 0;
       if (tile.any(dst_inserted)) {
-          rem_res = tiled_remove_op(g_MoRe_Hash, tx.src_id, tile, dst_inserted,3);
+          rem_res = tiled_remove_op(g_MoRe_Hash, tx.src_id, tile, dst_inserted,16);
       }
       bool src_removed = (dst_inserted && rem_res == 1);
 
       // Step 3: Rollback Dst if needed
       bool need_rollback = (dst_inserted && !src_removed);
       if (tile.any(need_rollback)) {
-          tiled_remove_op(g_MoRe_Hash, tx.dst_id, tile, need_rollback,3);
+          tiled_remove_op(g_MoRe_Hash, tx.dst_id, tile, need_rollback,16);
       }
 
       // if (src_removed) tx.success = true;
@@ -2641,8 +2640,8 @@ __device__ __noinline__ void perform_batch_update_tiled(AtomTx& tx, TileType til
   bool is_type4 = (tx.op_type == 4);
   if (tile.any(is_type4)) {
       // Step 1: 尝试插入所有新身份 (Re at Src, MoRe at Dst)
-      int ins_re_res = tiled_insert_op(g_Re_Hash, tx.src_id, tile, is_type4,3);
-      int ins_more_res = tiled_insert_op(g_MoRe_Hash, tx.dst_id, tile, is_type4,3);
+      int ins_re_res = tiled_insert_op(g_Re_Hash, tx.src_id, tile, is_type4,16);
+      int ins_more_res = tiled_insert_op(g_MoRe_Hash, tx.dst_id, tile, is_type4,16);
       
       bool re_inserted = (is_type4 && ins_re_res == 1);
       bool more_inserted = (is_type4 && ins_more_res == 1);
@@ -2652,8 +2651,8 @@ __device__ __noinline__ void perform_batch_update_tiled(AtomTx& tx, TileType til
       int rem_more_res = 0;
       int rem_re_res = 0;
       if (tile.any(both_inserted)) {
-          rem_more_res = tiled_remove_op(g_MoRe_Hash, tx.src_id, tile, both_inserted,3);
-          rem_re_res = tiled_remove_op(g_Re_Hash, tx.dst_id, tile, both_inserted,3);
+          rem_more_res = tiled_remove_op(g_MoRe_Hash, tx.src_id, tile, both_inserted,16);
+          rem_re_res = tiled_remove_op(g_Re_Hash, tx.dst_id, tile, both_inserted,16);
       }
       bool more_removed = (both_inserted && rem_more_res == 1);
       bool re_removed = (both_inserted && rem_re_res == 1);
@@ -2668,23 +2667,23 @@ __device__ __noinline__ void perform_batch_update_tiled(AtomTx& tx, TileType til
         // A. 插入失败的回滚
             bool fail_ins_re = (re_inserted && !more_inserted);
             if (tile.any(fail_ins_re)) {
-                tiled_remove_op(g_Re_Hash, tx.src_id, tile, fail_ins_re,3);
+                tiled_remove_op(g_Re_Hash, tx.src_id, tile, fail_ins_re,16);
             }
             bool fail_ins_more = (!re_inserted && more_inserted);
             if (tile.any(fail_ins_more)) {
-                tiled_remove_op(g_MoRe_Hash, tx.dst_id, tile, fail_ins_more,3);
+                tiled_remove_op(g_MoRe_Hash, tx.dst_id, tile, fail_ins_more,16);
             }
             
             // B. 删除失败的回滚 (全部回滚)
             bool fail_rem_both = both_inserted && !(more_removed && re_removed);
             if (tile.any(fail_rem_both)) {
-                tiled_remove_op(g_Re_Hash, tx.src_id, tile, fail_rem_both,3);
-                tiled_remove_op(g_MoRe_Hash, tx.dst_id, tile, fail_rem_both,3);
+                tiled_remove_op(g_Re_Hash, tx.src_id, tile, fail_rem_both,16);
+                tiled_remove_op(g_MoRe_Hash, tx.dst_id, tile, fail_rem_both,16);
             }
             // 恢复误删的 MoRe
         bool need_restore_more = both_inserted && more_removed && !re_removed;
         if (tile.any(need_restore_more)) {
-            int res4 = tiled_insert_op(g_MoRe_Hash, tx.src_id, tile, need_restore_more,3);
+            int res4 = tiled_insert_op(g_MoRe_Hash, tx.src_id, tile, need_restore_more,16);
             // if (need_restore_more && res4 != 1) {
             //     printf("[FATAL LEAK] Type4 Restore MoRe failed at src_id %ld! MoRe LOST! (res=%d)\n", tx.src_id, res4);
             // }
@@ -2693,7 +2692,7 @@ __device__ __noinline__ void perform_batch_update_tiled(AtomTx& tx, TileType til
         // 恢复误删的 Re
         bool need_restore_re4 = both_inserted && !more_removed && re_removed;
         if (tile.any(need_restore_re4)) {
-            int res5 = tiled_insert_op(g_Re_Hash, tx.dst_id, tile, need_restore_re4,3);
+            int res5 = tiled_insert_op(g_Re_Hash, tx.dst_id, tile, need_restore_re4,16);
             // if (need_restore_re4 && res5 != 1) {
             //     printf("[FATAL LEAK] Type4 Restore Re failed at dst_id %ld! Re LOST! (res=%d)\n", tx.dst_id, res5);
             // }
@@ -2710,15 +2709,15 @@ __device__ __noinline__ void perform_batch_update_tiled(AtomTx& tx, TileType til
     //3. 处理 Ghost 和 Surface 更新
     bool update_ghost = isGhostLat(tx.dst_id);
     if (tile.any(update_ghost)) {
-        tiled_insert_op(g_ghost_Hash, tx.dst_id, tile, update_ghost,3);
+        tiled_insert_op(g_ghost_Hash, tx.dst_id, tile, update_ghost,16);
     }
     bool update_surface = isSurfaceLat(tx.dst_id);
     if (tile.any(update_surface)) {
-        tiled_insert_op(g_surface_Hash, tx.dst_id, tile, update_surface,3);
+        tiled_insert_op(g_surface_Hash, tx.dst_id, tile, update_surface,16);
     }
-    bool update_surface_src = isSurfaceLat(tx.dst_id);
+    bool update_surface_src = isSurfaceLat(tx.src_id);
     if (tile.any(update_surface_src)) {
-        tiled_insert_op(g_surface_Hash, tx.src_id, tile, update_surface_src,3);
+        tiled_insert_op(g_surface_Hash, tx.src_id, tile, update_surface_src,16);
     }
   }
   return;
@@ -3808,9 +3807,9 @@ void recb_solver_GPU(
     //                   );
     // print_surface_and_ghost
 
-    // printf("---------------------------------------------------\n"); 
-    // hipLaunchKernelGGL(print_Hash_and_Pair, 1, 1, 0, 0,arr_size,1);
-    // printf("+++++++++++++++++++++++++++++++++++++++++++++++++++\n");
+    printf("---------------------------------------------------\n"); 
+    hipLaunchKernelGGL(print_Hash_and_Pair, 1, 1, 0, 0,arr_size,1);
+    printf("+++++++++++++++++++++++++++++++++++++++++++++++++++\n");
     // hipHostFree(Pair_Atoms);
     
 
@@ -3891,13 +3890,13 @@ void recb_solver_GPU(
       HANDLE_HIP(hipEventElapsedTime(&recb_ms_type, recb_evt_after_exchange, recb_evt_after_type));
       HANDLE_HIP(hipEventElapsedTime(&recb_ms_copy, recb_evt_after_type, recb_evt_after_copy));
       HANDLE_HIP(hipEventElapsedTime(&recb_ms_clear, recb_evt_after_copy, recb_evt_after_clear));
-      std::cout
-          << "[KMC_RECB_PROFILE] N=" << pair_atoms_size
-          << " exchange_ms=" << recb_ms_exchange
-          << " type_ms=" << recb_ms_type
-          << " copy_ms=" << recb_ms_copy
-          << " clear_ms=" << recb_ms_clear
-          << std::endl;
+      // std::cout
+      //     << "[KMC_RECB_PROFILE] N=" << pair_atoms_size
+      //     << " exchange_ms=" << recb_ms_exchange
+      //     << " type_ms=" << recb_ms_type
+      //     << " copy_ms=" << recb_ms_copy
+      //     << " clear_ms=" << recb_ms_clear
+      //     << std::endl;
     }
     // printf("cal exchange finished \n");
 }
