@@ -168,7 +168,46 @@ __device__ int isGhostLat(_type_lattice_id lid);
 __device__ int isSurfaceLat(_type_lattice_id lid);
 static __device__ __forceinline__ GPUHashSet* commBucketPtr(int idx);
 
+static int parseLocalRankEnv(const char* name) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0') return -1;
+  char* end = nullptr;
+  const long rank = std::strtol(value, &end, 10);
+  if (end == value || *end != '\0' || rank < 0) return -1;
+  return static_cast<int>(rank);
+}
 
+static int getLocalProcessRank(int fallback_rank) {
+  const char* env_names[] = {
+      "SLURM_LOCALID",
+      "OMPI_COMM_WORLD_LOCAL_RANK",
+      "MV2_COMM_WORLD_LOCAL_RANK",
+      "MPI_LOCALRANKID",
+      "PMI_LOCAL_RANK",
+  };
+  for (const char* name : env_names) {
+    const int rank = parseLocalRankEnv(name);
+    if (rank >= 0) return rank;
+  }
+  return fallback_rank;
+}
+
+static int getEnvIntOrDefault(const char* name, int default_value) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0') return default_value;
+  char* end = nullptr;
+  const long parsed = std::strtol(value, &end, 10);
+  if (end == value || *end != '\0') return default_value;
+  return static_cast<int>(parsed);
+}
+
+static bool shouldPrintGpuBindDebug(int process_rank, int local_rank) {
+  if (std::getenv("KMC_GPU_BIND_DEBUG") == nullptr) return false;
+  const int max_global = getEnvIntOrDefault("KMC_GPU_BIND_DEBUG_MAX_GLOBAL", 16);
+  const int local_filter = getEnvIntOrDefault("KMC_GPU_BIND_DEBUG_LOCAL_RANK", -1);
+  if (local_filter >= 0) return local_rank == local_filter;
+  return process_rank < max_global;
+}
 // =================================================================================
 //[防线 L1] 组内冲突拦截器 (Intra-Tile Resolvers)
 // =================================================================================
@@ -2857,7 +2896,7 @@ __device__ bool collective_bucket_contains(GPUHashSet* set, long int target_key,
     int loop_count = 0;
     // const int MAX_PROBE_STEPS = 3;
 
-    while (loop_count <= set->num_buckets) {
+    while (loop_count <=32){ // set->num_buckets) {
         if (tile.all(finished)) break;
 
         long int val = 0;
@@ -3807,9 +3846,9 @@ void recb_solver_GPU(
     //                   );
     // print_surface_and_ghost
 
-    printf("---------------------------------------------------\n"); 
-    hipLaunchKernelGGL(print_Hash_and_Pair, 1, 1, 0, 0,arr_size,1);
-    printf("+++++++++++++++++++++++++++++++++++++++++++++++++++\n");
+    // printf("---------------------------------------------------\n"); 
+    // hipLaunchKernelGGL(print_Hash_and_Pair, 1, 1, 0, 0,arr_size,1);
+    // printf("+++++++++++++++++++++++++++++++++++++++++++++++++++\n");
     // hipHostFree(Pair_Atoms);
     
 
@@ -4005,11 +4044,52 @@ double calculate_GPU_region(int x_low, int x_high, int y_low, int y_high, int z_
   HANDLE_HIP(hipMemcpy(sum_rates, d_sum_rates, sizeof(double), hipMemcpyDeviceToHost));
   return *sum_rates;
 }
+// void initialize_gpu(int process_rank){
+//   int gpu_count;
+//   HANDLE_HIP(hipGetDeviceCount(&gpu_count));
+
+//   int dev = process_rank % gpu_count;
+//   std::cerr << "[initialize_gpu] rank " << process_rank
+//             << " gpu_count=" << gpu_count
+//             << " before hipSetDevice dev=" << dev << std::endl;
+
+//   HANDLE_HIP(hipSetDevice(dev));
+
+//   int current_dev = -1;
+//   HANDLE_HIP(hipGetDevice(&current_dev));
+//   std::cerr << "[initialize_gpu] rank " << process_rank
+//             << " after hipSetDevice current_dev=" << current_dev << std::endl;
+
+//   std::cerr << "[initialize_gpu] rank " << process_rank
+//             << " before hipDeviceReset" << std::endl;
+//   HANDLE_HIP(hipDeviceReset());
+
+//   HANDLE_HIP(hipGetDevice(&current_dev));
+//   std::cerr << "[initialize_gpu] rank " << process_rank
+//             << " after hipDeviceReset current_dev=" << current_dev << std::endl;
+
+// #ifdef KMC_RCCL_ENABLE
+//   std::cerr << "[initialize_gpu] rank " << process_rank
+//             << " before rccl_smoke_test" << std::endl;
+//   rccl_smoke_test();
+//   std::cerr << "[initialize_gpu] rank " << process_rank
+//             << " after rccl_smoke_test" << std::endl;
+// #endif
+// }
+
 
 void initialize_gpu(int process_rank){
   int gpu_count;
   HANDLE_HIP(hipGetDeviceCount(&gpu_count));
-  HANDLE_HIP(hipSetDevice(process_rank % gpu_count));
+  const int local_rank = getLocalProcessRank(process_rank);
+  const int device_id = local_rank % gpu_count;
+  HANDLE_HIP(hipSetDevice(device_id));
+  if (shouldPrintGpuBindDebug(process_rank, local_rank)) {
+    std::cerr << "[KMC_GPU_BIND] process_rank=" << process_rank
+              << " local_rank=" << local_rank
+              << " gpu_count=" << gpu_count
+              << " device_id=" << device_id << std::endl;
+  }
   HANDLE_HIP(hipDeviceReset());
 #ifdef KMC_RCCL_ENABLE
   rccl_smoke_test();
@@ -4023,6 +4103,15 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
 
   int device_id;
   hipGetDevice(&device_id);  // 获取当前设备ID
+// size_t free_mem = 0;
+// size_t total_mem = 0;
+// HANDLE_HIP(hipMemGetInfo(&free_mem, &total_mem));
+
+// std::cerr << "[gpu_prepare] current device=" << device_id
+//           << " free_mem=" << free_mem
+//           << " total_mem=" << total_mem
+//           << std::endl;
+
   hipDeviceProp_t prop;
   hipGetDeviceProperties(&prop, device_id);  // 获取设备属性
   std::cout << "GPU名称: " << prop.name << std::endl;
@@ -4211,6 +4300,16 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
 
   // printf("finish gpu prepare\n");
   hipHostFree( Pair_Atoms);
+//   HANDLE_HIP(hipDeviceSynchronize());
+
+// size_t free_mem_end = 0;
+// size_t total_mem_end = 0;
+// HANDLE_HIP(hipMemGetInfo(&free_mem_end, &total_mem_end));
+
+// std::cerr << "[gpu_prepare] end current device=" << device_id
+//           << " free_mem=" << free_mem_end
+//           << " total_mem=" << total_mem_end
+//           << std::endl;
 }
 
 void gpu_final(){

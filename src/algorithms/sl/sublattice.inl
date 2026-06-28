@@ -24,7 +24,8 @@
 
 template <class PKg, class PKs, class Ins, typename E>
 void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks *p_event_hooks) {
-  std::cout<<"start time loop"<<std::endl;
+  if(SimulationDomain::comm_sim_pro.own_rank == 0){ std::cout<<"start time loop"<<std::endl; }
+
   const int64_t time_steps = ceil(time_limit / T); // T 是写死的3e-7，time_limit是config.yaml文件中的physics_time
   double time_total_start, time_total_end;
   double time_start, time_end;
@@ -32,11 +33,12 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
   double time_vac_calculate_total = 0.0;
   double time_selected_event_total = 0.0;
   double time_interval_trans_total = 0.0;
+  double time_compute_total = 0.0;
   double time_barrier_total = 0.0;
   double local_to_total = 0.0;
   double one_step_time_start,one_step_time_end;
 
-  p_event_hooks->onStepFinished(0);
+  // p_event_hooks->onStepFinished(0);
   if(SimulationDomain::comm_sim_pro.own_rank == 0) {
     kiwi::logs::v(" ", " rank id is : {} x dimension divided is : {} y dimension divided is : {} z dimension divided is : {}.\n", 
     SimulationDomain::comm_sim_pro.own_rank, 
@@ -44,9 +46,15 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
     p_model->p_domain->sub_box_lattice_size[1],
     p_model->p_domain->sub_box_lattice_size[2]);
   }
+  if (SimulationDomain::comm_sim_pro.own_rank == 0) std::cerr << "before barrier\n";
   MPI_Barrier(SimulationDomain::comm_sim_pro.comm);
+  if (SimulationDomain::comm_sim_pro.own_rank == 0) std::cerr << "after barrier\n";
+  if (SimulationDomain::comm_sim_pro.own_rank == 0) std::cerr << "before gpu_comm_init\n";
   gpu_comm_init(SimulationDomain::comm_sim_pro.comm);
+  if (SimulationDomain::comm_sim_pro.own_rank == 0) std::cerr << "after gpu_comm_init\n";
+  if (SimulationDomain::comm_sim_pro.own_rank == 0) std::cerr << "before gpu_comm_sanity_allreduce\n";
   gpu_comm_sanity_allreduce(SimulationDomain::comm_sim_pro.comm);
+  if (SimulationDomain::comm_sim_pro.own_rank == 0) std::cerr << "after gpu_comm_sanity_allreduce\n";
   if (gpu_comm_profile_enabled()) {
     gpu_comm_profile_reset();
   }
@@ -56,7 +64,7 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
   MPI_Barrier(SimulationDomain::comm_sim_pro.comm);
   // 扇区的执行顺序是 0, 7, 2, 5, 3, 4, 1, 6
   time_total_start = MPI_Wtime();
-  const int64_t TEST_STEPS = 100;
+  const int64_t TEST_STEPS = 1;
   // for (int64_t step = 1; step < time_steps; step++) { // time steps loop
   for (int64_t step = 1; step <=TEST_STEPS; step++) {
   //if (step % 100 == 0) kiwi::logs::v(" ", " step is : {} .\n", step);
@@ -75,11 +83,13 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
         //TODO:对这个地方的代码GPU化
         // while (sector_time < step_threshold_time) { // note: step_threshold_time may be less then 0.0
         // 各个方向的迁移机率，并将其累加
-        // time_start = MPI_Wtime();
+        time_start = MPI_Wtime();
         const double total_rates = calcRatesWrapper(p_model, (*sec_meta.sector_itl).id, sect);
         //if(SimulationDomain::comm_sim_pro.own_rank == 0) kiwi::logs::v(" ", " step is : {} sect is : {} total_rates is : {}.\n", step, sect, total_rates);
-        // time_end = MPI_Wtime() - time_start;
-        // time_vac_calculate_total += time_end;
+        time_end = MPI_Wtime() - time_start;
+        time_vac_calculate_total += time_end;
+        time_compute_total += time_end;
+        
         if (total_rates == 0.0 || std::abs(total_rates) < std::numeric_limits<_type_rate>::epsilon()) {
           // If there is no defect, use synchronous parallel kMC
           // algorithm. Because there is no kMC event, just increase
@@ -87,22 +97,30 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
           sector_time = step_threshold_time;
         } else {
           // 有KMC事件
-          // time_start = MPI_Wtime();
+          time_start = MPI_Wtime();
           one_step_time_start=MPI_Wtime();
           selectPerformWrapper(p_model, total_rates, (*sec_meta.sector_itl).id, SimulationDomain::comm_sim_pro.own_rank, step, sect);
           // time_end = MPI_Wtime() - time_start;
           // time_selected_event_total += time_end;
+          time_end = MPI_Wtime() - time_start;
+          // profile_select_time = time_end;
+          time_selected_event_total += time_end;
+          time_compute_total += time_end;
           // time_inc_dis can produces random numbers in a range [0, 1)
           // time_inc_rng 是 config.yaml 中给出的随机数种子
           const double rand = time_inc_dis(time_inc_rng);
           const double delta_t = -std::log(rand) / total_rates;
           sector_time += delta_t;
         }
-        // time_start = MPI_Wtime();
+        time_start = MPI_Wtime();
+        // one_step_time_start=MPI_Wtime();
         recbPerformWrapper(p_model, (*sec_meta.sector_itl).id);
-        one_step_time_end=MPI_Wtime()-one_step_time_start;
+        // one_step_time_end=MPI_Wtime()-one_step_time_start;
         // printf("%f\n",one_step_time_end);
-        // time_end = MPI_Wtime() - time_start;
+        time_end = MPI_Wtime() - time_start;
+        
+        time_interval_trans_total += time_end;
+        time_compute_total += time_end;
         // time_interval_trans_total += time_end;
         // todo: time comparing, nearest principle based on predicting
         // next delta t.  时间比较，基于预测下一个Δt的最接近原理。
@@ -154,11 +172,18 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
 
   MPI_Reduce(&time_total_end, &local_to_total, 1, MPI_DOUBLE, MPI_MAX, 0, SimulationDomain::comm_sim_pro.comm);
   if(SimulationDomain::comm_sim_pro.own_rank == 0) kiwi::logs::v(" ", " total time is : {} s. \n", local_to_total);
+  
+  MPI_Reduce(&time_compute_total, &local_to_total, 1, MPI_DOUBLE, MPI_SUM, 0, SimulationDomain::comm_sim_pro.comm);
+  if(SimulationDomain::comm_sim_pro.own_rank == 0) kiwi::logs::v(" ", " compute time is : {} s. \n", local_to_total / SimulationDomain::comm_sim_pro.all_ranks);
 
-   if(SimulationDomain::comm_sim_pro.own_rank == 0) {
-      kiwi::logs::v(" ", " >>> [Benchmark] Total Time for {} steps is : {} s. \n", TEST_STEPS, local_to_total);
-      kiwi::logs::v(" ", " >>> [Benchmark] Average Time per Step is : {} s. \n", local_to_total / TEST_STEPS);
-  }
+  MPI_Reduce(&time_vac_calculate_total, &local_to_total, 1, MPI_DOUBLE, MPI_SUM, 0, SimulationDomain::comm_sim_pro.comm);
+  if(SimulationDomain::comm_sim_pro.own_rank == 0) kiwi::logs::v(" ", " calcRatesWrapper time is : {} s. \n", local_to_total / SimulationDomain::comm_sim_pro.all_ranks);
+
+  MPI_Reduce(&time_selected_event_total, &local_to_total, 1, MPI_DOUBLE, MPI_SUM, 0, SimulationDomain::comm_sim_pro.comm);
+  if(SimulationDomain::comm_sim_pro.own_rank == 0) kiwi::logs::v(" ", " selectPerformWrapper time is : {} s. \n", local_to_total / SimulationDomain::comm_sim_pro.all_ranks);
+
+  MPI_Reduce(&time_interval_trans_total, &local_to_total, 1, MPI_DOUBLE, MPI_SUM, 0, SimulationDomain::comm_sim_pro.comm);
+  if(SimulationDomain::comm_sim_pro.own_rank == 0) kiwi::logs::v(" ", " recbPerformWrapper time is : {} s. \n", local_to_total / SimulationDomain::comm_sim_pro.all_ranks);
   //  MPI_Reduce(&time_vac_calculate_total, &local_to_total, 1, MPI_DOUBLE, MPI_SUM, 0, SimulationDomain::comm_sim_pro.comm);
   // if(SimulationDomain::comm_sim_pro.own_rank == 0) kiwi::logs::v(" ", " vac_calculate time is : {} s. \n", local_to_total / SimulationDomain::comm_sim_pro.all_ranks);
 
