@@ -14,7 +14,56 @@
 #define NN_TOTAL 126
 #define RE_SCALE_SIZE 1.2
 #define STREAM_SIZE 4
-#define BUCKET_SIZE 64
+#ifndef KMC_HASH_BUCKET_SIZE
+#define KMC_HASH_BUCKET_SIZE 64
+#endif
+#define BUCKET_SIZE KMC_HASH_BUCKET_SIZE
+
+#ifndef KMC_HASH_TILE_SIZE
+#define KMC_HASH_TILE_SIZE BUCKET_SIZE
+#endif
+
+#ifndef KMC_HASH_TARGET_LOAD_FACTOR
+#define KMC_HASH_TARGET_LOAD_FACTOR 0.50
+#endif
+
+#ifndef KMC_HASH_MAX_PROBES
+#define KMC_HASH_MAX_PROBES 32
+#endif
+
+#define HASH_SEED_PRIMARY 2u
+
+static constexpr long int GPU_HASH_EMPTY_KEY = -1L;
+static constexpr long int GPU_HASH_TOMBSTONE_KEY = -2L;
+
+__host__ __device__ __forceinline__ unsigned int lattice_hash_mix(long int k, unsigned int seed) {
+    unsigned long long int h = (unsigned long long int)k;
+    h ^= seed;
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
+    h *= 0xc4ceb9fe1a85ec53ULL;
+    h ^= h >> 33;
+    return (unsigned int)h;
+}
+
+__host__ __device__ __forceinline__ unsigned int hash_h1(long int key) {
+    return lattice_hash_mix(key, HASH_SEED_PRIMARY);
+}
+
+__host__ __device__ __forceinline__ unsigned int hash_primary_bucket(unsigned int num_buckets, long int key) {
+    return hash_h1(key) % num_buckets;
+}
+
+__host__ __device__ __forceinline__ unsigned int hash_probe_bucket(unsigned int num_buckets, long int key, unsigned int probe) {
+    return (hash_primary_bucket(num_buckets, key) + probe) % num_buckets;
+}
+
+__host__ __device__ __forceinline__ unsigned int hash_effective_max_probes(unsigned int num_buckets) {
+    unsigned int configured = static_cast<unsigned int>(KMC_HASH_MAX_PROBES);
+    if (configured == 0 || configured > num_buckets) return num_buckets;
+    return configured;
+}
 
 // 定义一个可以在 Device 端使用的哈希函数对象 (Functor)
 struct DeviceHasher {

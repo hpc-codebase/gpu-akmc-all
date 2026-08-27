@@ -1,6 +1,7 @@
 
 #include "gpu_simulate.h"
 #include <cstdlib>
+#include <mpi.h>
 
 // #include <hiprand_kernel.h>
 #ifndef KMC_RECB_DEVICE_PRINTF
@@ -113,6 +114,7 @@ namespace gpuSimulate {
 
     unsigned long long int* d_Global_Bitmap_Lock = nullptr;
     size_t bitmap_lock_bytes = 0;
+    GpuCommMaintenanceProfiler comm_gpu_maintenance_profiler;
 
     long int *d_ghost_list;
     long int *d_surface_list;
@@ -163,6 +165,23 @@ namespace gpuSimulate {
       recb_evt_inited = false;
     }
 }
+
+void resetGpuCommMaintenanceProfiler() {
+    gpuSimulate::comm_gpu_maintenance_profiler = GpuCommMaintenanceProfiler{};
+}
+
+GpuCommMaintenanceProfiler getGpuCommMaintenanceProfiler() {
+    return gpuSimulate::comm_gpu_maintenance_profiler;
+}
+
+void gpuCommProfileAddPackNcclRecv(double seconds) {
+    gpuSimulate::comm_gpu_maintenance_profiler.pack_nccl_recv_time += seconds;
+}
+
+void gpuCommProfileAddHashPostprocess(double seconds) {
+    gpuSimulate::comm_gpu_maintenance_profiler.hash_postprocess_time += seconds;
+}
+
 __device__ _type_lattice_id getId(_type_lattice_size x,_type_lattice_size y,_type_lattice_size z);
 __device__ int isGhostLat(_type_lattice_id lid);
 __device__ int isSurfaceLat(_type_lattice_id lid);
@@ -177,13 +196,29 @@ static int parseLocalRankEnv(const char* name) {
   return static_cast<int>(rank);
 }
 
+// Node-local rank for GPU bind. MPI_COMM_TYPE_SHARED is used first so
+// sbatch+mpirun cannot inherit a stale SLURM_LOCALID=0 onto remote nodes.
 static int getLocalProcessRank(int fallback_rank) {
+  int mpi_inited = 0;
+  MPI_Initialized(&mpi_inited);
+  if (mpi_inited) {
+    MPI_Comm node_comm = MPI_COMM_NULL;
+    if (MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, fallback_rank,
+                            MPI_INFO_NULL, &node_comm) == MPI_SUCCESS &&
+        node_comm != MPI_COMM_NULL) {
+      int local_rank = 0;
+      MPI_Comm_rank(node_comm, &local_rank);
+      MPI_Comm_free(&node_comm);
+      return local_rank;
+    }
+  }
+
   const char* env_names[] = {
-      "SLURM_LOCALID",
       "OMPI_COMM_WORLD_LOCAL_RANK",
       "MV2_COMM_WORLD_LOCAL_RANK",
       "MPI_LOCALRANKID",
       "PMI_LOCAL_RANK",
+      "SLURM_LOCALID",
   };
   for (const char* name : env_names) {
     const int rank = parseLocalRankEnv(name);
@@ -313,17 +348,18 @@ __device__ inline void release_bitmap_lock_single(long int id) {
 // 返回值: true (找到), false (未找到)
 // =========================================================
 __device__ bool hash_set_contains(GPUHashSet* set, long int key) {
-    unsigned int buck_num = set->hasher(key) % set->num_buckets;
-    int loop_count = 0;
+    unsigned int loop_count = 0;
+    const unsigned int max_probe = hash_effective_max_probes(set->num_buckets);
+    unsigned int buck_num = hash_probe_bucket(set->num_buckets, key, loop_count);
     bool result = false;
     // printf("debug_test_contain, buckets:%d capacity: %d\n", set->num_buckets,set->capacity);
 
 
-    while (loop_count <= set->num_buckets ) {
-        int base_index = buck_num * 64; 
+    while (loop_count <= max_probe ) {
+        int base_index = buck_num * BUCKET_SIZE;
         bool should_stop = false;
 
-        for (int i = 0; i < 64; ++i) {
+        for (int i = 0; i < BUCKET_SIZE; ++i) {
             // long int val = set->keys[base_index + i].load(hip::memory_order_relaxed);
             long int val = atomic_load_relaxed(&set->keys[base_index + i]);
             
@@ -341,8 +377,8 @@ __device__ bool hash_set_contains(GPUHashSet* set, long int key) {
           break; 
         }
 
-        buck_num = (buck_num + 1) % set->num_buckets;
         loop_count++;
+        buck_num = hash_probe_bucket(set->num_buckets, key, loop_count);
     }
     // printf("debug_test_contain, result:%d\n", result);
     return result;
@@ -350,14 +386,15 @@ __device__ bool hash_set_contains(GPUHashSet* set, long int key) {
 //单线程插入
 // 返回值: 1 (插入成功), 0 (已存在，未重复插入), -1 (表满失败)
 __device__ int hash_set_insert_atom_op(GPUHashSet* set, long int key) {
-    unsigned int buck_num = set->hasher(key) % set->num_buckets;
     unsigned int loop_count = 0;
+    const unsigned int max_probe = hash_effective_max_probes(set->num_buckets);
+    unsigned int buck_num = hash_probe_bucket(set->num_buckets, key, loop_count);
     // const int MAX_PROBE_STEPS = 3;
-    while (loop_count <= set->num_buckets) {
-        int base_index = buck_num * 64; 
+    while (loop_count <= max_probe) {
+        int base_index = buck_num * BUCKET_SIZE;
 
         // 在桶内的 64 个槽位中线性查找
-        for (int i = 0; i < 64; ++i) {
+        for (int i = 0; i < BUCKET_SIZE; ++i) {
             long int* target_addr = &set->keys[base_index + i];
             long int val = atomic_load_relaxed(target_addr);
             if (val == key) return 0;
@@ -376,21 +413,22 @@ __device__ int hash_set_insert_atom_op(GPUHashSet* set, long int key) {
         }
         
         // 当前桶满了，去下一个桶
-        buck_num = (buck_num + 1) % set->num_buckets;
         loop_count++;
+        buck_num = hash_probe_bucket(set->num_buckets, key, loop_count);
     }
     return -1;
 }
 //单线程删除
 // 返回值: 1 (删除成功), 0 (未找到该 Key)
 __device__ int hash_set_remove_atom_op(GPUHashSet* set, long int key) {
-    unsigned int buck_num = set->hasher(key) % set->num_buckets;
     unsigned int loop_count = 0;
+    const unsigned int max_probe = hash_effective_max_probes(set->num_buckets);
+    unsigned int buck_num = hash_probe_bucket(set->num_buckets, key, loop_count);
 
-    while (loop_count <= set->num_buckets) {
-        int base_index = buck_num * 64; 
+    while (loop_count <= max_probe) {
+        int base_index = buck_num * BUCKET_SIZE;
 
-        for (int i = 0; i < 64; ++i) {
+        for (int i = 0; i < BUCKET_SIZE; ++i) {
             long int* target_addr = &set->keys[base_index + i];
             long int val = atomic_load_relaxed(target_addr);
             
@@ -415,8 +453,8 @@ __device__ int hash_set_remove_atom_op(GPUHashSet* set, long int key) {
             if (val == set->empty_flag) return 0;
         }
 
-        buck_num = (buck_num + 1) % set->num_buckets;
         loop_count++;
+        buck_num = hash_probe_bucket(set->num_buckets, key, loop_count);
     }
     return 0;
 }
@@ -431,10 +469,10 @@ __device__ __noinline__ int tiled_contains_op(GPUHashSet* set, long int key, Til
         int leader = __ffsll((unsigned long long int)work_mask) - 1;
         long int leader_key = tile.shfl(key, leader); 
         
-        unsigned int buck_num = set->hasher(leader_key) % set->num_buckets;
         int lane = tile.thread_rank();
 
         int loop_count = 0;
+        unsigned int buck_num = hash_probe_bucket(set->num_buckets, leader_key, loop_count);
         int leader_result = 0;
         int searching = 1;
 
@@ -445,7 +483,7 @@ __device__ __noinline__ int tiled_contains_op(GPUHashSet* set, long int key, Til
 
         while(searching) {
             // long int val = set->keys[buck_num * 64 + lane].load(hip::memory_order_relaxed);
-            long int val = atomic_load_relaxed(&set->keys[buck_num * 64 + lane]);
+            long int val = atomic_load_relaxed(&set->keys[buck_num * BUCKET_SIZE + lane]);
             
             uint64_t match_mask = tile.ballot(val == leader_key);
             uint64_t empty_mask = tile.ballot(val == set->empty_flag);
@@ -459,8 +497,8 @@ __device__ __noinline__ int tiled_contains_op(GPUHashSet* set, long int key, Til
                 searching = 0; 
                 // if (lane == leader) printf("    -> [MISS] Encountered empty slots at bucket %u. Key %ld does not exist.\n", buck_num, leader_key);
             } else {
-                buck_num = (buck_num + 1) % set->num_buckets;
                 loop_count++;
+                buck_num = hash_probe_bucket(set->num_buckets, leader_key, loop_count);
                 // if (lane == leader) printf("    -> [COLLISION] Bucket full, probing next bucket %u (Loop %d)\n", buck_num, loop_count);
 
                 if (loop_count > set->num_buckets ) {  
@@ -484,6 +522,9 @@ __device__ __noinline__ int tiled_contains_op(GPUHashSet* set, long int key, Til
 template <typename TileType>
 __device__ int tiled_insert_op(GPUHashSet* set, long int key, TileType tile, bool active, int max_probes) {
     int final_result = 0; 
+    const unsigned int probe_limit = hash_effective_max_probes(set->num_buckets);
+    const unsigned int effective_max_probes =
+        max_probes < static_cast<int>(probe_limit) ? static_cast<unsigned int>(max_probes) : probe_limit;
     uint64_t work_mask = tile.ballot(active);
 
     while (work_mask != 0) {
@@ -491,9 +532,9 @@ __device__ int tiled_insert_op(GPUHashSet* set, long int key, TileType tile, boo
         // long int leader_key = tile.shfl(key, leader);
         long int leader_key = (long int)tile.shfl((unsigned long long int)key, leader);
         
-        unsigned int buck_num = set->hasher(leader_key) % set->num_buckets;
         int lane = tile.thread_rank();
         int loop_count = 0;
+        unsigned int buck_num = hash_probe_bucket(set->num_buckets, leader_key, loop_count);
         int leader_result = 0;
         // if (lane == leader) {
         //     printf("  -> [Insert] Leader %d starting search for Key %ld at Bucket %u\n", leader, leader_key, buck_num);
@@ -501,7 +542,11 @@ __device__ int tiled_insert_op(GPUHashSet* set, long int key, TileType tile, boo
         int searching = 1;
         while(searching){
           // long int val = set->keys[buck_num * 64 + lane].load(hip::memory_order_relaxed);
-          long int val = atomic_load_relaxed(&set->keys[buck_num * 64 + lane]);
+          long int val = atomic_load_relaxed(&set->keys[buck_num * BUCKET_SIZE + lane]);
+          if (tile.ballot(val == leader_key) != 0) {
+              leader_result = 0;
+              searching = 0;
+          } else {
 
           // // 1. 插入之前检查当前key是否已经存在
           // if (tile.ballot(val == leader_key) != 0) {
@@ -509,7 +554,8 @@ __device__ int tiled_insert_op(GPUHashSet* set, long int key, TileType tile, boo
           //     searching = 0;
           // }else{
             // 2. 寻找空位或墓碑
-            uint64_t candidate_mask = tile.ballot(val == set->empty_flag) | tile.ballot(val == set->tombstone_flag);
+            uint64_t candidate_mask = tile.ballot(val == set->empty_flag) |
+                                      tile.ballot(val == set->tombstone_flag);
             
             if (candidate_mask != 0) {
                 int target_lane = __ffsll((unsigned long long int)candidate_mask) - 1;
@@ -521,7 +567,7 @@ __device__ int tiled_insert_op(GPUHashSet* set, long int key, TileType tile, boo
                     // cas_success = set->keys[buck_num * 64 + lane].compare_exchange_strong(
                     //         expected, leader_key, 
                     //         hip::memory_order_seq_cst, hip::memory_order_seq_cst);
-                    unsigned long long int* addr = (unsigned long long int*)&set->keys[buck_num * 64 + lane];
+                    unsigned long long int* addr = (unsigned long long int*)&set->keys[buck_num * BUCKET_SIZE + lane];
                     unsigned long long int old_val = atomicCAS(addr, (unsigned long long int)val, (unsigned long long int)leader_key);
                     cas_success = (old_val == (unsigned long long int)val) ? 1 : 0;
                     // #endif
@@ -535,14 +581,14 @@ __device__ int tiled_insert_op(GPUHashSet* set, long int key, TileType tile, boo
                 // 如果插入失败(被同一Wave内其他操作抢占)，继续在当前桶内重试
             } else {
                 // 桶已满，线性探测到下一个桶
-                buck_num = (buck_num + 1) % set->num_buckets;
                 loop_count++;
-                if (loop_count > max_probes) {  
+                buck_num = hash_probe_bucket(set->num_buckets, leader_key, loop_count);
+                if (loop_count > effective_max_probes) {
                     leader_result = -2; // 插入失败(表满)
                     searching = 0;
                 }
             }
-          // }
+          }
         }
 
         if (lane == leader) final_result = leader_result;
@@ -558,15 +604,18 @@ __device__ int tiled_insert_op(GPUHashSet* set, long int key, TileType tile, boo
 template <typename TileType>
 __device__ int tiled_remove_op(GPUHashSet* set, long int key, TileType tile, bool active, int max_probes) {
     int final_result = 0;
+    const unsigned int probe_limit = hash_effective_max_probes(set->num_buckets);
+    const unsigned int effective_max_probes =
+        max_probes < static_cast<int>(probe_limit) ? static_cast<unsigned int>(max_probes) : probe_limit;
     uint64_t work_mask = tile.ballot(active); 
     while (work_mask != 0) {
         int leader = __ffsll((unsigned long long int)work_mask) - 1;
         // long int leader_key = tile.shfl(key, leader);
         long int leader_key = (long int)tile.shfl((unsigned long long int)key, leader);
         
-        unsigned int buck_num = set->hasher(leader_key) % set->num_buckets;
         int lane = tile.thread_rank();
         int loop_count = 0;
+        unsigned int buck_num = hash_probe_bucket(set->num_buckets, leader_key, loop_count);
         int leader_result = 0;
         // if (lane == leader) {
         //     printf("  -> [del] Leader %d starting search for Key %ld at Bucket %u\n", leader, leader_key, buck_num);
@@ -574,7 +623,7 @@ __device__ int tiled_remove_op(GPUHashSet* set, long int key, TileType tile, boo
         int searching = 1;
         while(searching){
             // long int val = set->keys[buck_num * 64 + lane].load(hip::memory_order_relaxed);
-            long int val = atomic_load_relaxed(&set->keys[buck_num * 64 + lane]);
+            long int val = atomic_load_relaxed(&set->keys[buck_num * BUCKET_SIZE + lane]);
             uint64_t match_mask = tile.ballot(val == leader_key);
             
             if (match_mask != 0) {
@@ -587,7 +636,7 @@ __device__ int tiled_remove_op(GPUHashSet* set, long int key, TileType tile, boo
                     // cas_success = set->keys[buck_num * 64 + lane].compare_exchange_strong(
                     //         expected, set->tombstone_flag, 
                     //         hip::memory_order_seq_cst, hip::memory_order_seq_cst);
-                    unsigned long long int* addr = (unsigned long long int*)&set->keys[buck_num * 64 + lane];
+                    unsigned long long int* addr = (unsigned long long int*)&set->keys[buck_num * BUCKET_SIZE + lane];
                     unsigned long long int old_val = atomicCAS(addr, (unsigned long long int)leader_key, (unsigned long long int)set->tombstone_flag);
                     cas_success = (old_val == (unsigned long long int)leader_key) ? 1 : 0;
                     // #endif
@@ -601,9 +650,9 @@ __device__ int tiled_remove_op(GPUHashSet* set, long int key, TileType tile, boo
                 leader_result = 0; // 未找到
                 searching = 0;
             }else{
-              buck_num = (buck_num + 1) % set->num_buckets;
               loop_count++;
-              if (loop_count > max_probes) {  
+              buck_num = hash_probe_bucket(set->num_buckets, leader_key, loop_count);
+              if (loop_count > effective_max_probes) {
                   leader_result = 0; // 未找到 (表满)
                   searching = 0;
               }
@@ -2564,13 +2613,13 @@ __device__ __noinline__ void perform_batch_update_tiled(AtomTx& tx, TileType til
     bool is_type1 = (tx.op_type == 1);
   if (tile.any(is_type1)) {
       // Step 1: 尝试插入 Dst (必须是空位)
-      int ins_res = tiled_insert_op(g_MoMo_Hash, tx.dst_id, tile, is_type1,16);
+      int ins_res = tiled_insert_op(g_MoMo_Hash, tx.dst_id, tile, is_type1,g_MoMo_Hash->num_buckets);
       bool dst_inserted = (is_type1 && ins_res == 1);
 
       // Step 2: 只有插入成功，才移除 Src
       int rem_res = 0;
       if (tile.any(dst_inserted)) {
-          rem_res = tiled_remove_op(g_MoMo_Hash, tx.src_id, tile, dst_inserted,16);
+          rem_res = tiled_remove_op(g_MoMo_Hash, tx.src_id, tile, dst_inserted,g_MoMo_Hash->num_buckets);
       }
       bool src_removed = (dst_inserted && rem_res == 1);
 
@@ -2578,7 +2627,7 @@ __device__ __noinline__ void perform_batch_update_tiled(AtomTx& tx, TileType til
       // 必须回滚 Dst (删除刚刚插入的)
       bool need_rollback = (dst_inserted && !src_removed);
       if (tile.any(need_rollback)) {
-        tiled_remove_op(g_MoMo_Hash, tx.dst_id, tile, need_rollback,16);
+        tiled_remove_op(g_MoMo_Hash, tx.dst_id, tile, need_rollback,g_MoMo_Hash->num_buckets);
       }
 
       // 只有两步都成功才算成功
@@ -2594,15 +2643,15 @@ __device__ __noinline__ void perform_batch_update_tiled(AtomTx& tx, TileType til
   bool is_type2 = (tx.op_type == 2);
   if (tile.any(is_type2)) {
       // Step 1: 尝试插入 MoRe (Dst) - 这是最关键的一步，如果满/冲突则直接放弃
-      int ins_more_res = tiled_insert_op(g_MoRe_Hash, tx.dst_id, tile, is_type2,16);
+      int ins_more_res = tiled_insert_op(g_MoRe_Hash, tx.dst_id, tile, is_type2,g_MoRe_Hash->num_buckets);
       bool more_inserted = (is_type2 && ins_more_res == 1);
 
       // Step 2: 只有插入成功，才去销毁旧原料 (Re 和 MoMo)
       int rem_re_res = 0;
       int rem_momo_res = 0;
       if (tile.any(more_inserted)) {
-          rem_re_res = tiled_remove_op(g_Re_Hash, tx.dst_id, tile, more_inserted,16);
-          rem_momo_res = tiled_remove_op(g_MoMo_Hash, tx.src_id, tile, more_inserted,16);
+          rem_re_res = tiled_remove_op(g_Re_Hash, tx.dst_id, tile, more_inserted,g_Re_Hash->num_buckets);
+          rem_momo_res = tiled_remove_op(g_MoMo_Hash, tx.src_id, tile, more_inserted,g_MoMo_Hash->num_buckets);
       }
       bool re_removed = (more_inserted && rem_re_res == 1);
       bool momo_removed = (more_inserted && rem_momo_res == 1);
@@ -2617,7 +2666,7 @@ __device__ __noinline__ void perform_batch_update_tiled(AtomTx& tx, TileType til
          // 撤销 MoRe
         bool need_revert_more = more_inserted && !(re_removed && momo_removed);
         if (tile.any(need_revert_more)) {
-            int res1 = tiled_remove_op(g_MoRe_Hash, tx.dst_id, tile, need_revert_more,16);
+            int res1 = tiled_remove_op(g_MoRe_Hash, tx.dst_id, tile, need_revert_more,g_MoRe_Hash->num_buckets);
             // 如果撤销插入失败，会导致原子变多 (Duplicate)
             // if (need_revert_more && res1 != 1) {
             //     printf("[DUPLICATE] Type2 Revert MoRe failed at dst_id %ld! (res=%d)\n", tx.dst_id, res1);
@@ -2627,7 +2676,7 @@ __device__ __noinline__ void perform_batch_update_tiled(AtomTx& tx, TileType til
         // 撤销误删的 Re
         bool need_restore_re = more_inserted && re_removed && !momo_removed;
         if (tile.any(need_restore_re)) {
-            int res2 = tiled_insert_op(g_Re_Hash, tx.dst_id, tile, need_restore_re,16);
+            int res2 = tiled_insert_op(g_Re_Hash, tx.dst_id, tile, need_restore_re,g_Re_Hash->num_buckets);
             // if (need_restore_re && res2 != 1) {
             //     printf("[FATAL LEAK] Type2 Restore Re failed at dst_id %ld! Re LOST! (res=%d)\n", tx.dst_id, res2);
             // }
@@ -2636,7 +2685,7 @@ __device__ __noinline__ void perform_batch_update_tiled(AtomTx& tx, TileType til
         // 撤销误删的 MoMo (这是最容易导致丢失的地方！)
         bool need_restore_momo = more_inserted && !re_removed && momo_removed;
         if (tile.any(need_restore_momo)) {
-            int res3 = tiled_insert_op(g_MoMo_Hash, tx.src_id, tile, need_restore_momo,16);
+            int res3 = tiled_insert_op(g_MoMo_Hash, tx.src_id, tile, need_restore_momo,g_MoMo_Hash->num_buckets);
             // if (need_restore_momo && res3 != 1) {
             //     printf("[FATAL LEAK] Type2 Restore MoMo failed at src_id %ld! MoMo LOST! (res=%d). Slot stolen by another thread?\n", tx.src_id, res3);
             // }
@@ -2650,20 +2699,20 @@ __device__ __noinline__ void perform_batch_update_tiled(AtomTx& tx, TileType til
   bool is_type3 = (tx.op_type == 3);
   if (tile.any(is_type3)) {
       // Step 1: Insert Dst
-      int ins_res = tiled_insert_op(g_MoRe_Hash, tx.dst_id, tile, is_type3,16);
+      int ins_res = tiled_insert_op(g_MoRe_Hash, tx.dst_id, tile, is_type3,g_MoRe_Hash->num_buckets);
       bool dst_inserted = (is_type3 && ins_res == 1);
       
       // Step 2: Remove Src
       int rem_res = 0;
       if (tile.any(dst_inserted)) {
-          rem_res = tiled_remove_op(g_MoRe_Hash, tx.src_id, tile, dst_inserted,16);
+          rem_res = tiled_remove_op(g_MoRe_Hash, tx.src_id, tile, dst_inserted,g_MoRe_Hash->num_buckets);
       }
       bool src_removed = (dst_inserted && rem_res == 1);
 
       // Step 3: Rollback Dst if needed
       bool need_rollback = (dst_inserted && !src_removed);
       if (tile.any(need_rollback)) {
-          tiled_remove_op(g_MoRe_Hash, tx.dst_id, tile, need_rollback,16);
+          tiled_remove_op(g_MoRe_Hash, tx.dst_id, tile, need_rollback,g_MoRe_Hash->num_buckets);
       }
 
       // if (src_removed) tx.success = true;
@@ -2679,8 +2728,8 @@ __device__ __noinline__ void perform_batch_update_tiled(AtomTx& tx, TileType til
   bool is_type4 = (tx.op_type == 4);
   if (tile.any(is_type4)) {
       // Step 1: 尝试插入所有新身份 (Re at Src, MoRe at Dst)
-      int ins_re_res = tiled_insert_op(g_Re_Hash, tx.src_id, tile, is_type4,16);
-      int ins_more_res = tiled_insert_op(g_MoRe_Hash, tx.dst_id, tile, is_type4,16);
+      int ins_re_res = tiled_insert_op(g_Re_Hash, tx.src_id, tile, is_type4,g_Re_Hash->num_buckets);
+      int ins_more_res = tiled_insert_op(g_MoRe_Hash, tx.dst_id, tile, is_type4,g_MoRe_Hash->num_buckets);
       
       bool re_inserted = (is_type4 && ins_re_res == 1);
       bool more_inserted = (is_type4 && ins_more_res == 1);
@@ -2690,8 +2739,8 @@ __device__ __noinline__ void perform_batch_update_tiled(AtomTx& tx, TileType til
       int rem_more_res = 0;
       int rem_re_res = 0;
       if (tile.any(both_inserted)) {
-          rem_more_res = tiled_remove_op(g_MoRe_Hash, tx.src_id, tile, both_inserted,16);
-          rem_re_res = tiled_remove_op(g_Re_Hash, tx.dst_id, tile, both_inserted,16);
+          rem_more_res = tiled_remove_op(g_MoRe_Hash, tx.src_id, tile, both_inserted,g_MoRe_Hash->num_buckets);
+          rem_re_res = tiled_remove_op(g_Re_Hash, tx.dst_id, tile, both_inserted,g_Re_Hash->num_buckets);
       }
       bool more_removed = (both_inserted && rem_more_res == 1);
       bool re_removed = (both_inserted && rem_re_res == 1);
@@ -2706,23 +2755,23 @@ __device__ __noinline__ void perform_batch_update_tiled(AtomTx& tx, TileType til
         // A. 插入失败的回滚
             bool fail_ins_re = (re_inserted && !more_inserted);
             if (tile.any(fail_ins_re)) {
-                tiled_remove_op(g_Re_Hash, tx.src_id, tile, fail_ins_re,16);
+                tiled_remove_op(g_Re_Hash, tx.src_id, tile, fail_ins_re,g_Re_Hash->num_buckets);
             }
             bool fail_ins_more = (!re_inserted && more_inserted);
             if (tile.any(fail_ins_more)) {
-                tiled_remove_op(g_MoRe_Hash, tx.dst_id, tile, fail_ins_more,16);
+                tiled_remove_op(g_MoRe_Hash, tx.dst_id, tile, fail_ins_more,g_MoRe_Hash->num_buckets);
             }
             
             // B. 删除失败的回滚 (全部回滚)
             bool fail_rem_both = both_inserted && !(more_removed && re_removed);
             if (tile.any(fail_rem_both)) {
-                tiled_remove_op(g_Re_Hash, tx.src_id, tile, fail_rem_both,16);
-                tiled_remove_op(g_MoRe_Hash, tx.dst_id, tile, fail_rem_both,16);
+                tiled_remove_op(g_Re_Hash, tx.src_id, tile, fail_rem_both,g_Re_Hash->num_buckets);
+                tiled_remove_op(g_MoRe_Hash, tx.dst_id, tile, fail_rem_both,g_MoRe_Hash->num_buckets);
             }
             // 恢复误删的 MoRe
         bool need_restore_more = both_inserted && more_removed && !re_removed;
         if (tile.any(need_restore_more)) {
-            int res4 = tiled_insert_op(g_MoRe_Hash, tx.src_id, tile, need_restore_more,16);
+            int res4 = tiled_insert_op(g_MoRe_Hash, tx.src_id, tile, need_restore_more,g_MoRe_Hash->num_buckets);
             // if (need_restore_more && res4 != 1) {
             //     printf("[FATAL LEAK] Type4 Restore MoRe failed at src_id %ld! MoRe LOST! (res=%d)\n", tx.src_id, res4);
             // }
@@ -2731,7 +2780,7 @@ __device__ __noinline__ void perform_batch_update_tiled(AtomTx& tx, TileType til
         // 恢复误删的 Re
         bool need_restore_re4 = both_inserted && !more_removed && re_removed;
         if (tile.any(need_restore_re4)) {
-            int res5 = tiled_insert_op(g_Re_Hash, tx.dst_id, tile, need_restore_re4,16);
+            int res5 = tiled_insert_op(g_Re_Hash, tx.dst_id, tile, need_restore_re4,g_Re_Hash->num_buckets);
             // if (need_restore_re4 && res5 != 1) {
             //     printf("[FATAL LEAK] Type4 Restore Re failed at dst_id %ld! Re LOST! (res=%d)\n", tx.dst_id, res5);
             // }
@@ -2748,15 +2797,15 @@ __device__ __noinline__ void perform_batch_update_tiled(AtomTx& tx, TileType til
     //3. 处理 Ghost 和 Surface 更新
     bool update_ghost = isGhostLat(tx.dst_id);
     if (tile.any(update_ghost)) {
-        tiled_insert_op(g_ghost_Hash, tx.dst_id, tile, update_ghost,16);
+        tiled_insert_op(g_ghost_Hash, tx.dst_id, tile, update_ghost,g_ghost_Hash->num_buckets);
     }
     bool update_surface = isSurfaceLat(tx.dst_id);
     if (tile.any(update_surface)) {
-        tiled_insert_op(g_surface_Hash, tx.dst_id, tile, update_surface,16);
+        tiled_insert_op(g_surface_Hash, tx.dst_id, tile, update_surface,g_surface_Hash->num_buckets);
     }
     bool update_surface_src = isSurfaceLat(tx.src_id);
     if (tile.any(update_surface_src)) {
-        tiled_insert_op(g_surface_Hash, tx.src_id, tile, update_surface_src,16);
+        tiled_insert_op(g_surface_Hash, tx.src_id, tile, update_surface_src,g_surface_Hash->num_buckets);
     }
   }
   return;
@@ -2884,43 +2933,46 @@ __device__ int decide_op_type(LatticeTypes::lat_type cur_type,LatticeTypes::lat_
 template <typename TileType>
 __device__ bool collective_bucket_contains(GPUHashSet* set, long int target_key, TileType tile) {
     // 即使 target_key <= 0，也不能提前 return，必须陪全组参与 tile.any 防死锁
-    bool found = false;
-    bool finished = (target_key <= 0); 
-    
-    unsigned int buck_num = 0;
-    if (!finished) {
-        buck_num = set->hasher(target_key) % set->num_buckets;
-    }
-    
-    int lane = tile.thread_rank();
-    int loop_count = 0;
+    if (set == nullptr) return false;
+
+    const bool valid_key = (target_key > 0);
+    const unsigned int max_probe = hash_effective_max_probes(set->num_buckets);
+    unsigned int loop_count = 0;
+    unsigned int buck_num = valid_key ? hash_probe_bucket(set->num_buckets, target_key, loop_count) : 0;
+    const int lane = tile.thread_rank();
+    bool done = !valid_key;
+    bool result = false;
     // const int MAX_PROBE_STEPS = 3;
 
-    while (loop_count <=32){ // set->num_buckets) {
-        if (tile.all(finished)) break;
+    while (loop_count <= max_probe) {
+        long int val = GPU_HASH_EMPTY_KEY;
+        if (!done) {
+            val = atomic_load_relaxed(&set->keys[buck_num * BUCKET_SIZE + lane]);
+        }
 
-        long int val = 0;
-        if (!finished) {
-            val = atomic_load_relaxed(&set->keys[buck_num * 64 + lane]);
-        }
-        bool match = (!finished && val == target_key);
-        if (tile.any(match)) {
-            found = true;
-            finished = true;
-        }
-        if (!finished) {
-            bool hit_empty = (val == set->empty_flag);
-            if (tile.any(hit_empty)) {
-                found = false;
-                finished = true;
+        const uint64_t active_mask = tile.ballot(!done);
+        if (active_mask == 0) break;
+
+        const uint64_t match_mask = tile.ballot(!done && val == target_key);
+        const uint64_t empty_mask = tile.ballot(!done && val == GPU_HASH_EMPTY_KEY);
+
+        if (match_mask != 0) {
+            result = true;
+            done = true;
+        } else if (empty_mask != 0) {
+            result = false;
+            done = true;
+        } else if (!done) {
+            loop_count++;
+            if (loop_count > max_probe) {
+                result = false;
+                done = true;
+            } else {
+                buck_num = hash_probe_bucket(set->num_buckets, target_key, loop_count);
             }
         }
-        if (!finished) {
-            buck_num = (buck_num + 1) % set->num_buckets;
-        }
-        loop_count++;
     }
-    return found; 
+    return result;
 }
 
 
@@ -3024,7 +3076,7 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
   printf("begin calcExchangePairs\n");
 #endif
   auto block = cg::this_thread_block();
-  auto tile = cg::tiled_partition<64>(block);
+  auto tile = cg::tiled_partition<KMC_HASH_TILE_SIZE>(block);
   // 初始化状态机
   AtomTx tx = {0, 0, true, false, 0};
 
@@ -4465,7 +4517,7 @@ __global__ void update_hash_set(ChangeLattice_GPU *d_buffer,int receive_len,cons
                                 long int  neighbour_local_sub_box_0,long int neighbour_local_sub_box_1,long int neighbour_local_sub_box_2
 ){
     auto block = cg::this_thread_block();
-    auto tile = cg::tiled_partition<64>(block);
+    auto tile = cg::tiled_partition<KMC_HASH_TILE_SIZE>(block);
 
     long int BCC_DBX = 2;
     int index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -4773,7 +4825,7 @@ __global__ void update_hash_set2(ChangeLattice_GPU *d_buffer,int receive_len,con
   // printf("env params:\t%ld\t%ld\t%ld ----- %ld\t%ld\t%ld\n",sub_box_lattice_size_0,sub_box_lattice_size_1,sub_box_lattice_size_2,
         // neighbour_local_sub_box_0,neighbour_local_sub_box_1,neighbour_local_sub_box_2);
   auto block = cg::this_thread_block();
-  auto tile = cg::tiled_partition<64>(block);
+  auto tile = cg::tiled_partition<KMC_HASH_TILE_SIZE>(block);
 
   long int BCC_DBX = 2;
   int index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -4854,7 +4906,7 @@ __global__ void update_hash_set2(ChangeLattice_GPU *d_buffer,int receive_len,con
     if (tiled_remove_op(g_MoMo_Hash, id, tile, need_del, g_MoMo_Hash->num_buckets) == 1) {
         need_del = false; 
     }
-    tiled_remove_op(g_V_Hash, id, tile, need_del, g_Re_Hash->num_buckets);
+    tiled_remove_op(g_V_Hash, id, tile, need_del, g_V_Hash->num_buckets);
 
     bool insert_V    = (active && type == LatticeTypes::V);
     bool insert_Re   = (active && type == LatticeTypes::Re);
@@ -5081,7 +5133,10 @@ using namespace gpuSimulate;
 
       ChangeLattice_GPU *d_buffer;
       HANDLE_HIP(hipMalloc((void**)&d_buffer,sizeof(ChangeLattice_GPU)*receive_len));
+      const double h2d_start = MPI_Wtime();
       HANDLE_HIP(hipMemcpy(d_buffer,h_buffer,sizeof(ChangeLattice_GPU)*receive_len,hipMemcpyHostToDevice));
+      gpuSimulate::comm_gpu_maintenance_profiler.h2d_time += MPI_Wtime() - h2d_start;
+      const double hash_update_start = MPI_Wtime();
       int blockSize = 128;
       int blockNum = (receive_len)/blockSize + 1;
       if (d_Global_Bitmap_Lock != nullptr && bitmap_lock_bytes > 0) {
@@ -5101,11 +5156,15 @@ using namespace gpuSimulate;
         neighbour_local_sub_box[2]
       );
       hipDeviceSynchronize();
+      gpuSimulate::comm_gpu_maintenance_profiler.hash_update_time += MPI_Wtime() - hash_update_start;
     // HANDLE_HIP(hipMemset(g_Pair_Atoms, 0xFF, pair_atoms_size * sizeof(long int)*2));
+    const double rebuild_cleanup_start = MPI_Wtime();
     hipLaunchKernelGGL(update_Pair_Atoms, 1, 1, 0, 0, pair_atoms_size
                       );
+    hipDeviceSynchronize();
     hipFree(d_buffer);
     hipHostFree(h_buffer);
+    gpuSimulate::comm_gpu_maintenance_profiler.rebuild_cleanup_time += MPI_Wtime() - rebuild_cleanup_start;
     // hipLaunchKernelGGL(update_Pair_Atoms, 1, 1, 0, 0, arr_size);
     // hipDeviceSynchronize();
 }
@@ -5120,7 +5179,10 @@ using namespace gpuSimulate;
 
     ChangeLattice_GPU *d_buffer;
     HANDLE_HIP(hipMalloc((void**)&d_buffer,sizeof(ChangeLattice_GPU)*receive_len));
+    const double h2d_start = MPI_Wtime();
     HANDLE_HIP(hipMemcpy(d_buffer,h_buffer,sizeof(ChangeLattice_GPU)*receive_len,hipMemcpyHostToDevice));
+    gpuSimulate::comm_gpu_maintenance_profiler.h2d_time += MPI_Wtime() - h2d_start;
+    const double hash_update_start = MPI_Wtime();
 
     if (d_Global_Bitmap_Lock != nullptr && bitmap_lock_bytes > 0) {
         HANDLE_HIP(hipMemset(d_Global_Bitmap_Lock, 0, bitmap_lock_bytes));
@@ -5142,13 +5204,16 @@ using namespace gpuSimulate;
       neighbour_local_sub_box[2]
     );
     hipDeviceSynchronize();
+    gpuSimulate::comm_gpu_maintenance_profiler.hash_update_time += MPI_Wtime() - hash_update_start;
     // HANDLE_HIP(hipMemset(g_Pair_Atoms, 0xFF, arr_size * sizeof(long int)));
     // HANDLE_HIP(hipMemset(g_Pair_Atoms, 0xFF, pair_atoms_size * sizeof(long int)*2));
+    const double rebuild_cleanup_start = MPI_Wtime();
     hipLaunchKernelGGL(update_Pair_Atoms, 1, 1, 0, 0, pair_atoms_size
                       );
+    hipDeviceSynchronize();
     hipFree(d_buffer);
     hipHostFree(h_buffer);
-    // hipDeviceSynchronize();
+    gpuSimulate::comm_gpu_maintenance_profiler.rebuild_cleanup_time += MPI_Wtime() - rebuild_cleanup_start;
     // // printf("------this is end print-----\n");
     // // hipLaunchKernelGGL(print_g_Pair_Atoms,1,1,0,0,arr_size);
     // hipDeviceSynchronize();
@@ -5156,6 +5221,7 @@ using namespace gpuSimulate;
 
 void transferBufferToGPU_Device(ChangeLattice_GPU *d_buffer, int receive_len, const int dimension,
                           const _type_lattice_count *sub_box_lattice_size, const _type_lattice_count *neighbour_local_sub_box, unsigned int id){
+      const double hash_update_start = MPI_Wtime();
       int blockSize = 128;
       int blockNum = (receive_len)/blockSize + 1;
       hipLaunchKernelGGL(update_hash_set, blockNum, blockSize, 0, 0, 
@@ -5171,12 +5237,17 @@ void transferBufferToGPU_Device(ChangeLattice_GPU *d_buffer, int receive_len, co
         neighbour_local_sub_box[2]
       );
       hipDeviceSynchronize();
+      gpuSimulate::comm_gpu_maintenance_profiler.hash_update_time += MPI_Wtime() - hash_update_start;
+      const double rebuild_cleanup_start = MPI_Wtime();
       hipLaunchKernelGGL(update_Pair_Atoms, 1, 1, 0, 0, pair_atoms_size
                       );
+      hipDeviceSynchronize();
+      gpuSimulate::comm_gpu_maintenance_profiler.rebuild_cleanup_time += MPI_Wtime() - rebuild_cleanup_start;
 }
 
 void transferBufferToGPU2_Device(ChangeLattice_GPU *d_buffer, int receive_len, const int dimension,
                           const _type_lattice_count *sub_box_lattice_size, const _type_lattice_count *neighbour_local_sub_box, unsigned int next_id){
+    const double hash_update_start = MPI_Wtime();
     int blockSize = 128;
     int blockNum = (receive_len)/blockSize + 1;
     hipDeviceSynchronize();
@@ -5193,8 +5264,12 @@ void transferBufferToGPU2_Device(ChangeLattice_GPU *d_buffer, int receive_len, c
       neighbour_local_sub_box[2]
     );
     hipDeviceSynchronize();
+    gpuSimulate::comm_gpu_maintenance_profiler.hash_update_time += MPI_Wtime() - hash_update_start;
+    const double rebuild_cleanup_start = MPI_Wtime();
     hipLaunchKernelGGL(update_Pair_Atoms, 1, 1, 0, 0, pair_atoms_size
                       );
+    hipDeviceSynchronize();
+    gpuSimulate::comm_gpu_maintenance_profiler.rebuild_cleanup_time += MPI_Wtime() - rebuild_cleanup_start;
 }
 
 __global__ void packChangeLatticeFromIdsKernel(const _type_lattice_id *ids, ChangeLattice_GPU *out, int n) {

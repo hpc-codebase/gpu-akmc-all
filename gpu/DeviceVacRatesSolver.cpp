@@ -5,6 +5,33 @@
 #include <unordered_set>
 #include <hip/hip_runtime.h>
 #include <iostream>
+#include <cmath>
+#include <limits>
+
+namespace {
+int compute_hash_capacity(int requested_slots) {
+    if (requested_slots <= 0) requested_slots = 1;
+    double load_factor = static_cast<double>(KMC_HASH_TARGET_LOAD_FACTOR);
+    if (!(load_factor > 0.0 && load_factor < 1.0)) {
+        std::cerr << "Invalid KMC_HASH_TARGET_LOAD_FACTOR=" << load_factor
+                  << ", fallback to 0.50" << std::endl;
+        load_factor = 0.50;
+    }
+    long long capacity = static_cast<long long>(
+        std::ceil(static_cast<double>(requested_slots) / load_factor));
+    if (capacity < BUCKET_SIZE) capacity = BUCKET_SIZE;
+    long long remainder = capacity % BUCKET_SIZE;
+    if (remainder != 0) {
+        capacity += (BUCKET_SIZE - remainder);
+    }
+    if (capacity > std::numeric_limits<int>::max()) {
+        std::cerr << "Fatal Error: GPU hash capacity exceeds int range: "
+                  << capacity << std::endl;
+        return std::numeric_limits<int>::max();
+    }
+    return static_cast<int>(capacity);
+}
+}
 
 
 // **构造函数：从 unordered_set 初始化**
@@ -12,34 +39,30 @@ HIPHashSet::HIPHashSet(const std::unordered_set<long int>& cpu_set) {
     int set_size = cpu_set.size();
     if (set_size == 0) set_size = 1;
 
-    h_table.capacity = set_size * 2;  // 保持装载因子 ~0.5
-    h_table.empty_flag = INIT_FLAG;
-    h_table.tombstone_flag = TOMBSTONE;
-
-    auto remainder = h_table.capacity % BUCKET_SIZE;
-    if (remainder) {
-        h_table.capacity += (BUCKET_SIZE - remainder);
-    }
+    h_table.capacity = compute_hash_capacity(set_size);
+    h_table.empty_flag = GPU_HASH_EMPTY_KEY;
+    h_table.tombstone_flag = GPU_HASH_TOMBSTONE_KEY;
     h_table.num_buckets = h_table.capacity / BUCKET_SIZE;
     // 初始化哈希函数,使用固定种子 2
     h_table.hasher = DeviceHasher(2);
 
     // **分配主机端数组，并初始化**
     long int* h_keys = new long int[h_table.capacity];
-    memset(h_keys, INIT_FLAG, h_table.capacity * sizeof(long int));// INIT_FLAG=-1, 但C++ 中，对于非 0 和非 -1 的数组初始化，应使用 std::fill_n
+    memset(h_keys, GPU_HASH_EMPTY_KEY, h_table.capacity * sizeof(long int));
 
     // **填充哈希表**
     for (const auto& key : cpu_set) {
-        unsigned int buck_num = h_table.hasher(key) % h_table.num_buckets;
-        int loop_count = 0;
+        unsigned int loop_count = 0;
+        const unsigned int max_probe = hash_effective_max_probes(h_table.num_buckets);
+        unsigned int buck_num = hash_probe_bucket(h_table.num_buckets, key, loop_count);
         bool inserted = false;
 
-        while (loop_count <= h_table.num_buckets) {
+        while (loop_count <= max_probe) {
             int base_index = buck_num * BUCKET_SIZE;    
             
             // 在当前桶内的 64 个槽位中找空位
             for(int i = 0; i < BUCKET_SIZE; i++) {
-                if(h_keys[base_index + i] == INIT_FLAG || h_keys[base_index + i] == TOMBSTONE) {
+                if(h_keys[base_index + i] == GPU_HASH_EMPTY_KEY || h_keys[base_index + i] == GPU_HASH_TOMBSTONE_KEY) {
                     h_keys[base_index + i] = key;
                     inserted = true;
                     break;
@@ -48,11 +71,12 @@ HIPHashSet::HIPHashSet(const std::unordered_set<long int>& cpu_set) {
             if (inserted) break; // 插入成功，处理下一个 key
 
             // 桶满了，线性探测下一个桶
-            buck_num = (buck_num + 1) % h_table.num_buckets;
             loop_count++;
+            buck_num = hash_probe_bucket(h_table.num_buckets, key, loop_count);
         }
         if (!inserted) {
-            std::cerr << "Fatal Error: CPU Hash Table is fully saturated!" << std::endl;
+            std::cerr << "Fatal Error: CPU Hash Table insertion exceeded probe limit "
+                      << max_probe << " for key " << key << std::endl;
         }
     }
 
@@ -92,34 +116,30 @@ HIPHashSet::HIPHashSet(const std::unordered_set<long int>& cpu_set,int size){
     int set_size = cpu_set.size() + size;
     if (set_size == 0) set_size = 1;
 
-    h_table.capacity = set_size * 2;  // 保持装载因子 ~0.5
-    h_table.empty_flag = INIT_FLAG;
-    h_table.tombstone_flag = TOMBSTONE;
-
-    auto remainder = h_table.capacity % BUCKET_SIZE;
-    if (remainder) {
-        h_table.capacity += (BUCKET_SIZE - remainder);
-    }
+    h_table.capacity = compute_hash_capacity(set_size);
+    h_table.empty_flag = GPU_HASH_EMPTY_KEY;
+    h_table.tombstone_flag = GPU_HASH_TOMBSTONE_KEY;
     h_table.num_buckets = h_table.capacity / BUCKET_SIZE;
 
     // **分配主机端数组，并初始化**
     long int* h_keys = new long int[h_table.capacity];
-    memset(h_keys, INIT_FLAG, h_table.capacity * sizeof(long int));
+    memset(h_keys, GPU_HASH_EMPTY_KEY, h_table.capacity * sizeof(long int));
 
     // 初始化哈希函数，使用固定种子 2
     h_table.hasher = DeviceHasher(2);
 
     for (const auto& key : cpu_set) {
-        unsigned int buck_num = h_table.hasher(key) % h_table.num_buckets;
-        int loop_count = 0;
+        unsigned int loop_count = 0;
+        const unsigned int max_probe = hash_effective_max_probes(h_table.num_buckets);
+        unsigned int buck_num = hash_probe_bucket(h_table.num_buckets, key, loop_count);
         bool inserted = false;
 
-        while (loop_count <= h_table.num_buckets) {
+        while (loop_count <= max_probe) {
             int base_index = buck_num * BUCKET_SIZE;    
             
             // 在当前桶内的 64 个槽位中找空位
             for(int i = 0; i < BUCKET_SIZE; i++) {
-                if(h_keys[base_index + i] == INIT_FLAG || h_keys[base_index + i] == TOMBSTONE) {
+                if(h_keys[base_index + i] == GPU_HASH_EMPTY_KEY || h_keys[base_index + i] == GPU_HASH_TOMBSTONE_KEY) {
                     h_keys[base_index + i] = key;
                     inserted = true;
                     break;
@@ -128,11 +148,12 @@ HIPHashSet::HIPHashSet(const std::unordered_set<long int>& cpu_set,int size){
             if (inserted) break; // 插入成功，处理下一个 key
 
             // 桶满了，线性探测下一个桶
-            buck_num = (buck_num + 1) % h_table.num_buckets;
             loop_count++;
+            buck_num = hash_probe_bucket(h_table.num_buckets, key, loop_count);
         }
         if (!inserted) {
-            std::cerr << "Fatal Error: CPU Hash Table is fully saturated!" << std::endl;
+            std::cerr << "Fatal Error: CPU Hash Table insertion exceeded probe limit "
+                      << max_probe << " for key " << key << std::endl;
         }
     }
 
@@ -172,21 +193,16 @@ HIPHashSet::HIPHashSet(const std::unordered_set<long int>& cpu_set,int size){
 // **构造函数：指定容量**
 HIPHashSet::HIPHashSet(int size) {
   // 设置容量为 size * 2，保持装载因子约 0.5
-  h_table.capacity = size * 2;
-  h_table.empty_flag = INIT_FLAG;
-  h_table.tombstone_flag = TOMBSTONE;
-
-  auto remainder = h_table.capacity % BUCKET_SIZE;
-  if (remainder) {
-    h_table.capacity += (BUCKET_SIZE - remainder);
-  }
+  h_table.capacity = compute_hash_capacity(size);
+  h_table.empty_flag = GPU_HASH_EMPTY_KEY;
+  h_table.tombstone_flag = GPU_HASH_TOMBSTONE_KEY;
   h_table.num_buckets = h_table.capacity / BUCKET_SIZE;
 
   h_table.hasher = DeviceHasher(2); // 使用固定种子 2
 
   // 分配主机端 keys 数组，并初始化为 INIT_FLAG
   long int* h_keys = new long int[h_table.capacity];
-  memset(h_keys, INIT_FLAG, h_table.capacity * sizeof(long int));
+  memset(h_keys, GPU_HASH_EMPTY_KEY, h_table.capacity * sizeof(long int));
 
   // 分配设备端 keys 数组
   hipError_t err = hipMalloc(&h_table.keys, h_table.capacity * sizeof(long int));
@@ -295,7 +311,7 @@ void HIPHashSet::copyToHost(std::unordered_set<_type_lattice_id> &cpu_hash){
     long int hash_num =0;
     cpu_hash.clear();
     for (const auto& key : keys) {
-        if (key != INIT_FLAG && key != TOMBSTONE) {
+        if (key != GPU_HASH_EMPTY_KEY && key != GPU_HASH_TOMBSTONE_KEY) {
             cpu_hash.emplace(key);  // 值设为true表示存在
            hash_num++;
         }
