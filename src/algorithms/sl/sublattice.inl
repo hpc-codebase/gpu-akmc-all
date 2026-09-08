@@ -145,6 +145,7 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
       //syncSimGohstRegionsCombine<PKs>(pk_inst, p_model->exchange_ghost, p_model->exchange_surface_x, p_model->exchange_surface_y, p_model->exchange_surface_z);
       syncNextSectorGhostRegions<PKg>(pk_inst, p_model->exchange_surface_x, p_model->exchange_surface_y, p_model->exchange_surface_z); // communicate ghost area data of next sector in
                                                 // current process. 通信当前进程中下一个扇区的重影区域数据。
+      rebuildPairAtomsAfterComm();
       // printf("finish ghost sync\n");
       time_end = MPI_Wtime() - time_start;
       time_commu_total += time_end;

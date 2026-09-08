@@ -95,6 +95,8 @@ void transferBufferToGPU_Device(ChangeLattice_GPU *d_buffer, int receive_len, co
 void transferBufferToGPU2_Device(ChangeLattice_GPU *d_buffer, int receive_len, const int dimension,
   const _type_lattice_count *sub_box_lattice_size, const _type_lattice_count *neighbour_local_sub_box, unsigned int next_id);
 
+void rebuildPairAtomsAfterComm();
+
 void packChangeLatticeFromIds_Device(const _type_lattice_id *d_ids, ChangeLattice_GPU *d_out, int n);
 
 struct CommBox {
