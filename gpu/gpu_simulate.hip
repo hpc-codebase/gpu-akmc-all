@@ -174,12 +174,26 @@ GpuCommMaintenanceProfiler getGpuCommMaintenanceProfiler() {
     return gpuSimulate::comm_gpu_maintenance_profiler;
 }
 
-void gpuCommProfileAddPackNcclRecv(double seconds) {
-    gpuSimulate::comm_gpu_maintenance_profiler.pack_nccl_recv_time += seconds;
+void gpuCommProfileAddPack(double seconds) {
+    gpuSimulate::comm_gpu_maintenance_profiler.pack_time += seconds;
 }
 
-void gpuCommProfileAddHashPostprocess(double seconds) {
-    gpuSimulate::comm_gpu_maintenance_profiler.hash_postprocess_time += seconds;
+void gpuCommProfileAddNccl(double seconds) {
+    gpuSimulate::comm_gpu_maintenance_profiler.nccl_time += seconds;
+}
+
+void gpuCommProfileAddHashOp(double seconds) {
+    gpuSimulate::comm_gpu_maintenance_profiler.hash_op_time += seconds;
+}
+
+void gpuCommProfileAddCompactSample(double seconds, bool first_of_dim) {
+    if (first_of_dim) {
+        gpuSimulate::comm_gpu_maintenance_profiler.compact_first_sum += seconds;
+        gpuSimulate::comm_gpu_maintenance_profiler.compact_first_n += 1.0;
+    } else {
+        gpuSimulate::comm_gpu_maintenance_profiler.compact_rest_sum += seconds;
+        gpuSimulate::comm_gpu_maintenance_profiler.compact_rest_n += 1.0;
+    }
 }
 
 __device__ _type_lattice_id getId(_type_lattice_size x,_type_lattice_size y,_type_lattice_size z);
@@ -5161,7 +5175,6 @@ using namespace gpuSimulate;
     const double rebuild_cleanup_start = MPI_Wtime();
     hipLaunchKernelGGL(update_Pair_Atoms, 1, 1, 0, 0, pair_atoms_size
                       );
-    hipDeviceSynchronize();
     hipFree(d_buffer);
     hipHostFree(h_buffer);
     gpuSimulate::comm_gpu_maintenance_profiler.rebuild_cleanup_time += MPI_Wtime() - rebuild_cleanup_start;
@@ -5210,7 +5223,6 @@ using namespace gpuSimulate;
     const double rebuild_cleanup_start = MPI_Wtime();
     hipLaunchKernelGGL(update_Pair_Atoms, 1, 1, 0, 0, pair_atoms_size
                       );
-    hipDeviceSynchronize();
     hipFree(d_buffer);
     hipHostFree(h_buffer);
     gpuSimulate::comm_gpu_maintenance_profiler.rebuild_cleanup_time += MPI_Wtime() - rebuild_cleanup_start;
@@ -5241,7 +5253,6 @@ void transferBufferToGPU_Device(ChangeLattice_GPU *d_buffer, int receive_len, co
       const double rebuild_cleanup_start = MPI_Wtime();
       hipLaunchKernelGGL(update_Pair_Atoms, 1, 1, 0, 0, pair_atoms_size
                       );
-      hipDeviceSynchronize();
       gpuSimulate::comm_gpu_maintenance_profiler.rebuild_cleanup_time += MPI_Wtime() - rebuild_cleanup_start;
 }
 
@@ -5268,7 +5279,6 @@ void transferBufferToGPU2_Device(ChangeLattice_GPU *d_buffer, int receive_len, c
     const double rebuild_cleanup_start = MPI_Wtime();
     hipLaunchKernelGGL(update_Pair_Atoms, 1, 1, 0, 0, pair_atoms_size
                       );
-    hipDeviceSynchronize();
     gpuSimulate::comm_gpu_maintenance_profiler.rebuild_cleanup_time += MPI_Wtime() - rebuild_cleanup_start;
 }
 

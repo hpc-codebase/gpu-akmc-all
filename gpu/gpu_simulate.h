@@ -62,19 +62,26 @@ void add_surface(_type_lattice_id& surface_id,
                  
 void output_time();
 
-// 通信耗时统计：pack+NCCL+recv 与 hash/后续 分段墙钟
+// pack+NCCL 与 hash 更新分段；pair 重建仍只统计 launch，不含等待
 struct GpuCommMaintenanceProfiler {
   double h2d_time = 0.0;
   double hash_update_time = 0.0;
   double rebuild_cleanup_time = 0.0;
-  double pack_nccl_recv_time = 0.0;
-  double hash_postprocess_time = 0.0;
+  double pack_time = 0.0;
+  double nccl_time = 0.0;
+  double hash_op_time = 0.0;
+  double compact_first_sum = 0.0;
+  double compact_rest_sum = 0.0;
+  double compact_first_n = 0.0;
+  double compact_rest_n = 0.0;
 };
 
 void resetGpuCommMaintenanceProfiler();
 GpuCommMaintenanceProfiler getGpuCommMaintenanceProfiler();
-void gpuCommProfileAddPackNcclRecv(double seconds);
-void gpuCommProfileAddHashPostprocess(double seconds);
+void gpuCommProfileAddPack(double seconds);
+void gpuCommProfileAddNccl(double seconds);
+void gpuCommProfileAddHashOp(double seconds);
+void gpuCommProfileAddCompactSample(double seconds, bool first_of_dim);
 
 __device__ LatticeTypes::lat_type getType(const long int& id);
 

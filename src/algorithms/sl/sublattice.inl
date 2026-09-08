@@ -139,7 +139,6 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
       // time_end = MPI_Wtime() - time_start;
       // time_barrier_total += time_end;
 
-      hipDeviceSynchronize();
       time_start = MPI_Wtime();
       syncSimRegions<PKs>(pk_inst, p_model->exchange_ghost, p_model->exchange_surface_x, p_model->exchange_surface_y, p_model->exchange_surface_z);
       // printf("finish surface sync\n");
@@ -170,13 +169,15 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
   if(SimulationDomain::comm_sim_pro.own_rank == 0) kiwi::logs::v(" ", " total time is : {} s. \n", local_to_total);
 
   MPI_Reduce(&time_total_end, &local_to_total, 1, MPI_DOUBLE, MPI_SUM, 0, SimulationDomain::comm_sim_pro.comm);
-  if(SimulationDomain::comm_sim_pro.own_rank == 0) kiwi::logs::v(" ", " total time is : {} s. \n", local_to_total / SimulationDomain::comm_sim_pro.all_ranks);
+  const double avg_loop_time = local_to_total / SimulationDomain::comm_sim_pro.all_ranks;
+  if(SimulationDomain::comm_sim_pro.own_rank == 0) kiwi::logs::v(" ", " total time is : {} s. \n", avg_loop_time);
 
   MPI_Reduce(&time_total_end, &local_to_total, 1, MPI_DOUBLE, MPI_MAX, 0, SimulationDomain::comm_sim_pro.comm);
   if(SimulationDomain::comm_sim_pro.own_rank == 0) kiwi::logs::v(" ", " total time is : {} s. \n", local_to_total);
   
   MPI_Reduce(&time_compute_total, &local_to_total, 1, MPI_DOUBLE, MPI_SUM, 0, SimulationDomain::comm_sim_pro.comm);
-  if(SimulationDomain::comm_sim_pro.own_rank == 0) kiwi::logs::v(" ", " compute time is : {} s. \n", local_to_total / SimulationDomain::comm_sim_pro.all_ranks);
+  const double avg_compute_time = local_to_total / SimulationDomain::comm_sim_pro.all_ranks;
+  if(SimulationDomain::comm_sim_pro.own_rank == 0) kiwi::logs::v(" ", " compute time is : {} s. \n", avg_compute_time);
 
   MPI_Reduce(&time_vac_calculate_total, &local_to_total, 1, MPI_DOUBLE, MPI_SUM, 0, SimulationDomain::comm_sim_pro.comm);
   if(SimulationDomain::comm_sim_pro.own_rank == 0) kiwi::logs::v(" ", " calcRatesWrapper time is : {} s. \n", local_to_total / SimulationDomain::comm_sim_pro.all_ranks);
@@ -199,21 +200,58 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
   // if(SimulationDomain::comm_sim_pro.own_rank == 0) kiwi::logs::v(" ", " barrier time is : {} s. \n", local_to_total / SimulationDomain::comm_sim_pro.all_ranks);
 
   double local_comm_total = 0.0;
-  double local_pack_nccl_total = 0.0;
-  double local_hash_post_total = 0.0;
+  double local_pack_total = 0.0;
+  double local_nccl_total = 0.0;
+  double local_hash_op_total = 0.0;
+  double local_hash_kernel_total = 0.0;
+  double local_pair_launch_total = 0.0;
   const GpuCommMaintenanceProfiler gpu_comm_profiler = getGpuCommMaintenanceProfiler();
-  const double pack_nccl_recv_time = gpu_comm_profiler.pack_nccl_recv_time;
-  const double hash_postprocess_time = gpu_comm_profiler.hash_postprocess_time;
+  const double pack_time = gpu_comm_profiler.pack_time;
+  const double nccl_time = gpu_comm_profiler.nccl_time;
+  const double hash_op_time = gpu_comm_profiler.hash_op_time;
+  const double hash_kernel_time = gpu_comm_profiler.hash_update_time;
+  const double pair_launch_time = gpu_comm_profiler.rebuild_cleanup_time;
+  const double compact_first_sum = gpu_comm_profiler.compact_first_sum;
+  const double compact_rest_sum = gpu_comm_profiler.compact_rest_sum;
+  const double compact_first_n = gpu_comm_profiler.compact_first_n;
+  const double compact_rest_n = gpu_comm_profiler.compact_rest_n;
+  double local_first_sum = 0.0, local_rest_sum = 0.0, local_first_n = 0.0, local_rest_n = 0.0;
   MPI_Reduce(&time_commu_total, &local_comm_total, 1, MPI_DOUBLE, MPI_SUM, 0, SimulationDomain::comm_sim_pro.comm);
-  MPI_Reduce(&pack_nccl_recv_time, &local_pack_nccl_total, 1, MPI_DOUBLE, MPI_SUM, 0, SimulationDomain::comm_sim_pro.comm);
-  MPI_Reduce(&hash_postprocess_time, &local_hash_post_total, 1, MPI_DOUBLE, MPI_SUM, 0, SimulationDomain::comm_sim_pro.comm);
+  MPI_Reduce(&pack_time, &local_pack_total, 1, MPI_DOUBLE, MPI_SUM, 0, SimulationDomain::comm_sim_pro.comm);
+  MPI_Reduce(&nccl_time, &local_nccl_total, 1, MPI_DOUBLE, MPI_SUM, 0, SimulationDomain::comm_sim_pro.comm);
+  MPI_Reduce(&hash_op_time, &local_hash_op_total, 1, MPI_DOUBLE, MPI_SUM, 0, SimulationDomain::comm_sim_pro.comm);
+  MPI_Reduce(&hash_kernel_time, &local_hash_kernel_total, 1, MPI_DOUBLE, MPI_SUM, 0, SimulationDomain::comm_sim_pro.comm);
+  MPI_Reduce(&pair_launch_time, &local_pair_launch_total, 1, MPI_DOUBLE, MPI_SUM, 0, SimulationDomain::comm_sim_pro.comm);
+  MPI_Reduce(&compact_first_sum, &local_first_sum, 1, MPI_DOUBLE, MPI_SUM, 0, SimulationDomain::comm_sim_pro.comm);
+  MPI_Reduce(&compact_rest_sum, &local_rest_sum, 1, MPI_DOUBLE, MPI_SUM, 0, SimulationDomain::comm_sim_pro.comm);
+  MPI_Reduce(&compact_first_n, &local_first_n, 1, MPI_DOUBLE, MPI_SUM, 0, SimulationDomain::comm_sim_pro.comm);
+  MPI_Reduce(&compact_rest_n, &local_rest_n, 1, MPI_DOUBLE, MPI_SUM, 0, SimulationDomain::comm_sim_pro.comm);
   if(SimulationDomain::comm_sim_pro.own_rank == 0) {
-    const double avg_comm_total = local_comm_total / SimulationDomain::comm_sim_pro.all_ranks;
-    const double avg_pack_nccl = local_pack_nccl_total / SimulationDomain::comm_sim_pro.all_ranks;
-    const double avg_hash_post = local_hash_post_total / SimulationDomain::comm_sim_pro.all_ranks;
+    const double nrank = static_cast<double>(SimulationDomain::comm_sim_pro.all_ranks);
+    const double avg_comm_total = local_comm_total / nrank;
+    const double avg_pack = local_pack_total / nrank;
+    const double avg_nccl = local_nccl_total / nrank;
+    const double avg_hash_op = local_hash_op_total / nrank;
+    const double avg_hash_kernel = local_hash_kernel_total / nrank;
+    const double avg_pair_launch = local_pair_launch_total / nrank;
+    const double avg_async_tail = (avg_loop_time > avg_compute_time + avg_comm_total)
+                                      ? (avg_loop_time - avg_compute_time - avg_comm_total)
+                                      : 0.0;
+    const double avg_compact_rest = (local_rest_n > 0.0) ? (local_rest_sum / local_rest_n) : 0.0;
+    const double avg_pair_wait_in_pack = (local_first_n > 0.0 && local_rest_n > 0.0)
+        ? ((local_first_sum - avg_compact_rest * local_first_n) / nrank)
+        : 0.0;
+    const double pair_wait_clamped = (avg_pair_wait_in_pack > 0.0) ? avg_pair_wait_in_pack : 0.0;
+    const double avg_pack_only = (avg_pack > pair_wait_clamped) ? (avg_pack - pair_wait_clamped) : 0.0;
     kiwi::logs::v(" ", " communicate time is : {} s. \n", avg_comm_total);
-    kiwi::logs::v(" ", " >>> [Performance] communicate pack+NCCL+recv time is : {} s. \n", avg_pack_nccl);
-    kiwi::logs::v(" ", " >>> [Performance] communicate hash update and post-process time is : {} s. \n", avg_hash_post);
+    kiwi::logs::v(" ", " >>> [Performance] pack/compact total is : {} s. \n", avg_pack);
+    kiwi::logs::v(" ", " >>> [Performance] pack/compact only (subtract previous-pair wait) is : {} s. \n", avg_pack_only);
+    kiwi::logs::v(" ", " >>> [Performance] wait previous async pair (inside pack, first compact minus later compact) is : {} s. \n", pair_wait_clamped);
+    kiwi::logs::v(" ", " >>> [Performance] NCCL/MPI send-recv is : {} s. \n", avg_nccl);
+    kiwi::logs::v(" ", " >>> [Performance] hash update (from update_hash_set/2 through pair launch+forward) is : {} s. \n", avg_hash_op);
+    kiwi::logs::v(" ", " >>> [Performance] hash kernel only (update_hash_set/2 + existing device sync) is : {} s. \n", avg_hash_kernel);
+    kiwi::logs::v(" ", " >>> [Performance] pair rebuild launch only (async, no wait) is : {} s. \n", avg_pair_launch);
+    kiwi::logs::v(" ", " >>> [Performance] async leftover outside communicate (total-compute-communicate, mainly last pair wait) is : {} s. \n", avg_async_tail);
   }
 
   if (gpu_comm_profile_enabled()) {
@@ -516,7 +554,7 @@ template <class PKs, class Ins> void SubLattice::syncSimRegions(Ins &pk_inst, st
     //     dim_id = DIMENSION_SIZE - 1 - d;
     // }
     // dim_id = comm::DIMENSION_SIZE - 1 - d;
-    const double pack_nccl_t0 = MPI_Wtime();
+    const double pack_t0 = MPI_Wtime();
 
     if (gpu_comm_enabled()) {
       static ChangeLattice_GPU *d_payload = nullptr;
@@ -541,12 +579,16 @@ template <class PKs, class Ins> void SubLattice::syncSimRegions(Ins &pk_inst, st
 
       int h_counts[4] = {0, 0, 0, 0};
       int total_ids = 0;
+      bool compact_first = true;
       for (int bi = 0; bi < nb; bi++) {
         if (static_cast<size_t>(d_tmp_ids_cap) == 0) {
           d_tmp_ids_cap = static_cast<size_t>(commGhostCapacity());
           hipMalloc(reinterpret_cast<void**>(&d_tmp_ids), d_tmp_ids_cap * sizeof(long int));
         }
+        const double compact_t0 = MPI_Wtime();
         commCompactGhostBucket(buckets[bi], d_tmp_ids, d_tmp_count);
+        gpuCommProfileAddCompactSample(MPI_Wtime() - compact_t0, compact_first);
+        compact_first = false;
         hipMemcpy(&h_counts[bi], d_tmp_count, sizeof(int), hipMemcpyDeviceToHost);
         total_ids += h_counts[bi];
       }
@@ -570,7 +612,9 @@ template <class PKs, class Ins> void SubLattice::syncSimRegions(Ins &pk_inst, st
       for (int bi = 0; bi < nb; bi++) {
         int cnt = h_counts[bi];
         if (cnt <= 0) continue;
+        const double compact_t0 = MPI_Wtime();
         commCompactGhostBucket(buckets[bi], d_tmp_ids, d_tmp_count);
+        gpuCommProfileAddCompactSample(MPI_Wtime() - compact_t0, false);
         packChangeLatticeFromIds_Device(reinterpret_cast<_type_lattice_id*>(d_tmp_ids), d_payload + offset, cnt);
         offset += cnt;
       }
@@ -585,6 +629,8 @@ template <class PKs, class Ins> void SubLattice::syncSimRegions(Ins &pk_inst, st
 
     int &numsend = num_send[dim_id];
     int numrecv = 0;
+    gpuCommProfileAddPack(MPI_Wtime() - pack_t0);
+    const double nccl_t0 = MPI_Wtime();
 
     if (gpu_comm_enabled()) {
       gpu_comm_send_recv_default(&numsend, 1, &numrecv, 1, sizeof(int), ranks_send[dim_id], ranks_recv[dim_id],
@@ -607,9 +653,8 @@ template <class PKs, class Ins> void SubLattice::syncSimRegions(Ins &pk_inst, st
       MPI_Wait(&send_requests[dim_id], &send_statuses[dim_id]);
       MPI_Wait(&recv_requests[dim_id], &recv_statuses[dim_id]);
     }
-    hipDeviceSynchronize();
-    gpuCommProfileAddPackNcclRecv(MPI_Wtime() - pack_nccl_t0);
-    const double hash_post_t0 = MPI_Wtime();
+    gpuCommProfileAddNccl(MPI_Wtime() - nccl_t0);
+    const double hash_op_t0 = MPI_Wtime();
     //将接收到的数据存到_lattices中，也就是更新全局的lattices信息
     // int receive_len = recv_regions[dim_id];
     // printf("start transfer\n");
@@ -628,8 +673,7 @@ template <class PKs, class Ins> void SubLattice::syncSimRegions(Ins &pk_inst, st
                         p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, cur_sector.id, 
                         exchange_surface_x, exchange_surface_y, exchange_surface_z, p_domain);
     }
-    hipDeviceSynchronize();
-    gpuCommProfileAddHashPostprocess(MPI_Wtime() - hash_post_t0);
+    gpuCommProfileAddHashOp(MPI_Wtime() - hash_op_t0);
 
     // release buffer
     //if(num_send[dim_id] > 0) delete[] send_buff;
@@ -725,7 +769,7 @@ template <class PKg, class Ins> void SubLattice::syncNextSectorGhostRegions(Ins 
 
   for (int d = 0; d < comm::DIMENSION_SIZE; d++) {
     int dim_id = d;
-    const double pack_nccl_t0 = MPI_Wtime();
+    const double pack_t0 = MPI_Wtime();
     // prepare data
     // note: the direction in sendLength, onSend and onReceive are not used (ignored).
     num_send[dim_id] = packer.sendLength2(dim_id, exchange_surface_x[next_sector.id], exchange_surface_y[next_sector.id], exchange_surface_z[next_sector.id]);
@@ -746,7 +790,9 @@ template <class PKg, class Ins> void SubLattice::syncNextSectorGhostRegions(Ins 
       }
 
       const int bucket = static_cast<int>(next_sector.id) * 3 + dim_id;
+      const double compact_t0 = MPI_Wtime();
       commCompactSurfaceBucket(bucket, d_tmp_ids, d_tmp_count);
+      gpuCommProfileAddCompactSample(MPI_Wtime() - compact_t0, true);
       int h_count = 0;
       hipMemcpy(&h_count, d_tmp_count, sizeof(int), hipMemcpyDeviceToHost);
 
@@ -769,6 +815,8 @@ template <class PKg, class Ins> void SubLattice::syncNextSectorGhostRegions(Ins 
     // send and received data.
     int &numsend = num_send[dim_id];
     int numrecv = 0;
+    gpuCommProfileAddPack(MPI_Wtime() - pack_t0);
+    const double nccl_t0 = MPI_Wtime();
     if (gpu_comm_enabled()) {
       gpu_comm_send_recv_default(&numsend, 1, &numrecv, 1, sizeof(int), ranks_send[dim_id], ranks_recv[dim_id],
                                  SimulationDomain::comm_sim_pro.comm);
@@ -790,11 +838,10 @@ template <class PKg, class Ins> void SubLattice::syncNextSectorGhostRegions(Ins 
       MPI_Wait(&send_requests[dim_id], &send_statuses[dim_id]);
       MPI_Wait(&recv_requests[dim_id], &recv_statuses[dim_id]);
     }
-    hipDeviceSynchronize();
-    gpuCommProfileAddPackNcclRecv(MPI_Wtime() - pack_nccl_t0);
-    const double hash_post_t0 = MPI_Wtime();
+    gpuCommProfileAddNccl(MPI_Wtime() - nccl_t0);
 
     int receive_len = num_receive[dim_id];
+    const double hash_op_t0 = MPI_Wtime();
 
     // printf("ghost dim id is %d,next_sector.id: %d\n",dim_id,next_sector.id);
     // for(int i=0;i<num_receive[dim_id];i++)
@@ -810,8 +857,7 @@ template <class PKg, class Ins> void SubLattice::syncNextSectorGhostRegions(Ins 
       packer.onReceive2(receive_buff, num_receive[dim_id], dim_id, exchange_surface_x, exchange_surface_y, exchange_surface_z,
                   p_domain->sub_box_lattice_size, p_domain->neighbour_local_sub_box, next_sector.id, p_domain);
     }
-    hipDeviceSynchronize();
-    gpuCommProfileAddHashPostprocess(MPI_Wtime() - hash_post_t0);
+    gpuCommProfileAddHashOp(MPI_Wtime() - hash_op_t0);
 
     //在这里把receive_buff传给GPU
     //然后让gpu去更新gpu端的hashset
