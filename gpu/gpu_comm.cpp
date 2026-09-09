@@ -288,6 +288,9 @@ void gpu_comm_send_recv_device_default(const void* send_dev, size_t send_bytes,
 #else
 
 bool gpu_comm_enabled() { return false; }
+bool gpu_comm_profile_enabled() { return false; }
+GpuCommProfileStats gpu_comm_profile_get_stats() { return {}; }
+void gpu_comm_profile_reset() {}
 void gpu_comm_init(MPI_Comm) {}
 void gpu_comm_finalize() {}
 void gpu_comm_sanity_allreduce(MPI_Comm) {}

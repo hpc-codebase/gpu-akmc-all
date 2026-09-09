@@ -1824,6 +1824,17 @@ __global__ void compactHashSetKernel(GPUHashSet *set, long int *out, int *out_co
   out[pos] = key;
 }
 
+__global__ void compactHashSetBoundedKernel(GPUHashSet *set, long int *out, int *out_count, int max_out) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (!set || !out || !out_count) return;
+  if (i >= set->capacity) return;
+  long int key = set->keys[i];
+  if (key == set->empty_flag || key == set->tombstone_flag) return;
+  int pos = atomicAdd(out_count, 1);
+  if (pos < 0 || pos >= max_out) return;
+  out[pos] = key;
+}
+
 void commSetGhostRegions(const comm::Region<comm::_type_lattice_size> *ghost_region, int n) {
   if (!ghost_region) return;
   if (n <= 0) return;
@@ -3265,6 +3276,16 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
             // if(tx.op_type == 2) cur_type = LatticeTypes::MoRe;
             tx.src_id = id = random_id; // ID 同步更新    
             if(tx.op_type == 2 || tx.op_type == 4) cur_type = LatticeTypes::MoRe;
+            // op 1–4 成功后间隙对都在 dest：仍在本扇区且非 ghost 写新 ID，否则写 -1。
+            // 捕获 / 抢锁失败 / 事务失败不进这里，名单保持原 ID。
+            const bool dest_in_sector = (x_min <= x && x < x_max &&
+                                         y_min <= y && y < y_max &&
+                                         z_min <= z && z < z_max);
+            if (dest_in_sector && !isGhostLat(random_id)) {
+              g_Pair_Atoms[tid] = random_id;
+            } else {
+              g_Pair_Atoms[tid] = -1;
+            }
           }
           tx.active = false;
         }
@@ -5261,8 +5282,38 @@ void transferBufferToGPU2_Device(ChangeLattice_GPU *d_buffer, int receive_len, c
 void rebuildPairAtomsAfterComm() {
   using namespace gpuSimulate;
   if (pair_atoms_size <= 0) return;
+  if (!d_Pair_Atoms) return;
+  if (!MoMo_Hash && !MoRe_Hash) return;
+
   const double rebuild_cleanup_start = MPI_Wtime();
-  hipLaunchKernelGGL(update_Pair_Atoms, 1, 1, 0, 0, pair_atoms_size);
+
+  static int *d_pair_compact_count = nullptr;
+  if (!d_pair_compact_count) {
+    HANDLE_HIP(hipMalloc(reinterpret_cast<void**>(&d_pair_compact_count), sizeof(int)));
+  }
+
+  const int max_out = static_cast<int>(pair_atoms_size);
+  HANDLE_HIP(hipMemset(d_Pair_Atoms, 0xFF, static_cast<size_t>(pair_atoms_size) * sizeof(long int)));
+  HANDLE_HIP(hipMemset(d_pair_compact_count, 0, sizeof(int)));
+
+  const int blockSize = 256;
+  if (MoMo_Hash && MoMo_Hash->device_ptr()) {
+    const int cap = MoMo_Hash->get_capacity();
+    const int grid = (cap + blockSize - 1) / blockSize;
+    if (grid > 0) {
+      hipLaunchKernelGGL(compactHashSetBoundedKernel, grid, blockSize, 0, 0,
+                         MoMo_Hash->device_ptr(), d_Pair_Atoms, d_pair_compact_count, max_out);
+    }
+  }
+  if (MoRe_Hash && MoRe_Hash->device_ptr()) {
+    const int cap = MoRe_Hash->get_capacity();
+    const int grid = (cap + blockSize - 1) / blockSize;
+    if (grid > 0) {
+      hipLaunchKernelGGL(compactHashSetBoundedKernel, grid, blockSize, 0, 0,
+                         MoRe_Hash->device_ptr(), d_Pair_Atoms, d_pair_compact_count, max_out);
+    }
+  }
+
   hipDeviceSynchronize();
   gpuSimulate::comm_gpu_maintenance_profiler.rebuild_cleanup_time += MPI_Wtime() - rebuild_cleanup_start;
 }
