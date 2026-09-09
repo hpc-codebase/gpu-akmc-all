@@ -263,30 +263,27 @@ static bool shouldPrintGpuBindDebug(int process_rank, int local_rank) {
 // 针对双目标 (calcExchangePairs 用)
 template <typename TileType>
 __device__ void resolve_intra_tile_conflicts(AtomTx& tx, TileType tile) {
-    if (!tx.active || tx.op_type == 0) return;
     int my_rank = tile.thread_rank();
     bool conflict = false;
+    const bool me_can_conflict = tx.active && tx.op_type != 0;
 
     for (int i = 0; i < tile.size(); ++i) {
         long int other_src = (long int)tile.shfl((unsigned long long int)tx.src_id, i);
         long int other_dst = (long int)tile.shfl((unsigned long long int)tx.dst_id, i);
-        // int other_op       = tile.shfl(tx.op_type, i);
         bool other_active  = tile.shfl(tx.active, i);
+        int other_op       = tile.shfl(tx.op_type, i);
 
-        if (other_active && i != my_rank) {
-            // if (tx.dst_id == other_dst && my_rank > i) conflict = true;  // 冲突 1：两个线程抢同一个目的地。Rank小的去，大的取消操作
-            // if (tx.dst_id == other_src || tx.src_id == other_dst) conflict = true;
-             bool overlap = (tx.dst_id == other_dst) || 
-                           (tx.dst_id == other_src) || 
-                           (tx.src_id == other_dst) || 
+        if (me_can_conflict && other_active && other_op != 0 && i != my_rank) {
+             bool overlap = (tx.dst_id == other_dst) ||
+                           (tx.dst_id == other_src) ||
+                           (tx.src_id == other_dst) ||
                            (tx.src_id == other_src);
-            // 永远只让 Rank 大的那个退让！
             if (overlap && my_rank > i) {
                 conflict = true;
             }
         }
     }
-    if (conflict) tx.op_type = 0; 
+    if (conflict) tx.op_type = 0;
 }
 
 // 针对单目标 (update_hash_set 用)
@@ -3160,10 +3157,10 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
         
         // 统一更新出界状态
         if (tx.active) {
-          bool in_bounds = (x_min <= x && x < x_max && 
-                            y_min <= y && y < y_max && 
+          bool in_bounds = (x_min <= x && x < x_max &&
+                            y_min <= y && y < y_max &&
                             z_min <= z && z < z_max);
-          if (!in_bounds || loop_index >= 10) {
+          if (!in_bounds) {
             tx.active = false;
           }
         }
@@ -3188,20 +3185,13 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
         _type_lattice_id random_id = 0;
         if (tx.active) {
             int sum = tid + id + loop_index;
-            int randomNumber = (sum % 14 + 14) % 14; 
+            int randomNumber = (sum % 14 + 14) % 14;
             getRandomLattice(x, y, z, temp_x, temp_y, temp_z, randomNumber);
             random_id = getId(temp_x, temp_y, temp_z);
         }
-        //----组内冲突拦截----
-        resolve_intra_tile_conflicts(tx, tile);
-        // --- 全组协作查目标点类型 ---
-        // LatticeTypes::lat_type rand_type = tiled_get_type(random_id, tile, tx.active);
-        //单线程查random_type
         LatticeTypes::lat_type rand_type = tx.active? getType(random_id):(LatticeTypes::Mo);
 
-        // --- 判断反应类型 (无哈希操作) ---
         if (tx.active) {
-            // printf("[Thread %d] My ID is %ld, and my rand_type is: %d\n", threadIdx.x, random_id, rand_type);
             if (rand_type == LatticeTypes::Mo || rand_type == LatticeTypes::Re) {
                 bool flag1 = (numRe == 0);
                 bool flag2 = false;
@@ -3210,23 +3200,14 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
                     flag2 = (ranmov > (static_cast<double>(numRe) / 8.0));
                 }
                 tx.op_type = decide_op_type(cur_type, rand_type, flag1 || flag2);
-                tx.dst_id = random_id; 
+                tx.dst_id = random_id;
             } else {
                 tx.op_type = 0;
             }
-            // printf("[Thread %d] op_type======: %d\n", threadIdx.x,tx.op_type);
-            //  if (tx.op_type != 0) {
-            //   // 打印：操作类型 | 起点ID(类型) -> 终点ID(类型)
-            //   printf("🔥[OP VERIFY] Type:%d | Src:%ld(Hex:%x) -> Dst:%ld(Hex:%x)\n", 
-            //         tx.op_type, 
-            //         tx.src_id, cur_type, 
-            //         tx.dst_id, rand_type);
-            //   }
         } else {
             tx.op_type = 0;
         }
-        // //----组内冲突拦截----
-        // resolve_intra_tile_conflicts(tx, tile);
+        resolve_intra_tile_conflicts(tx, tile);
         //----加锁----
         bool locks_acquired = false;
         if (tx.active && tx.op_type != 0) {
@@ -3265,19 +3246,14 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
             release_bitmap_locks(tx.src_id, tx.dst_id);
         }
         //----更新状态----
-        if (tx.active && tx.op_type != 0) {     
-          if (tx.success) {
+        // 对齐 original recb_solver：成功换格后继续在本 while 里跳，直到抓住或出扇区。
+        // 抓住 / 出界只关 active，全组走完 tile 集体操作后由 ballot 一起 break，不能 return。
+        if (tx.active && tx.op_type != 0 && tx.success) {
             x = temp_x;
             y = temp_y;
             z = temp_z;
-            // ??? 如果发生了移动，更新 tx.src_id 和 cur_type???
-            // tx.src_id = getId(x, y, z);
-            // id = tx.src_id;
-            // if(tx.op_type == 2) cur_type = LatticeTypes::MoRe;
-            tx.src_id = id = random_id; // ID 同步更新    
+            tx.src_id = id = random_id;
             if(tx.op_type == 2 || tx.op_type == 4) cur_type = LatticeTypes::MoRe;
-            // op 1–4 成功后间隙对都在 dest：仍在本扇区且非 ghost 写新 ID，否则写 -1。
-            // 捕获 / 抢锁失败 / 事务失败不进这里，名单保持原 ID。
             const bool dest_in_sector = (x_min <= x && x < x_max &&
                                          y_min <= y && y < y_max &&
                                          z_min <= z && z < z_max);
@@ -3285,22 +3261,10 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
               g_Pair_Atoms[tid] = random_id;
             } else {
               g_Pair_Atoms[tid] = -1;
+              tx.active = false;
             }
-          }
-          tx.active = false;
         }
-
-        if (tx.active && tx.op_type != 0) {     
-          if (tx.success) {
-            id = random_id;
-            x = temp_x; y = temp_y; z = temp_z;
-            tx.src_id = id;
-            if(tx.op_type == 2 || tx.op_type == 4) cur_type = LatticeTypes::MoRe;
-            tx.active = false; 
-          } else {
-            tx.op_type = 0; 
-          }
-        }
+        tx.op_type = 0;
     }
 }
 
