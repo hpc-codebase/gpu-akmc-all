@@ -36,6 +36,14 @@ __device__ unsigned long long int* g_Global_Bitmap_Lock;//哈希表的全局位�
 static long int arr_size;
 static long int pair_atoms_size;
 
+struct RecbVerifyStats {
+  unsigned long long hops;
+  unsigned int max_hops;
+  unsigned int multi_hop_pairs;
+  unsigned int captured_no_move;
+  unsigned int sector_pairs;
+};
+
 namespace cg = cooperative_groups;
 //这些都是GPU内部的全局变量
 namespace gpuSimulate {
@@ -111,6 +119,7 @@ namespace gpuSimulate {
     long int *Pair_Atoms;
     long int *d_Pair_Atoms;
     dev_meta *d_meta;
+    RecbVerifyStats *d_recb_verify_stats = nullptr;
 
     unsigned long long int* d_Global_Bitmap_Lock = nullptr;
     size_t bitmap_lock_bytes = 0;
@@ -3092,7 +3101,7 @@ __device__ void tiled_check_neighbors_single(_type_lattice_size x, _type_lattice
         }
     }
 }
-__global__ void calcExchangePairs(int sector_id,int arr_size
+__global__ void calcExchangePairs(int sector_id,int arr_size, RecbVerifyStats *stats
 ){
   #if KMC_RECB_DEVICE_PRINTF
   printf("begin calcExchangePairs\n");
@@ -3147,7 +3156,20 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
   const long int y_min = g_meta->regions[sector_id * 6 + 2];
   const long int y_max = g_meta->regions[sector_id * 6 + 3];
   const long int z_min = g_meta->regions[sector_id * 6 + 4];
-  const long int z_max = g_meta->regions[sector_id * 6 + 5]; 
+  const long int z_max = g_meta->regions[sector_id * 6 + 5];
+
+  int my_hops = 0;
+  int started_in_sector = 0;
+  int captured_no_move = 0;
+  if (tx.active) {
+    const bool in0 = (x_min <= x && x < x_max &&
+                      y_min <= y && y < y_max &&
+                      z_min <= z && z < z_max);
+    if (in0) {
+      started_in_sector = 1;
+      if (stats) atomicAdd(&stats->sector_pairs, 1u);
+    }
+  }
 
   _type_lattice_size temp_x, temp_y, temp_z; 
   int loop_index = 0;
@@ -3176,8 +3198,13 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
         if (tx.active) {
           tiled_check_neighbors_single(x, y, z, numSIA, numRe); //单线程查
           // printf("[checkThread %d]numSIA= %d, numRe=%d,and my cur_type is: %d\n", threadIdx.x, numSIA, numRe,cur_type);
-          if (numSIA >= 2) tx.active = false;
-          else if (cur_type == LatticeTypes::MoRe && numRe >= 5) tx.active = false;
+          if (numSIA >= 2) {
+            if (my_hops == 0) captured_no_move = 1;
+            tx.active = false;
+          } else if (cur_type == LatticeTypes::MoRe && numRe >= 5) {
+            if (my_hops == 0) captured_no_move = 1;
+            tx.active = false;
+          }
         }
        
         // --- 计算随机跳跃目标 ---
@@ -3254,6 +3281,7 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
             z = temp_z;
             tx.src_id = id = random_id;
             if(tx.op_type == 2 || tx.op_type == 4) cur_type = LatticeTypes::MoRe;
+            my_hops++;
             const bool dest_in_sector = (x_min <= x && x < x_max &&
                                          y_min <= y && y < y_max &&
                                          z_min <= z && z < z_max);
@@ -3265,6 +3293,12 @@ __global__ void calcExchangePairs(int sector_id,int arr_size
             }
         }
         tx.op_type = 0;
+    }
+    if (stats && started_in_sector) {
+      if (my_hops > 0) atomicAdd(&stats->hops, (unsigned long long)my_hops);
+      atomicMax(&stats->max_hops, (unsigned int)my_hops);
+      if (my_hops >= 2) atomicAdd(&stats->multi_hop_pairs, 1u);
+      if (captured_no_move) atomicAdd(&stats->captured_no_move, 1u);
     }
 }
 
@@ -3882,13 +3916,34 @@ void recb_solver_GPU(
     // printf("arr size is %ld\n",pair_atoms_size);
     // hipLaunchKernelGGL(print_Hash_and_Pair, 1, 1, 0, 0,arr_size,0);
   
+    if (!d_recb_verify_stats) {
+      HANDLE_HIP(hipMalloc(reinterpret_cast<void**>(&d_recb_verify_stats), sizeof(RecbVerifyStats)));
+    }
+    HANDLE_HIP(hipMemset(d_recb_verify_stats, 0, sizeof(RecbVerifyStats)));
+
     if (do_profile) HANDLE_HIP(hipEventRecord(recb_evt_begin, 0));
     hipLaunchKernelGGL(calcExchangePairs, numBlocks, blockSize, 0, 0,
-                      sector_id,pair_atoms_size
+                      sector_id,pair_atoms_size, d_recb_verify_stats
                       );
     CHECK_FOR_ERROR();
     hipDeviceSynchronize();
     if (do_profile) HANDLE_HIP(hipEventRecord(recb_evt_after_exchange, 0));
+
+    {
+      static int recb_launch_by_sector[8] = {};
+      const unsigned int sid = sector_id < 8 ? sector_id : 0;
+      recb_launch_by_sector[sid]++;
+      const int launch_n = recb_launch_by_sector[sid];
+      int recb_rank = 0;
+      MPI_Comm_rank(MPI_COMM_WORLD, &recb_rank);
+      if (recb_rank == 0 && launch_n <= 5) {
+        RecbVerifyStats h_stats{};
+        HANDLE_HIP(hipMemcpy(&h_stats, d_recb_verify_stats, sizeof(RecbVerifyStats), hipMemcpyDeviceToHost));
+        kiwi::logs::v(" ", " [recb-verify] sect={} launch={} sector_pairs={} hops={} max_hops_one_pair={} pairs_multi_hop={} pairs_captured_no_move={}.\n",
+                      sid, launch_n, h_stats.sector_pairs, h_stats.hops, h_stats.max_hops,
+                      h_stats.multi_hop_pairs, h_stats.captured_no_move);
+      }
+    }
     // print_momo_and_more
     //  hipLaunchKernelGGL(print_momo_and_more, 1, 1, 0, 0
                       
@@ -4402,6 +4457,10 @@ if (d_Global_Bitmap_Lock != nullptr) {
   HANDLE_HIP(hipFree(d_ghost_count));
 
   hipFree(d_Pair_Atoms);
+  if (d_recb_verify_stats) {
+    HANDLE_HIP(hipFree(d_recb_verify_stats));
+    d_recb_verify_stats = nullptr;
+  }
 
 
   // hipHostFree(Pair_Atoms);
