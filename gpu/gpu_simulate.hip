@@ -3,9 +3,14 @@
 #include <cstdlib>
 #include <mpi.h>
 
-// #include <hiprand_kernel.h>
+#include <hiprand/hiprand_kernel.h>
 #ifndef KMC_RECB_DEVICE_PRINTF
 #define KMC_RECB_DEVICE_PRINTF 0
+#endif
+
+// recb 随机游走保险丝：单 walker 最大跳跃数（正常捕获中位数 ~6e3，1e5 约为均值 10 倍，正常不会触发）
+#ifndef KMC_RECB_MAX_HOPS
+#define KMC_RECB_MAX_HOPS 100000
 #endif
 
 // #define const int MAX_PROBE_STEPS = 3
@@ -32,6 +37,7 @@ __device__ static CommBox *g_comm_surface_boxes;
 __device__ static int *g_comm_surface_offsets;
 __device__ static long int  *g_Pair_Atoms;
 __device__ unsigned long long int* g_Global_Bitmap_Lock;//哈希表的全局位图锁
+__device__ static hiprandStatePhilox4_32_10_t *g_rng_states;//每个 walker 线程一条独立持久的随机数流
 
 static long int arr_size;
 static long int pair_atoms_size;
@@ -42,6 +48,7 @@ struct RecbVerifyStats {
   unsigned int multi_hop_pairs;
   unsigned int captured_no_move;
   unsigned int sector_pairs;
+  unsigned int capped_walks; // 触发 KMC_RECB_MAX_HOPS 保险丝的 walker 数（正常应恒为 0）
 };
 
 namespace cg = cooperative_groups;
@@ -120,6 +127,8 @@ namespace gpuSimulate {
     long int *d_Pair_Atoms;
     dev_meta *d_meta;
     RecbVerifyStats *d_recb_verify_stats = nullptr;
+    hiprandStatePhilox4_32_10_t *d_rng_states = nullptr;
+    long int rng_states_count = 0;
 
     unsigned long long int* d_Global_Bitmap_Lock = nullptr;
     size_t bitmap_lock_bytes = 0;
@@ -1737,7 +1746,8 @@ __global__ void setGlobalPointer(dev_meta *meta,
                             GPUHashSet *Re_Hash,GPUHashSet *V_Hash,GPUHashSet *Busy_Set_Hash,
                             GPUHashSet *surface_Hash,GPUHashSet *ghost_Hash,
                             long int *Pair_Atoms,
-                            unsigned long long int* d_bitmap_lock
+                            unsigned long long int* d_bitmap_lock,
+                            hiprandStatePhilox4_32_10_t *rng_states
                             ){
   if (threadIdx.x == 0 && blockIdx.x == 0) {
   g_meta = meta;
@@ -1752,11 +1762,21 @@ __global__ void setGlobalPointer(dev_meta *meta,
   g_ghost_Hash = ghost_Hash;
   g_Pair_Atoms = Pair_Atoms;
   g_Global_Bitmap_Lock = d_bitmap_lock;
-  
+  g_rng_states = rng_states;
+
     // printHashTableKernel(g_MoMo_Hash,200,false);
     // printDevMetaKernel(g_meta);
 
-   
+
+  }
+}
+
+// 每个 walker 线程初始化一条独立的 Philox 随机数流：
+// 同一 seed + 子序列号 tid => 各流互相独立且整跑可复现；整个模拟只调用一次。
+__global__ void initRngStates(long int n, unsigned long long seed) {
+  long int tid = blockIdx.x * (long int)blockDim.x + threadIdx.x;
+  if (tid < n) {
+    hiprand_init(seed, (unsigned long long)tid, 0, &g_rng_states[tid]);
   }
 }
 
@@ -3174,9 +3194,16 @@ __global__ void calcExchangePairs(int sector_id,int arr_size, RecbVerifyStats *s
   _type_lattice_size temp_x, temp_y, temp_z; 
   int loop_index = 0;
 
-  while (true) { 
+  while (true) {
         loop_index++;
-        
+
+        // 保险丝：单 walker 跳跃数上限（正常捕获中位数 ~6e3，1e5 约均值 10 倍，正常不会触发）。
+        // 触发仅意味着 walker 本次事件提前停下，g_Pair_Atoms 保留，下一事件照常重走。
+        if (tx.active && loop_index >= KMC_RECB_MAX_HOPS) {
+          tx.active = false;
+          if (stats) atomicAdd(&stats->capped_walks, 1u);
+        }
+
         // 统一更新出界状态
         if (tx.active) {
           bool in_bounds = (x_min <= x && x < x_max &&
@@ -3211,8 +3238,9 @@ __global__ void calcExchangePairs(int sector_id,int arr_size, RecbVerifyStats *s
         _type_lattice_size temp_x = 0, temp_y = 0, temp_z = 0;
         _type_lattice_id random_id = 0;
         if (tx.active) {
-            int sum = tid + id + loop_index;
-            int randomNumber = (sum % 14 + 14) % 14;
+            // 每线程持久 Philox 流：方向与 walker 处境解耦，每步都是新骰子
+            int randomNumber = (int)(hiprand_uniform(&g_rng_states[tid]) * 14.0f);
+            if (randomNumber > 13) randomNumber = 13; // hiprand_uniform 返回 (0,1]，防边界
             getRandomLattice(x, y, z, temp_x, temp_y, temp_z, randomNumber);
             random_id = getId(temp_x, temp_y, temp_z);
         }
@@ -3223,7 +3251,7 @@ __global__ void calcExchangePairs(int sector_id,int arr_size, RecbVerifyStats *s
                 bool flag1 = (numRe == 0);
                 bool flag2 = false;
                 if (numRe > 0 && numRe < LatticesList::MAX_1NN) {
-                    double ranmov = randomFloat(tid + id + loop_index);
+                    double ranmov = (double)hiprand_uniform(&g_rng_states[tid]);
                     flag2 = (ranmov > (static_cast<double>(numRe) / 8.0));
                 }
                 tx.op_type = decide_op_type(cur_type, rand_type, flag1 || flag2);
@@ -3931,17 +3959,24 @@ void recb_solver_GPU(
 
     {
       static int recb_launch_by_sector[8] = {};
+      static unsigned long long recb_capped_total = 0; // 全程累计触发上限的 walker 数
       const unsigned int sid = sector_id < 8 ? sector_id : 0;
       recb_launch_by_sector[sid]++;
       const int launch_n = recb_launch_by_sector[sid];
       int recb_rank = 0;
       MPI_Comm_rank(MPI_COMM_WORLD, &recb_rank);
+      // 每次启动都取回统计（保险丝计数不能漏），但常规日志只打前 5 次
+      RecbVerifyStats h_stats{};
+      HANDLE_HIP(hipMemcpy(&h_stats, d_recb_verify_stats, sizeof(RecbVerifyStats), hipMemcpyDeviceToHost));
+      recb_capped_total += h_stats.capped_walks;
       if (recb_rank == 0 && launch_n <= 5) {
-        RecbVerifyStats h_stats{};
-        HANDLE_HIP(hipMemcpy(&h_stats, d_recb_verify_stats, sizeof(RecbVerifyStats), hipMemcpyDeviceToHost));
-        kiwi::logs::v(" ", " [recb-verify] sect={} launch={} sector_pairs={} hops={} max_hops_one_pair={} pairs_multi_hop={} pairs_captured_no_move={}.\n",
+        kiwi::logs::v(" ", " [recb-verify] sect={} launch={} sector_pairs={} hops={} max_hops_one_pair={} pairs_multi_hop={} pairs_captured_no_move={} capped_walks={}.\n",
                       sid, launch_n, h_stats.sector_pairs, h_stats.hops, h_stats.max_hops,
-                      h_stats.multi_hop_pairs, h_stats.captured_no_move);
+                      h_stats.multi_hop_pairs, h_stats.captured_no_move, h_stats.capped_walks);
+      }
+      if (h_stats.capped_walks > 0) {
+        kiwi::logs::v(" ", " [recb-cap] rank={} sect={} launch={} 触发跳跃上限的 walker 数={} 全程累计={}（疑似病态轨迹，请检查！）.\n",
+                      recb_rank, sid, launch_n, h_stats.capped_walks, recb_capped_total);
       }
     }
     // print_momo_and_more
@@ -4203,7 +4238,7 @@ void initialize_gpu(int process_rank){
 }
 
 void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain *_p_domain,
-                std::vector<long int> pair_atoms
+                std::vector<long int> pair_atoms, unsigned long long rng_seed
                 ){
   using namespace gpuSimulate;
 
@@ -4376,12 +4411,31 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
   //===============================
   arr_size = pair_atoms.size();
   // printf("arr_size is %ld",arr_size);
-  hipLaunchKernelGGL(setGlobalPointer, 1, 1, 0, 0, 
+  //=======每个 walker 线程一条独立持久的 RNG 流（Philox）=======
+  // 线程总数与 recb kernel 启动口径一致：numBlocks = pair_atoms_size / 128 + 1
+  {
+    const long int rng_block = 128;
+    rng_states_count = (pair_atoms_size / rng_block + 1) * rng_block;
+    HANDLE_HIP(hipMalloc((void**)&d_rng_states, rng_states_count * sizeof(hiprandStatePhilox4_32_10_t)));
+  }
+  //=============================================================
+  hipLaunchKernelGGL(setGlobalPointer, 1, 1, 0, 0,
       d_meta,
       MoRe_Hash->device_ptr(),MoMo_Hash->device_ptr(),Re_Hash->device_ptr(),V_Hash->device_ptr(),Busy_Set->device_ptr(),
-      surface_Hash->device_ptr(),ghost_Hash->device_ptr(),d_Pair_Atoms,d_Global_Bitmap_Lock
+      surface_Hash->device_ptr(),ghost_Hash->device_ptr(),d_Pair_Atoms,d_Global_Bitmap_Lock,d_rng_states
   );
 
+  hipDeviceSynchronize();
+  // 各 rank 错开种子，保证进程间流也互相独立；固定 seed 可整跑复现
+  int rng_rank = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rng_rank);
+  {
+    const long int rng_block = 128;
+    const long int rng_grid = (rng_states_count + rng_block - 1) / rng_block;
+    hipLaunchKernelGGL(initRngStates, rng_grid, rng_block, 0, 0,
+        rng_states_count, rng_seed + 1000003ULL * (unsigned long long)rng_rank);
+    CHECK_FOR_ERROR();
+  }
   hipDeviceSynchronize();
   // std::cin.get();
   // GPUHashSet* hostPtr;
@@ -4457,6 +4511,11 @@ if (d_Global_Bitmap_Lock != nullptr) {
   HANDLE_HIP(hipFree(d_ghost_count));
 
   hipFree(d_Pair_Atoms);
+  if (d_rng_states) {
+    HANDLE_HIP(hipFree(d_rng_states));
+    d_rng_states = nullptr;
+    rng_states_count = 0;
+  }
   if (d_recb_verify_stats) {
     HANDLE_HIP(hipFree(d_recb_verify_stats));
     d_recb_verify_stats = nullptr;

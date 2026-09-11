@@ -238,7 +238,8 @@ void PKMC::onStart() {
   SectorMeta sec_meta;
   int sector_id = (*sec_meta.sector_itl).id;
   printf("gpu_prepare start\n");
-  gpu_prepare(config_v.attempt_freq, config_v.temperature, sim->box->lattice_list, sim->_p_domain,arr);
+  gpu_prepare(config_v.attempt_freq, config_v.temperature, sim->box->lattice_list, sim->_p_domain,arr,
+              (unsigned long long)config_v.seeds.event_selection);
   // gpu_prepare(config_v.attempt_freq, config_v.temperature);
 
   MEventListener m_listener(m_counter, sim->box->lattice_list->meta);
