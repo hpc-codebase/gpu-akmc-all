@@ -129,6 +129,8 @@ namespace gpuSimulate {
     RecbVerifyStats *d_recb_verify_stats = nullptr;
     hiprandStatePhilox4_32_10_t *d_rng_states = nullptr;
     long int rng_states_count = 0;
+    long int *d_sector_slots = nullptr;   // recb 前筛出的本扇区 walker 槽位号（g_Pair_Atoms 下标）
+    int *d_sector_slot_count = nullptr;   // 本扇区 walker 数
 
     unsigned long long int* d_Global_Bitmap_Lock = nullptr;
     size_t bitmap_lock_bytes = 0;
@@ -3121,7 +3123,8 @@ __device__ void tiled_check_neighbors_single(_type_lattice_size x, _type_lattice
         }
     }
 }
-__global__ void calcExchangePairs(int sector_id,int arr_size, RecbVerifyStats *stats
+__global__ void calcExchangePairs(int sector_id,int arr_size, RecbVerifyStats *stats,
+                                  const long int* __restrict__ sector_slots
 ){
   #if KMC_RECB_DEVICE_PRINTF
   printf("begin calcExchangePairs\n");
@@ -3132,11 +3135,17 @@ __global__ void calcExchangePairs(int sector_id,int arr_size, RecbVerifyStats *s
   AtomTx tx = {0, 0, true, false, 0};
 
   _type_lattice_count tid = blockIdx.x * blockDim.x + threadIdx.x;
+  // slot 是 walker 在花名册 g_Pair_Atoms 中的槽位号（身份），tid 只是本次启动的线程号（临时工牌）。
+  // sector_slots 为 recb 前筛出的本扇区槽位列表；传 nullptr 时退回旧行为（slot = tid）。
+  long int slot = tid;
+  if (sector_slots != nullptr && tid < arr_size) {
+    slot = sector_slots[tid];
+  }
   _type_lattice_id id = 0;
 
   bool valid_thread = (g_Pair_Atoms != nullptr && tid < arr_size);
   if (valid_thread) {
-    id = g_Pair_Atoms[tid];
+    id = g_Pair_Atoms[slot];
   }
 
   if(!valid_thread || id<=0){
@@ -3239,7 +3248,7 @@ __global__ void calcExchangePairs(int sector_id,int arr_size, RecbVerifyStats *s
         _type_lattice_id random_id = 0;
         if (tx.active) {
             // 每线程持久 Philox 流：方向与 walker 处境解耦，每步都是新骰子
-            int randomNumber = (int)(hiprand_uniform(&g_rng_states[tid]) * 14.0f);
+            int randomNumber = (int)(hiprand_uniform(&g_rng_states[slot]) * 14.0f);
             if (randomNumber > 13) randomNumber = 13; // hiprand_uniform 返回 (0,1]，防边界
             getRandomLattice(x, y, z, temp_x, temp_y, temp_z, randomNumber);
             random_id = getId(temp_x, temp_y, temp_z);
@@ -3251,7 +3260,7 @@ __global__ void calcExchangePairs(int sector_id,int arr_size, RecbVerifyStats *s
                 bool flag1 = (numRe == 0);
                 bool flag2 = false;
                 if (numRe > 0 && numRe < LatticesList::MAX_1NN) {
-                    double ranmov = (double)hiprand_uniform(&g_rng_states[tid]);
+                    double ranmov = (double)hiprand_uniform(&g_rng_states[slot]);
                     flag2 = (ranmov > (static_cast<double>(numRe) / 8.0));
                 }
                 tx.op_type = decide_op_type(cur_type, rand_type, flag1 || flag2);
@@ -3314,9 +3323,9 @@ __global__ void calcExchangePairs(int sector_id,int arr_size, RecbVerifyStats *s
                                          y_min <= y && y < y_max &&
                                          z_min <= z && z < z_max);
             if (dest_in_sector && !isGhostLat(random_id)) {
-              g_Pair_Atoms[tid] = random_id;
+              g_Pair_Atoms[slot] = random_id;
             } else {
-              g_Pair_Atoms[tid] = -1;
+              g_Pair_Atoms[slot] = -1;
               tx.active = false;
             }
         }
@@ -3845,6 +3854,32 @@ __global__ void filter_ids_in_region(const long int* __restrict__ in_ids,
   }
 }
 
+// recb 前筛选：把当前扇区盒子内的 walker 槽位号（g_Pair_Atoms 下标）压缩到 out_slots。
+// 存槽位号而非 id：calcExchangePairs 游走后会写回 g_Pair_Atoms[slot]（新位置或 -1），
+// 用槽位号保证写回永远对准自己的槽位。边界口径与 calcExchangePairs 完全一致：
+// x 为双倍坐标（2*regions），y/z 直接用 regions；id<=0 为无效槽（离扇区标记）跳过。
+__global__ void filter_pair_slots_for_sector(int sector_id, long int roster_size,
+                                             long int* __restrict__ out_slots,
+                                             int* __restrict__ out_count) {
+  long int slot = blockIdx.x * (long int)blockDim.x + threadIdx.x;
+  if (slot >= roster_size) return;
+  long int id = g_Pair_Atoms[slot];
+  if (id <= 0) return;
+  _type_lattice_id x = id % g_meta->size_x;
+  _type_lattice_id y = (id / g_meta->size_x) % g_meta->size_y;
+  _type_lattice_id z = id / (g_meta->size_x * g_meta->size_y);
+  const long int x_min = 2 * g_meta->regions[sector_id * 6 + 0];
+  const long int x_max = 2 * g_meta->regions[sector_id * 6 + 1];
+  const long int y_min = g_meta->regions[sector_id * 6 + 2];
+  const long int y_max = g_meta->regions[sector_id * 6 + 3];
+  const long int z_min = g_meta->regions[sector_id * 6 + 4];
+  const long int z_max = g_meta->regions[sector_id * 6 + 5];
+  if (x_min <= x && x < x_max && y_min <= y && y < y_max && z_min <= z && z < z_max) {
+    int idx = atomicAdd(out_count, 1);
+    out_slots[idx] = slot;
+  }
+}
+
 __global__ void build_nn_info_from_vac_list(const long int* __restrict__ vac_ids,
                                            int vac_count,
                                            dev_Vacancy* __restrict__ out_vac,
@@ -3938,23 +3973,38 @@ void recb_solver_GPU(
     if (do_profile) initRecbProfileEvents();
 
     blockSize = 128;
-    numBlocks = pair_atoms_size / blockSize + 1;
     // print_Hash_and_Pair
-    // printf("+++++++++++++++++++++++++++++++++++++++++++++++++\n"); 
+    // printf("+++++++++++++++++++++++++++++++++++++++++++++++++\n");
     // printf("arr size is %ld\n",pair_atoms_size);
     // hipLaunchKernelGGL(print_Hash_and_Pair, 1, 1, 0, 0,arr_size,0);
-  
+
     if (!d_recb_verify_stats) {
       HANDLE_HIP(hipMalloc(reinterpret_cast<void**>(&d_recb_verify_stats), sizeof(RecbVerifyStats)));
     }
     HANDLE_HIP(hipMemset(d_recb_verify_stats, 0, sizeof(RecbVerifyStats)));
 
+    //=======recb 前筛选：把本扇区盒子内的 walker 槽位号压缩出来=======
+    // 花名册 g_Pair_Atoms 混装全部 8 个扇区，这里先筛出本扇区，kernel 只启动所需线程。
+    HANDLE_HIP(hipMemset(d_sector_slot_count, 0, sizeof(int)));
+    {
+      const long int filter_grid = (pair_atoms_size + blockSize - 1) / blockSize;
+      hipLaunchKernelGGL(filter_pair_slots_for_sector, filter_grid, blockSize, 0, 0,
+                         (int)sector_id, pair_atoms_size, d_sector_slots, d_sector_slot_count);
+      CHECK_FOR_ERROR();
+    }
+    int h_sector_count = 0;
+    HANDLE_HIP(hipMemcpy(&h_sector_count, d_sector_slot_count, sizeof(int), hipMemcpyDeviceToHost));
+    //=============================================================
+
     if (do_profile) HANDLE_HIP(hipEventRecord(recb_evt_begin, 0));
-    hipLaunchKernelGGL(calcExchangePairs, numBlocks, blockSize, 0, 0,
-                      sector_id,pair_atoms_size, d_recb_verify_stats
-                      );
-    CHECK_FOR_ERROR();
-    hipDeviceSynchronize();
+    if (h_sector_count > 0) {
+      numBlocks = (h_sector_count + blockSize - 1) / blockSize;
+      hipLaunchKernelGGL(calcExchangePairs, numBlocks, blockSize, 0, 0,
+                        sector_id, h_sector_count, d_recb_verify_stats, d_sector_slots
+                        );
+      CHECK_FOR_ERROR();
+      hipDeviceSynchronize();
+    }
     if (do_profile) HANDLE_HIP(hipEventRecord(recb_evt_after_exchange, 0));
 
     {
@@ -4418,6 +4468,9 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
     rng_states_count = (pair_atoms_size / rng_block + 1) * rng_block;
     HANDLE_HIP(hipMalloc((void**)&d_rng_states, rng_states_count * sizeof(hiprandStatePhilox4_32_10_t)));
   }
+  //=======recb 前扇区筛选的工作缓冲区（槽位号列表 + 计数）=======
+  HANDLE_HIP(hipMalloc((void**)&d_sector_slots, pair_atoms_size * sizeof(long int)));
+  HANDLE_HIP(hipMalloc((void**)&d_sector_slot_count, sizeof(int)));
   //=============================================================
   hipLaunchKernelGGL(setGlobalPointer, 1, 1, 0, 0,
       d_meta,
@@ -4515,6 +4568,14 @@ if (d_Global_Bitmap_Lock != nullptr) {
     HANDLE_HIP(hipFree(d_rng_states));
     d_rng_states = nullptr;
     rng_states_count = 0;
+  }
+  if (d_sector_slots) {
+    HANDLE_HIP(hipFree(d_sector_slots));
+    d_sector_slots = nullptr;
+  }
+  if (d_sector_slot_count) {
+    HANDLE_HIP(hipFree(d_sector_slot_count));
+    d_sector_slot_count = nullptr;
   }
   if (d_recb_verify_stats) {
     HANDLE_HIP(hipFree(d_recb_verify_stats));
