@@ -91,10 +91,14 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
         time_vac_calculate_total += time_end;
         time_compute_total += time_end;
         
+        // 恢复每轮打印：区分"本扇区无空位、纯 recb 重收集"与"真空位事件"两种情况，
+        // 用于和 [recb-verify] 的 launch 序号逐轮对照（launch 序号 == 本循环轮数）。
         if (total_rates == 0.0 || std::abs(total_rates) < std::numeric_limits<_type_rate>::epsilon()) {
           // If there is no defect, use synchronous parallel kMC
           // algorithm. Because there is no kMC event, just increase
           // time.
+          kiwi::logs::v(" ", " step {} sect {} (loop {}) : total_rates=0, 本轮无空位事件, sector_time -> {} .\n",
+                        step, (*sec_meta.sector_itl).id, sect, step_threshold_time);
           sector_time = step_threshold_time;
         } else {
           // 有KMC事件
@@ -111,6 +115,9 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
           // time_inc_rng 是 config.yaml 中给出的随机数种子
           const double rand = time_inc_dis(time_inc_rng);
           const double delta_t = -std::log(rand) / total_rates;
+          kiwi::logs::v(" ", " step {} sect {} (loop {}) : total_rates={} delta_t={} sector_time={}/{} .\n",
+                        step, (*sec_meta.sector_itl).id, sect, total_rates, delta_t,
+                        sector_time + delta_t, step_threshold_time);
           sector_time += delta_t;
         }
         time_start = MPI_Wtime();

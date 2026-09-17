@@ -4,6 +4,7 @@
 
 #include <abvi/kmc.h>
 #include <args.hpp>
+#include <cstdint>
 #include <iostream>
 #include <lattice/lattices_list.h>
 #include <logs/logs.h>
@@ -22,6 +23,28 @@
 #include "profile_config.h"
 #include "seed_relocate.h"
 #include "../gpu/gpu_simulate.h"
+
+namespace {
+
+// SplitMix64 finalizer: derive reproducible, well-separated random streams from
+// one configured seed without allowing MPI ranks or simulation subsystems to
+// consume the same sequence.
+uint64_t deriveRandomStreamSeed(const int64_t configured_seed,
+                                const uint64_t stream_tag,
+                                const int rank) {
+  uint64_t x = static_cast<uint64_t>(configured_seed) ^ stream_tag;
+  x += 0x9e3779b97f4a7c15ULL * (static_cast<uint64_t>(rank) + 1ULL);
+  x = (x ^ (x >> 30U)) * 0xbf58476d1ce4e5b9ULL;
+  x = (x ^ (x >> 27U)) * 0x94d049bb133111ebULL;
+  return x ^ (x >> 31U);
+}
+
+constexpr uint64_t EVENT_STREAM_TAG = 0x4556454e545f4b4dULL; // "EVENT_KM"
+constexpr uint64_t TIME_STREAM_TAG = 0x54494d455f4b4d43ULL;  // "TIME_KMC"
+constexpr uint64_t RECB_STREAM_TAG = 0x524543425f4b4d43ULL;  // "RECB_KMC"
+constexpr uint64_t RECB_RANK_STRIDE = 1000003ULL;
+
+} // namespace
 
 // 这个函数的主要功能是解析命令行参数，并根据解析结果执行不同的操作。让我解释一下函数的主要功能：
 // 首先，它创建了一个名为parser的命令行参数解析器，使用了一个开源的C++库（args），用于帮助解析命令行参数。
@@ -155,7 +178,9 @@ bool PKMC::prepare() {
   mpi_types::setInterMPIType();
   sim = new simulation();
   // 获取config文件中的设置的参数
-  conf::ConfigValues config_v = ConfigParsing::getInstance()->configValues;
+  // Keep relocated auto-seeds in the shared configuration. A local copy would
+  // discard random_device-generated values before onStart().
+  conf::ConfigValues &config_v = ConfigParsing::getInstance()->configValues;
   // if(SimulationDomain::comm_sim_pro.own_rank == 0) kiwi::logs::v(" ", " getInstance ending !!!.\n");
   // if the seed is 0, reset the seed using random device.
   r::seedRelocate(&config_v.seeds.create_types, &config_v.seeds.create_vacancy, &config_v.seeds.event_selection,
@@ -200,6 +225,17 @@ bool PKMC::prepare() {
 
 void PKMC::onStart() {
   conf::ConfigValues config_v = ConfigParsing::getInstance()->configValues;
+  const int mpi_rank = SimulationDomain::comm_sim_pro.own_rank;
+  const uint32_t event_seed_rank = static_cast<uint32_t>(deriveRandomStreamSeed(
+      config_v.seeds.event_selection, EVENT_STREAM_TAG, mpi_rank));
+  const uint32_t time_seed_rank = static_cast<uint32_t>(deriveRandomStreamSeed(
+      config_v.seeds.time_inc, TIME_STREAM_TAG, mpi_rank));
+  // gpu_prepare already adds RECB_RANK_STRIDE * rank when it initializes the
+  // Philox states, so derive only the recb stream base here.
+  const uint64_t recb_seed_base = deriveRandomStreamSeed(
+      config_v.seeds.event_selection, RECB_STREAM_TAG, 0);
+  const uint64_t recb_seed_rank =
+      recb_seed_base + RECB_RANK_STRIDE * static_cast<uint64_t>(mpi_rank);
 
   //  set up ghost.
   if(SimulationDomain::comm_sim_pro.own_rank == 0) kiwi::logs::v(" ", " prepareForStart starting !!!.\n");
@@ -239,7 +275,7 @@ void PKMC::onStart() {
   int sector_id = (*sec_meta.sector_itl).id;
   printf("gpu_prepare start\n");
   gpu_prepare(config_v.attempt_freq, config_v.temperature, sim->box->lattice_list, sim->_p_domain,arr,
-              (unsigned long long)config_v.seeds.event_selection);
+              static_cast<unsigned long long>(recb_seed_base));
   // gpu_prepare(config_v.attempt_freq, config_v.temperature);
 
   MEventListener m_listener(m_counter, sim->box->lattice_list->meta);
@@ -248,7 +284,15 @@ void PKMC::onStart() {
 
   // run simulation
   MEventHook m_event_hook(config_v.output, sim->box->lattice_list, &m_counter);
-  sim->simulate(&model, &m_event_hook, config_v.seeds.time_inc, config_v.physics_time);
+  // Event selection uses the process-global r::random() generator. Seed it
+  // immediately before the time loop so creation or initialization cannot
+  // accidentally consume values from the event-selection stream.
+  r::initSeed(event_seed_rank);
+  kiwi::logs::v("random",
+                "rank {} stream seeds: event={} time={} recb={} (configured event={}, time={}).\n",
+                mpi_rank, event_seed_rank, time_seed_rank, recb_seed_rank,
+                config_v.seeds.event_selection, config_v.seeds.time_inc);
+  sim->simulate(&model, &m_event_hook, time_seed_rank, config_v.physics_time);
   
 }
 
