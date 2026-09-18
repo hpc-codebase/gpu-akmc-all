@@ -22,6 +22,14 @@ target_include_directories(${KMC_GPU_LIB_NAME} PUBLIC
         $<INSTALL_INTERFACE:include>
         )
 
+# 哈希桶大小可配置（cmake -DKMC_HASH_BUCKET_SIZE=N）：
+#   1  = 经典单线程开放寻址（每桶 1 槽，纯线性探测），作对比基准；
+#   64 = 桶式开放寻址。不传则用 DeviceVacRatesSolver.h 的默认值。
+if(DEFINED KMC_HASH_BUCKET_SIZE)
+        message(STATUS "KMC_HASH_BUCKET_SIZE = ${KMC_HASH_BUCKET_SIZE} (overriding header default)")
+        target_compile_definitions(${KMC_GPU_LIB_NAME} PRIVATE KMC_HASH_BUCKET_SIZE=${KMC_HASH_BUCKET_SIZE})
+endif()
+
 if(KMC_RCCL_ENABLE_FLAG)
         find_path(KMC_NCCL_INCLUDE_DIR NAMES nccl.h rccl.h
                 PATHS

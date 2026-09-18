@@ -15,20 +15,15 @@
 #define RE_SCALE_SIZE 1.2
 #define STREAM_SIZE 4
 #ifndef KMC_HASH_BUCKET_SIZE
-#define KMC_HASH_BUCKET_SIZE 64
+// 桶大小可配置（编译时 -DKMC_HASH_BUCKET_SIZE=N 覆盖）：
+//   1  = 最原始单线程开放寻址（每桶 1 槽，纯线性探测），作对比基准；
+//   64 = 桶式开放寻址（每桶 64 槽）。做 tile vs 单线程、桶大小对比时在此切换。
+#define KMC_HASH_BUCKET_SIZE 1
 #endif
 #define BUCKET_SIZE KMC_HASH_BUCKET_SIZE
 
 #ifndef KMC_HASH_TILE_SIZE
 #define KMC_HASH_TILE_SIZE BUCKET_SIZE
-#endif
-
-#ifndef KMC_HASH_TARGET_LOAD_FACTOR
-#define KMC_HASH_TARGET_LOAD_FACTOR 0.50
-#endif
-
-#ifndef KMC_HASH_MAX_PROBES
-#define KMC_HASH_MAX_PROBES 32
 #endif
 
 #define HASH_SEED_PRIMARY 2u
@@ -59,10 +54,13 @@ __host__ __device__ __forceinline__ unsigned int hash_probe_bucket(unsigned int 
     return (hash_primary_bucket(num_buckets, key) + probe) % num_buckets;
 }
 
+// 标准线性探测不设人为次数上限：探测序列 (h1 + probe) % num_buckets 会遍历全部桶，
+// 只要表里至少有一个空槽，查找/插入/删除就必然在 num_buckets 步内终止。
+// 这里把探测上界直接设为表长（num_buckets），等价于“无限探测”的教科书语义，
+// 避免人为截断造成“存在却查不到”的假阴性（这正是此前 roster/hash 失配、
+// tx 失败、stale walker 的根源）。
 __host__ __device__ __forceinline__ unsigned int hash_effective_max_probes(unsigned int num_buckets) {
-    unsigned int configured = static_cast<unsigned int>(KMC_HASH_MAX_PROBES);
-    if (configured == 0 || configured > num_buckets) return num_buckets;
-    return configured;
+    return num_buckets;
 }
 
 // 定义一个可以在 Device 端使用的哈希函数对象 (Functor)

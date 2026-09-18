@@ -11,14 +11,9 @@
 namespace {
 int compute_hash_capacity(int requested_slots) {
     if (requested_slots <= 0) requested_slots = 1;
-    double load_factor = static_cast<double>(KMC_HASH_TARGET_LOAD_FACTOR);
-    if (!(load_factor > 0.0 && load_factor < 1.0)) {
-        std::cerr << "Invalid KMC_HASH_TARGET_LOAD_FACTOR=" << load_factor
-                  << ", fallback to 0.50" << std::endl;
-        load_factor = 0.50;
-    }
-    long long capacity = static_cast<long long>(
-        std::ceil(static_cast<double>(requested_slots) / load_factor));
+    // 开放寻址必须保留空槽，探测链才能在“第一个 empty”处自然终止，
+    // 故按固定 2 倍（负载因子 0.5）预留容量，直接写死、不做可调参数。
+    long long capacity = static_cast<long long>(requested_slots) * 2;
     if (capacity < BUCKET_SIZE) capacity = BUCKET_SIZE;
     long long remainder = capacity % BUCKET_SIZE;
     if (remainder != 0) {
@@ -113,7 +108,11 @@ HIPHashSet::HIPHashSet(const std::unordered_set<long int>& cpu_set) {
     delete[] h_keys;
 }
 HIPHashSet::HIPHashSet(const std::unordered_set<long int>& cpu_set,int size){
-    int set_size = cpu_set.size() + size;
+    // size 语义：目标能容纳的 key 总数（含初始元素与增长余量），由调用方显式给定。
+    // 注意不再累加 cpu_set.size()：此前把调用方已算好的总量又加一次，导致
+    // MoMo 表（cpu_set 非空）比 MoRe 表（cpu_set 为空）多开了一倍容量。
+    int set_size = size;
+    if (set_size < (int)cpu_set.size()) set_size = (int)cpu_set.size();
     if (set_size == 0) set_size = 1;
 
     h_table.capacity = compute_hash_capacity(set_size);

@@ -43,6 +43,19 @@ __device__ static hiprandStatePhilox4_32_10_t *g_rng_states;//每个 walker 线�
 // [0]=validate_cleared [1]=validate_cleared_ghost [2]=hash_keys_before_compact [3]=roster_after_compact
 __device__ static unsigned int g_validate_counters[4];
 
+// 哈希操作统计（KMC_RECB_VERIFY_DETAIL=1 时启用，用于量化 recb 的访存负载）：
+// query:  [0]MoRe [1]MoMo [2]Re [3]V 的 hash_set_contains 调用次数
+// update: [0]MoMo [1]MoRe [2]Re [3]ghost [4]surface 的 insert+remove 调用次数
+__device__ static unsigned long long g_hash_query[4];
+__device__ static unsigned long long g_hash_update[5];
+__device__ static bool g_hash_stats_on = false;
+// 最长探测链（桶数）：仅在探测链 ≥32 时触发 atomicMax，正常链零开销。
+// 0 表示本轮没有任何一次探测走深（健康）；>0 说明有长链，值越大离"满载"越近。
+__device__ static unsigned int g_probe_max;
+// 哈希表占用统计（KMC_RECB_VERIFY_DETAIL=1 时在 rebuild 前统计）：
+// [MoMo, MoRe] × {empty, tombstone, live}
+__device__ static unsigned int g_hash_occ[6];
+
 static long int arr_size;
 static long int pair_atoms_size;
 
@@ -421,10 +434,17 @@ __device__ inline void release_bitmap_lock_single(long int id) {
 // =========================================================
 __device__ bool hash_set_contains(GPUHashSet* set, long int key) {
     if (set == nullptr || key <= 0) return false;
+    if (g_hash_stats_on) {
+      if (set == g_MoRe_Hash) atomicAdd(&g_hash_query[0], 1ULL);
+      else if (set == g_MoMo_Hash) atomicAdd(&g_hash_query[1], 1ULL);
+      else if (set == g_Re_Hash) atomicAdd(&g_hash_query[2], 1ULL);
+      else if (set == g_V_Hash) atomicAdd(&g_hash_query[3], 1ULL);
+    }
     unsigned int loop_count = 0;
     const unsigned int max_probe = hash_effective_max_probes(set->num_buckets);
     unsigned int buck_num = hash_probe_bucket(set->num_buckets, key, loop_count);
     while (loop_count <= max_probe ) {
+        if (loop_count >= 32) atomicMax(&g_probe_max, loop_count + 1);
         int base_index = buck_num * BUCKET_SIZE;
         bool has_empty = false;
 
@@ -452,6 +472,13 @@ __device__ bool hash_set_contains(GPUHashSet* set, long int key) {
 // 返回值: 1 (插入成功), 0 (已存在，未重复插入), -1 (表满失败)
 __device__ int hash_set_insert_atom_op(GPUHashSet* set, long int key) {
     if (set == nullptr || key <= 0) return -1;
+    if (g_hash_stats_on) {
+      if (set == g_MoMo_Hash) atomicAdd(&g_hash_update[0], 1ULL);
+      else if (set == g_MoRe_Hash) atomicAdd(&g_hash_update[1], 1ULL);
+      else if (set == g_Re_Hash) atomicAdd(&g_hash_update[2], 1ULL);
+      else if (set == g_ghost_Hash) atomicAdd(&g_hash_update[3], 1ULL);
+      else if (set == g_surface_Hash) atomicAdd(&g_hash_update[4], 1ULL);
+    }
     const unsigned int max_probe = hash_effective_max_probes(set->num_buckets);
     // CAS 被同 bucket 的其他 key 抢占时从头重查，避免在并发下制造重复 key。
     for (unsigned int retry = 0; retry < 64; ++retry) {
@@ -460,6 +487,7 @@ __device__ int hash_set_insert_atom_op(GPUHashSet* set, long int key) {
         unsigned int buck_num = hash_probe_bucket(set->num_buckets, key, loop_count);
 
         while (loop_count <= max_probe) {
+            if (loop_count >= 32) atomicMax(&g_probe_max, loop_count + 1);
             int base_index = buck_num * BUCKET_SIZE;
             long int* first_empty = nullptr;
 
@@ -513,11 +541,19 @@ __device__ int hash_set_insert_atom_op(GPUHashSet* set, long int key) {
 // 返回值: 1 (删除成功), 0 (未找到该 Key)
 __device__ int hash_set_remove_atom_op(GPUHashSet* set, long int key) {
     if (set == nullptr || key <= 0) return 0;
+    if (g_hash_stats_on) {
+      if (set == g_MoMo_Hash) atomicAdd(&g_hash_update[0], 1ULL);
+      else if (set == g_MoRe_Hash) atomicAdd(&g_hash_update[1], 1ULL);
+      else if (set == g_Re_Hash) atomicAdd(&g_hash_update[2], 1ULL);
+      else if (set == g_ghost_Hash) atomicAdd(&g_hash_update[3], 1ULL);
+      else if (set == g_surface_Hash) atomicAdd(&g_hash_update[4], 1ULL);
+    }
     unsigned int loop_count = 0;
     const unsigned int max_probe = hash_effective_max_probes(set->num_buckets);
     unsigned int buck_num = hash_probe_bucket(set->num_buckets, key, loop_count);
 
     while (loop_count <= max_probe) {
+        if (loop_count >= 32) atomicMax(&g_probe_max, loop_count + 1);
         int base_index = buck_num * BUCKET_SIZE;
         bool has_empty = false;
 
@@ -4069,6 +4105,16 @@ __global__ void reset_validate_counters() {
   g_validate_counters[1] = 0;
   g_validate_counters[2] = 0;
   g_validate_counters[3] = 0;
+  g_hash_occ[0] = 0; g_hash_occ[1] = 0; g_hash_occ[2] = 0;
+  g_hash_occ[3] = 0; g_hash_occ[4] = 0; g_hash_occ[5] = 0;
+}
+
+// 清零哈希操作统计计数器（g_hash_query / g_hash_update / g_probe_max）
+__global__ void reset_hash_stats() {
+  g_hash_query[0] = 0; g_hash_query[1] = 0; g_hash_query[2] = 0; g_hash_query[3] = 0;
+  g_hash_update[0] = 0; g_hash_update[1] = 0; g_hash_update[2] = 0;
+  g_hash_update[3] = 0; g_hash_update[4] = 0;
+  g_probe_max = 0;
 }
 
 // 统计一个哈希表的有效 key 数，累加到 g_validate_counters[2]
@@ -4081,6 +4127,19 @@ __global__ void count_hash_keys_all(GPUHashSet* set) {
   atomicAdd(&g_validate_counters[2], 1u);
 }
 
+// 统计一张哈希表的占用分布（empty/tombstone/live），写入 g_hash_occ[idx*3 + 0/1/2]。
+// 用于 rebuild 前量化"离满载还有多少余量"：有效占用 = (live + tombstone) / capacity，
+// 它决定了开放寻址探测链的长度。idx: 0=MoMo, 1=MoRe。
+__global__ void count_hash_occupancy(GPUHashSet* set, int idx) {
+  if (!set) return;
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= set->capacity) return;
+  const long int key = set->keys[i];
+  if (key == set->empty_flag) atomicAdd(&g_hash_occ[idx * 3 + 0], 1u);
+  else if (key == set->tombstone_flag) atomicAdd(&g_hash_occ[idx * 3 + 1], 1u);
+  else atomicAdd(&g_hash_occ[idx * 3 + 2], 1u);
+}
+
 // 统计花名册有效 slot 数，累加到 g_validate_counters[3]
 __global__ void count_roster_slots(long int roster_size) {
   long int slot = blockIdx.x * (long int)blockDim.x + threadIdx.x;
@@ -4091,8 +4150,8 @@ __global__ void count_roster_slots(long int roster_size) {
 // 从花名册重新插入有效 key 到哈希表。用于 rebuild 时清理 tombstone：
 // clear 哈希表（全部置 empty）后，把 compact 收集到的有效 key 重新 hash 插入，
 // 从而消除长期 remove 累积的 tombstone（tombstone 会拉长开放寻址探测链，
-// 超过 KMC_HASH_MAX_PROBES 后 hash_set_contains 误判为“不存在”，进而被
-// validate_roster_all 误清，造成 roster/hash 差值累积）。
+// 占用度逼近 1 时查找/插入会退化，甚至把“存在”误判为“不存在”，
+// 进而被 validate_roster_all 误清，造成 roster/hash 差值累积）。
 __global__ void reinsert_from_roster(GPUHashSet* set, const long int* roster,
                                      long int start, long int end) {
   const long int i = blockIdx.x * (long int)blockDim.x + threadIdx.x;
@@ -4267,6 +4326,12 @@ void recb_solver_GPU(
     //=============================================================
 
     if (do_profile) HANDLE_HIP(hipEventRecord(recb_evt_begin, 0));
+    // 哈希操作统计：清零计数器并开启统计开关（仅 verify_detail 时，正常跑零开销）
+    if (verify_detail) {
+      hipLaunchKernelGGL(reset_hash_stats, 1, 1, 0, 0);
+      const bool stats_on = true;
+      HANDLE_HIP(hipMemcpyToSymbol(HIP_SYMBOL(g_hash_stats_on), &stats_on, sizeof(bool)));
+    }
     if (h_sector_count > 0) {
       numBlocks = (h_sector_count + blockSize - 1) / blockSize;
       hipLaunchKernelGGL(calcExchangePairs, numBlocks, blockSize, 0, 0,
@@ -4275,6 +4340,10 @@ void recb_solver_GPU(
                         verify_detail
                         );
       CHECK_FOR_ERROR();
+      if (verify_detail) {
+        const bool stats_off = false;
+        HANDLE_HIP(hipMemcpyToSymbol(HIP_SYMBOL(g_hash_stats_on), &stats_off, sizeof(bool)));
+      }
       // 正确性清理不依赖详细日志开关；同一默认 stream 保证它在游走结束后执行。
       hipLaunchKernelGGL(validate_pair_slots, numBlocks, blockSize, 0, 0,
                          d_sector_slots, h_sector_count,
@@ -4380,6 +4449,22 @@ void recb_solver_GPU(
                       sid, launch_n, h_stats.sector_pairs, classified_walkers,
                       h_stats.unclassified_walkers, h_stats.roster_live_count,
                       h_stats.hash_pair_count);
+      }
+      // 哈希操作统计：量化 recb 本次 launch 的哈希查询/更新次数与分布（访存负载）
+      {
+        unsigned long long h_query[4] = {0, 0, 0, 0};
+        unsigned long long h_update[5] = {0, 0, 0, 0, 0};
+        unsigned int h_probe_max = 0;
+        hipMemcpyFromSymbol(h_query, HIP_SYMBOL(g_hash_query), 4 * sizeof(unsigned long long));
+        hipMemcpyFromSymbol(h_update, HIP_SYMBOL(g_hash_update), 5 * sizeof(unsigned long long));
+        hipMemcpyFromSymbol(&h_probe_max, HIP_SYMBOL(g_probe_max), sizeof(unsigned int));
+        if (recb_rank == 0 && launch_n <= 5) {
+          kiwi::logs::v(" ", " [recb-hash] sect={} launch={} query(MoRe/MoMo/Re/V)={}/{}/{}/{} update(MoMo/MoRe/Re/ghost/surface)={}/{}/{}/{}/{} max_probe_len={}.\n",
+                        sid, launch_n,
+                        h_query[0], h_query[1], h_query[2], h_query[3],
+                        h_update[0], h_update[1], h_update[2], h_update[3], h_update[4],
+                        h_probe_max);
+        }
       }
     }
     // print_momo_and_more
@@ -4646,6 +4731,18 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
                 std::vector<long int> pair_atoms, unsigned long long rng_seed
                 ){
   using namespace gpuSimulate;
+
+  // 哈希配置打印：跑一次日志即可确认当前二进制实际用的桶大小 / tile / 探测上限 / 路径。
+  // BUCKET_SIZE=1 即"经典单线程线性探测开放寻址"；=64 为桶式。哈希操作全部为单线程版
+  // （recb: hash_set_contains/insert/remove_atom_op；通信: 同上）。
+  {
+    int hash_cfg_rank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &hash_cfg_rank);
+    if (hash_cfg_rank == 0) {
+      kiwi::logs::v(" ", " [hash-config] BUCKET_SIZE={} TILE_SIZE={} PROBE_LIMIT=table_size(no cap) capacity=2x_keys | hash ops=single-threaded (recb & comm) | bucket=1 => classic linear-probing open addressing.\n",
+                    (long long)BUCKET_SIZE, (long long)KMC_HASH_TILE_SIZE);
+    }
+  }
 
   int device_id;
   hipGetDevice(&device_id);  // 获取当前设备ID
@@ -5049,103 +5146,89 @@ __global__ void update_hash_set(ChangeLattice_GPU *d_buffer,int receive_len,cons
                                 long int sub_box_lattice_size_0,long int sub_box_lattice_size_1,long int sub_box_lattice_size_2,
                                 long int  neighbour_local_sub_box_0,long int neighbour_local_sub_box_1,long int neighbour_local_sub_box_2
 ){
-    auto block = cg::this_thread_block();
-    auto tile = cg::tiled_partition<KMC_HASH_TILE_SIZE>(block);
-
+    // 单线程版：每个线程独立处理一个 receive buffer 元素，靠位图锁保证跨线程互斥，
+    // 不再用 tile 协作（tiled_*_op 的 leader 串行结构在桶=1 时无意义且退化）。
     long int BCC_DBX = 2;
     int index = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    // 初始化有效性掩码==注意不要return
-    bool active = (index < receive_len);
+    if (index >= receive_len) return;
 
     long int x=0,y=0,z=0;
     long int o_x=0,o_y=0,o_z=0;
     long int id=0,o_id=0;
    int type = 0;
 
-    if(active){
-      o_x= d_buffer[index].x;
-      o_y= d_buffer[index].y;
-      o_z= d_buffer[index].z;
-      o_id = getId(d_buffer[index].x,d_buffer[index].y,d_buffer[index].z);
+    o_x= d_buffer[index].x;
+    o_y= d_buffer[index].y;
+    o_z= d_buffer[index].z;
+    o_id = getId(d_buffer[index].x,d_buffer[index].y,d_buffer[index].z);
 
-      type = d_buffer[index].type;
-      if(dimension == 0){
-        if(sector_id % 2 == 0){
-          d_buffer[index].x += BCC_DBX * sub_box_lattice_size_0;
-        }else{
-          d_buffer[index].x -= BCC_DBX * (sub_box_lattice_size_0 + (neighbour_local_sub_box_0 - sub_box_lattice_size_0));
-        }
-        x = d_buffer[index].x;
-        y = d_buffer[index].y;
-        z = d_buffer[index].z;
-        id = getId(x,y,z);
-        // printf("original sur pos:(%ld,%ld,%ld)-%ld\t	,change sur pos:(%ld,%ld,%ld)-%ld\n",o_x,o_y,o_z,o_id,x,y,z,id);
-      }else if(dimension == 1){
-    
-        x = d_buffer[index].x;
-        if(sector_id == 0 || sector_id == 1 || sector_id == 4 || sector_id == 5) {
-          d_buffer[index].y += sub_box_lattice_size_1;
-        } else {
-          d_buffer[index].y -= sub_box_lattice_size_1 + (neighbour_local_sub_box_1 - sub_box_lattice_size_1);
-        }
-        y = d_buffer[index].y;
-        z = d_buffer[index].z;
-
-        id = getId(x,y,z);
-        // printf("original sur pos:(%ld,%ld,%ld)-%ld\t	,change sur pos:(%ld,%ld,%ld)-%ld\n",o_x,o_y,o_z,o_id,x,y,z,id);
-      
-      }else if(dimension == 2){
-        x = d_buffer[index].x;
-        y = d_buffer[index].y;
-        if(sector_id < 4) {
-          d_buffer[index].z += sub_box_lattice_size_2;
-        }else{
-          d_buffer[index].z -= sub_box_lattice_size_2+ (neighbour_local_sub_box_2 - sub_box_lattice_size_2);
-        }
-        z = d_buffer[index].z;
-
-        id = getId(x,y,z);
-        // printf("original sur pos:(%ld,%ld,%ld)-%ld\t	,change sur pos:(%ld,%ld,%ld)-%ld\n",o_x,o_y,o_z,o_id,x,y,z,id);
+    type = d_buffer[index].type;
+    if(dimension == 0){
+      if(sector_id % 2 == 0){
+        d_buffer[index].x += BCC_DBX * sub_box_lattice_size_0;
+      }else{
+        d_buffer[index].x -= BCC_DBX * (sub_box_lattice_size_0 + (neighbour_local_sub_box_0 - sub_box_lattice_size_0));
       }
-    }
-    // L1: 拦截 Buffer 中传来的重复 ID
-    resolve_intra_tile_conflicts_single(id, active, tile);
+      x = d_buffer[index].x;
+      y = d_buffer[index].y;
+      z = d_buffer[index].z;
+      id = getId(x,y,z);
+      // printf("original sur pos:(%ld,%ld,%ld)-%ld\t	,change sur pos:(%ld,%ld,%ld)-%ld\n",o_x,o_y,o_z,o_id,x,y,z,id);
+    }else if(dimension == 1){
 
-    // L2: 拦截跨 Block 的并发修改
-    bool lock_acquired = false;
-    if (active) {
-        lock_acquired = try_acquire_bitmap_lock_single(id);
-        if (!lock_acquired) active = false; // 抢锁失败，本轮不操作
-    }
-    //
-    bool need_del = active;
-    // 级联删除， 物理优化：按 Mo-Re 合金的浓度与反应产物留存概率，从高到低排序
-    // 既然在 V 删了，就不用去查 Re, MoMo 了，直接把 active_remove 设为 false。
-    // 这样接下来的 remove 操作就会直接被 work_mask 拦截，耗时为 0。
-    if (tiled_remove_op(g_Re_Hash, id, tile, need_del,g_Re_Hash->num_buckets) == 1) {
-        need_del = false; 
-    }
-    if (tiled_remove_op(g_MoRe_Hash, id, tile, need_del,g_MoRe_Hash->num_buckets) == 1) {
-        need_del = false; 
-    }
-    if (tiled_remove_op(g_MoMo_Hash, id, tile, need_del,g_MoMo_Hash->num_buckets) == 1) {
-        need_del = false; 
-    }
-    tiled_remove_op(g_V_Hash, id, tile, need_del,g_V_Hash->num_buckets);
+      x = d_buffer[index].x;
+      if(sector_id == 0 || sector_id == 1 || sector_id == 4 || sector_id == 5) {
+        d_buffer[index].y += sub_box_lattice_size_1;
+      } else {
+        d_buffer[index].y -= sub_box_lattice_size_1 + (neighbour_local_sub_box_1 - sub_box_lattice_size_1);
+      }
+      y = d_buffer[index].y;
+      z = d_buffer[index].z;
 
-    bool insert_V    = (active && type == LatticeTypes::V);
-    bool insert_Re   = (active && type == LatticeTypes::Re);
-    bool insert_MoMo = (active && type == LatticeTypes::MoMo);
-    bool insert_MoRe = (active && type == LatticeTypes::MoRe);
+      id = getId(x,y,z);
+      // printf("original sur pos:(%ld,%ld,%ld)-%ld\t	,change sur pos:(%ld,%ld,%ld)-%ld\n",o_x,o_y,o_z,o_id,x,y,z,id);
+    
+    }else if(dimension == 2){
+      x = d_buffer[index].x;
+      y = d_buffer[index].y;
+      if(sector_id < 4) {
+        d_buffer[index].z += sub_box_lattice_size_2;
+      }else{
+        d_buffer[index].z -= sub_box_lattice_size_2+ (neighbour_local_sub_box_2 - sub_box_lattice_size_2);
+      }
+      z = d_buffer[index].z;
 
-    tiled_insert_op(g_V_Hash, id, tile, insert_V,g_V_Hash->num_buckets);
-    tiled_insert_op(g_Re_Hash, id, tile, insert_Re,g_Re_Hash->num_buckets);
-    tiled_insert_op(g_MoMo_Hash, id, tile, insert_MoMo,g_MoMo_Hash->num_buckets);
-    tiled_insert_op(g_MoRe_Hash, id, tile, insert_MoRe,g_MoRe_Hash->num_buckets);
-    if (lock_acquired) {
-        release_bitmap_lock_single(id);
+      id = getId(x,y,z);
+      // printf("original sur pos:(%ld,%ld,%ld)-%ld\t	,change sur pos:(%ld,%ld,%ld)-%ld\n",o_x,o_y,o_z,o_id,x,y,z,id);
     }
+
+    // 跨 Block 并发互斥：单线程位图锁（重复 id 由抢锁拦截，一个成功一个放弃）
+    if (!try_acquire_bitmap_lock_single(id)) return;
+
+    // 级联删除，物理优化：按 Mo-Re 合金的浓度与反应产物留存概率，从高到低排序。
+    // 一个 id 只属于一张表，删到第一张命中的就停。
+    if (hash_set_remove_atom_op(g_Re_Hash, id) == 1) {
+        // 删掉了 Re
+    } else if (hash_set_remove_atom_op(g_MoRe_Hash, id) == 1) {
+        // 删掉了 MoRe
+    } else if (hash_set_remove_atom_op(g_MoMo_Hash, id) == 1) {
+        // 删掉了 MoMo
+    } else {
+        hash_set_remove_atom_op(g_V_Hash, id);
+    }
+
+    // 按新类型插入对应表
+    if (type == LatticeTypes::V) {
+      hash_set_insert_atom_op(g_V_Hash, id);
+    } else if (type == LatticeTypes::Re) {
+      hash_set_insert_atom_op(g_Re_Hash, id);
+    } else if (type == LatticeTypes::MoMo) {
+      hash_set_insert_atom_op(g_MoMo_Hash, id);
+    } else if (type == LatticeTypes::MoRe) {
+      hash_set_insert_atom_op(g_MoRe_Hash, id);
+    }
+
+    release_bitmap_lock_single(id);
     return;
 }
 
@@ -5354,106 +5437,80 @@ __global__ void update_hash_set2(ChangeLattice_GPU *d_buffer,int receive_len,con
                                 long int sub_box_lattice_size_0,long int sub_box_lattice_size_1,long int sub_box_lattice_size_2,
                                 long int neighbour_local_sub_box_0,long int neighbour_local_sub_box_1,long int neighbour_local_sub_box_2
 ){
-
-  // printf("env params:\t%ld\t%ld\t%ld ----- %ld\t%ld\t%ld\n",sub_box_lattice_size_0,sub_box_lattice_size_1,sub_box_lattice_size_2,
-        // neighbour_local_sub_box_0,neighbour_local_sub_box_1,neighbour_local_sub_box_2);
-  auto block = cg::this_thread_block();
-  auto tile = cg::tiled_partition<KMC_HASH_TILE_SIZE>(block);
-
+  // 单线程版（与 update_hash_set 一致）：每线程独立处理，位图锁保证跨线程互斥。
   long int BCC_DBX = 2;
   int index = blockIdx.x * blockDim.x + threadIdx.x;
-  // if(index >= receive_len)
-  //   return;
-
-  bool active = (index < receive_len);
+  if (index >= receive_len) return;
 
   long int x=0,y=0,z=0;
   long int id=0,o_id=0;
   long int o_x=0,o_y=0,o_z=0;
   int type = 0;
-  if(active){
-    o_x= d_buffer[index].x;
-    o_y= d_buffer[index].y;
-    o_z= d_buffer[index].y;
-    o_id = getId(d_buffer[index].x,d_buffer[index].y,d_buffer[index].z);
-    type = d_buffer[index].type;
 
-    if(dimension == 0){
-      if(next_id % 2 == 1){
-        d_buffer[index].x += BCC_DBX * sub_box_lattice_size_0;
-      }else{
-        d_buffer[index].x -= BCC_DBX * (sub_box_lattice_size_0 + (neighbour_local_sub_box_0 - sub_box_lattice_size_0));
-      }
-      x = d_buffer[index].x;
-      y = d_buffer[index].y;
-      z = d_buffer[index].z;
-      id = getId(x,y,z);
+  o_x= d_buffer[index].x;
+  o_y= d_buffer[index].y;
+  o_z= d_buffer[index].y;
+  o_id = getId(d_buffer[index].x,d_buffer[index].y,d_buffer[index].z);
+  type = d_buffer[index].type;
 
-      // printf("original gho pos:(%ld,%ld,%ld)-%ld\t	,change gho pos:(%ld,%ld,%ld)-%ld\n",o_x,o_y,o_z,o_id,x,y,z,id);
+  if(dimension == 0){
+    if(next_id % 2 == 1){
+      d_buffer[index].x += BCC_DBX * sub_box_lattice_size_0;
+    }else{
+      d_buffer[index].x -= BCC_DBX * (sub_box_lattice_size_0 + (neighbour_local_sub_box_0 - sub_box_lattice_size_0));
     }
-    else if(dimension == 1){
-      x = d_buffer[index].x;
-      if(next_id == 2 || next_id == 3 || next_id == 6 || next_id == 7) {
-        d_buffer[index].y += sub_box_lattice_size_1;
-      } else {
-        d_buffer[index].y -= sub_box_lattice_size_1 + (neighbour_local_sub_box_1 - sub_box_lattice_size_1);
-      }
-      y = d_buffer[index].y;
-      z = d_buffer[index].z;
-
-      id = getId(x,y,z);
-      // printf("original gho pos:(%ld,%ld,%ld)-%ld\t	,change gho pos:(%ld,%ld,%ld)-%ld\n",o_x,o_y,o_z,o_id,x,y,z,id);
-    }
-    else if(dimension == 2){
-      x = d_buffer[index].x;
-      y = d_buffer[index].y;
-      if(next_id > 3 ) {
-        d_buffer[index].z += sub_box_lattice_size_2;
-      }else{
-        d_buffer[index].z -= sub_box_lattice_size_2+ (neighbour_local_sub_box_2 - sub_box_lattice_size_2);
-      }
-      z = d_buffer[index].z;
-
-      id = getId(x,y,z);
-       //printf("change pos:(%ld,%ld,%ld)-%ld\n",x,y,z,id);
-      // printf("original gho pos:(%ld,%ld,%ld)-%ld\t	,change gho pos:(%ld,%ld,%ld)-%ld\n",o_x,o_y,o_z,o_id,x,y,z,id);
-    }
+    x = d_buffer[index].x;
+    y = d_buffer[index].y;
+    z = d_buffer[index].z;
+    id = getId(x,y,z);
   }
-    // L1: 拦截 Buffer 中传来的重复 ID
-    resolve_intra_tile_conflicts_single(id, active, tile);
+  else if(dimension == 1){
+    x = d_buffer[index].x;
+    if(next_id == 2 || next_id == 3 || next_id == 6 || next_id == 7) {
+      d_buffer[index].y += sub_box_lattice_size_1;
+    } else {
+      d_buffer[index].y -= sub_box_lattice_size_1 + (neighbour_local_sub_box_1 - sub_box_lattice_size_1);
+    }
+    y = d_buffer[index].y;
+    z = d_buffer[index].z;
+    id = getId(x,y,z);
+  }
+  else if(dimension == 2){
+    x = d_buffer[index].x;
+    y = d_buffer[index].y;
+    if(next_id > 3 ) {
+      d_buffer[index].z += sub_box_lattice_size_2;
+    }else{
+      d_buffer[index].z -= sub_box_lattice_size_2+ (neighbour_local_sub_box_2 - sub_box_lattice_size_2);
+    }
+    z = d_buffer[index].z;
+    id = getId(x,y,z);
+  }
 
-    // L2: 拦截跨 Block 的并发修改
-    bool lock_acquired = false;
-    if (active) {
-      lock_acquired = try_acquire_bitmap_lock_single(id);
-      if (!lock_acquired) active = false; // 抢锁失败，本轮不操作 (可交由下一帧重试，或直接丢弃因为必定有同伴正在更新它)
-    }
-   
-    bool need_del = active;
-    if (tiled_remove_op(g_Re_Hash, id, tile, need_del,g_Re_Hash->num_buckets) == 1) {
-        need_del = false; 
-    }
-    if (tiled_remove_op(g_MoRe_Hash, id, tile, need_del,g_MoRe_Hash->num_buckets) == 1) {
-        need_del = false; 
-    }
-    if (tiled_remove_op(g_MoMo_Hash, id, tile, need_del, g_MoMo_Hash->num_buckets) == 1) {
-        need_del = false; 
-    }
-    tiled_remove_op(g_V_Hash, id, tile, need_del, g_V_Hash->num_buckets);
+  // 跨 Block 并发互斥：单线程位图锁
+  if (!try_acquire_bitmap_lock_single(id)) return;
 
-    bool insert_V    = (active && type == LatticeTypes::V);
-    bool insert_Re   = (active && type == LatticeTypes::Re);
-    bool insert_MoMo = (active && type == LatticeTypes::MoMo);
-    bool insert_MoRe = (active && type == LatticeTypes::MoRe);
+  // 级联删除（删到第一张命中的表就停）
+  if (hash_set_remove_atom_op(g_Re_Hash, id) == 1) {
+  } else if (hash_set_remove_atom_op(g_MoRe_Hash, id) == 1) {
+  } else if (hash_set_remove_atom_op(g_MoMo_Hash, id) == 1) {
+  } else {
+    hash_set_remove_atom_op(g_V_Hash, id);
+  }
 
-    tiled_insert_op(g_V_Hash, id, tile, insert_V,g_V_Hash->num_buckets);
-    tiled_insert_op(g_Re_Hash, id, tile, insert_Re,g_Re_Hash->num_buckets);
-    tiled_insert_op(g_MoMo_Hash, id, tile, insert_MoMo,g_MoMo_Hash->num_buckets);
-    tiled_insert_op(g_MoRe_Hash, id, tile, insert_MoRe, g_MoRe_Hash->num_buckets);
-    if (lock_acquired) {
-        release_bitmap_lock_single(id);
-    }
-    return;
+  // 按新类型插入对应表
+  if (type == LatticeTypes::V) {
+    hash_set_insert_atom_op(g_V_Hash, id);
+  } else if (type == LatticeTypes::Re) {
+    hash_set_insert_atom_op(g_Re_Hash, id);
+  } else if (type == LatticeTypes::MoMo) {
+    hash_set_insert_atom_op(g_MoMo_Hash, id);
+  } else if (type == LatticeTypes::MoRe) {
+    hash_set_insert_atom_op(g_MoRe_Hash, id);
+  }
+
+  release_bitmap_lock_single(id);
+  return;
 }
 
 __global__ void update_hash_set2_tiled(ChangeLattice_GPU *d_buffer,int receive_len,const int dimension,
@@ -5817,6 +5874,33 @@ void rebuildPairAtomsAfterComm() {
     h_hash_keys_before = h_all[2];
   }
 
+  // 占用率统计：clear 之前统计 MoMo/MoRe 的 empty/tombstone/live，
+  // 有效占用 = (live+tombstone)/capacity 直接决定探测链长度，作为"容量是否足够"的预警。
+  if (verify_detail) {
+    hipLaunchKernelGGL(reset_validate_counters, 1, 1, 0, 0);
+    const int cb = 256;
+    if (MoMo_Hash && MoMo_Hash->device_ptr()) {
+      const int cap = MoMo_Hash->get_capacity();
+      const int grid = (cap + cb - 1) / cb;
+      if (grid > 0) hipLaunchKernelGGL(count_hash_occupancy, grid, cb, 0, 0, MoMo_Hash->device_ptr(), 0);
+    }
+    if (MoRe_Hash && MoRe_Hash->device_ptr()) {
+      const int cap = MoRe_Hash->get_capacity();
+      const int grid = (cap + cb - 1) / cb;
+      if (grid > 0) hipLaunchKernelGGL(count_hash_occupancy, grid, cb, 0, 0, MoRe_Hash->device_ptr(), 1);
+    }
+    hipDeviceSynchronize();
+    unsigned int h_occ[6] = {0, 0, 0, 0, 0, 0};
+    hipMemcpyFromSymbol(h_occ, HIP_SYMBOL(g_hash_occ), 6 * sizeof(unsigned int));
+    const long long momo_cap = MoMo_Hash ? MoMo_Hash->get_capacity() : 1;
+    const long long more_cap = MoRe_Hash ? MoRe_Hash->get_capacity() : 1;
+    kiwi::logs::v(" ", " [hash-occupancy] MoMo cap={} empty={} tombstone={} live={} eff_load={:.3f} | MoRe cap={} empty={} tombstone={} live={} eff_load={:.3f}.\n",
+                  momo_cap, h_occ[0], h_occ[1], h_occ[2],
+                  (h_occ[2] + h_occ[1]) / (double)momo_cap,
+                  more_cap, h_occ[3], h_occ[4], h_occ[5],
+                  (h_occ[5] + h_occ[4]) / (double)more_cap);
+  }
+
   HANDLE_HIP(hipMemset(d_Pair_Atoms, 0xFF, static_cast<size_t>(pair_atoms_size) * sizeof(long int)));
   HANDLE_HIP(hipMemset(d_pair_compact_count, 0, sizeof(int)));
 
@@ -5853,7 +5937,7 @@ void rebuildPairAtomsAfterComm() {
   }
 
   // 关键修复：clear 两个哈希表（清空有效 key 与长期累积的 tombstone），再按 compact 结果重新插入。
-  // 否则 tombstone 会拉长开放寻址探测链，超过 KMC_HASH_MAX_PROBES 后 hash_set_contains 误判为
+  // 否则 tombstone 会拉长开放寻址探测链，占用度逼近 1 时 hash_set_contains 误判为
   // “不存在”，validate_roster_all 因此误清 slot，造成 roster/hash 差值累积（间隙对漏游走）。
   if (MoMo_Hash) MoMo_Hash->clear();
   if (MoRe_Hash) MoRe_Hash->clear();

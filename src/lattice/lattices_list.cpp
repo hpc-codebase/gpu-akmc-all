@@ -195,8 +195,14 @@ void LatticesList::initGpuInfo_exchange(std::vector<long int> pair_atoms,
   for (const auto& pair : vac_hash) {
         vac_set.insert(pair.first); // 提取键并插入集合
   }
-  MoRe_Hash = new HIPHashSet(more_hash,more_hash.size()+momo_hash.size());
-  MoMo_Hash = new HIPHashSet(momo_hash,more_hash.size()+momo_hash.size());
+  // MoMo 与 MoRe 是间隙对的两种互斥状态：最坏情况全部间隙对落在同一张表。
+  // 且模拟中间隙对总数会增长（本算例一个 step 内 8590 → 13000+），
+  // 故两张表都按"2 倍初始总对数"的 key 容量开（构造器再 ×2 预留空槽），
+  // 保证增长后仍有余量、探测链不因满载而拉长。
+  const std::size_t total_pairs = more_hash.size() + momo_hash.size();
+  const int pair_capacity = static_cast<int>(2 * total_pairs);
+  MoRe_Hash = new HIPHashSet(more_hash, pair_capacity);
+  MoMo_Hash = new HIPHashSet(momo_hash, pair_capacity);
   Re_Hash = new HIPHashSet(re_hash);
   V_Hash = new HIPHashSet(vac_set);
   Busy_Set = new HIPHashSet(pair_atoms.size()+2);
