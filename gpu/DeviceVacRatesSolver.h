@@ -28,6 +28,15 @@
 
 #define HASH_SEED_PRIMARY 2u
 
+// MoRe 在一次 recb launch 内会经历大量 remove/insert churn。每次 recb 后会
+// 清理墓碑，因此默认容量由 18 倍压到 10 倍，兼顾探测余量和显存/扫描开销。
+#ifndef KMC_MORE_HASH_CAPACITY_MULTIPLIER
+#define KMC_MORE_HASH_CAPACITY_MULTIPLIER 10
+#endif
+#if KMC_MORE_HASH_CAPACITY_MULTIPLIER <= 0
+#error "KMC_MORE_HASH_CAPACITY_MULTIPLIER must be positive"
+#endif
+
 static constexpr long int GPU_HASH_EMPTY_KEY = -1L;
 static constexpr long int GPU_HASH_TOMBSTONE_KEY = -2L;
 

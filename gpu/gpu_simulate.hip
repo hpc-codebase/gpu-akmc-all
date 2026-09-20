@@ -4,10 +4,6 @@
 #include <mpi.h>
 
 #include <hiprand/hiprand_kernel.h>
-#ifndef KMC_RECB_DEVICE_PRINTF
-#define KMC_RECB_DEVICE_PRINTF 0
-#endif
-
 // recb 随机游走保险丝：限制的是循环尝试次数，不是成功跳跃次数。
 #ifndef KMC_RECB_MAX_ITERATIONS
 #define KMC_RECB_MAX_ITERATIONS 100000
@@ -43,16 +39,18 @@ __device__ static hiprandStatePhilox4_32_10_t *g_rng_states;//每个 walker 线�
 // [0]=validate_cleared [1]=validate_cleared_ghost [2]=hash_keys_before_compact [3]=roster_after_compact
 __device__ static unsigned int g_validate_counters[4];
 
-// 哈希操作统计（KMC_RECB_VERIFY_DETAIL=1 时启用，用于量化 recb 的访存负载）：
-// query:  [0]MoRe [1]MoMo [2]Re [3]V 的 hash_set_contains 调用次数
-// update: [0]MoMo [1]MoRe [2]Re [3]ghost [4]surface 的 insert+remove 调用次数
-__device__ static unsigned long long g_hash_query[4];
-__device__ static unsigned long long g_hash_update[5];
+// 哈希统计统一由 KMC_RECB_HASH_STATS=1 控制。
+// 下标：[0]MoRe [1]MoMo [2]Re [3]V [4]Busy [5]ghost [6]surface。
+static constexpr int RECB_HASH_TABLE_COUNT = 7;
+__device__ static unsigned long long g_hash_query[RECB_HASH_TABLE_COUNT];
+__device__ static unsigned long long g_hash_update[RECB_HASH_TABLE_COUNT];
 __device__ static bool g_hash_stats_on = false;
-// 最长探测链（桶数）：仅在探测链 ≥32 时触发 atomicMax，正常链零开销。
-// 0 表示本轮没有任何一次探测走深（健康）；>0 说明有长链，值越大离"满载"越近。
-__device__ static unsigned int g_probe_max;
-// 哈希表占用统计（KMC_RECB_VERIFY_DETAIL=1 时在 rebuild 前统计）：
+// 每张表独立的最长探测链（桶数）；仅统计模式开启时更新。
+__device__ static unsigned int g_probe_max[RECB_HASH_TABLE_COUNT];
+// MoRe 增量占用：[empty, tombstone, live]。无论日志开关是否开启均维护，
+// refresh 只需回读这三个数；debug 模式再用全表扫描交叉核验。
+__device__ static unsigned int g_more_occupancy[3];
+// 正确性 debug 模式在通信 rebuild 前统计两张 pair 表的占用：
 // [MoMo, MoRe] × {empty, tombstone, live}
 __device__ static unsigned int g_hash_occ[6];
 
@@ -177,6 +175,8 @@ namespace gpuSimulate {
     long int rng_states_count = 0;
     long int *d_sector_slots = nullptr;   // recb 前筛出的本扇区 walker 槽位号（g_Pair_Atoms 下标）
     int *d_sector_slot_count = nullptr;   // 本扇区 walker 数
+    long int *d_more_refresh_keys = nullptr;       // MoRe 原地刷新时暂存全部 LIVE key
+    unsigned int *d_more_refresh_counts = nullptr; // empty/tombstone/live/reinsert_fail
 
     unsigned long long int* d_Global_Bitmap_Lock = nullptr;
     size_t bitmap_lock_bytes = 0;
@@ -191,18 +191,21 @@ namespace gpuSimulate {
     int ghost_capacity;
     int surface_capacity;
 
-    static bool recbProfileEnabled() {
+    // 只保留两类运行时开关：
+    //   KMC_RECB_CORRECTNESS_DEBUG=1  正确性/不变量/全表核验
+    //   KMC_RECB_HASH_STATS=1         哈希访问量、分类 probe、占用与性能计时
+    static bool recbHashStatsEnabled() {
       static int cached = -1;
       if (cached != -1) return cached != 0;
-      const char* v = std::getenv("KMC_RECB_PROFILE");
+      const char* v = std::getenv("KMC_RECB_HASH_STATS");
       cached = (v != nullptr && v[0] != '\0' && v[0] != '0') ? 1 : 0;
       return cached != 0;
     }
 
-    static bool recbVerifyDetailEnabled() {
+    static bool recbCorrectnessDebugEnabled() {
       static int cached = -1;
       if (cached != -1) return cached != 0;
-      const char* v = std::getenv("KMC_RECB_VERIFY_DETAIL");
+      const char* v = std::getenv("KMC_RECB_CORRECTNESS_DEBUG");
       cached = (v != nullptr && v[0] != '\0' && v[0] != '0') ? 1 : 0;
       return cached != 0;
     }
@@ -432,19 +435,64 @@ __device__ inline void release_bitmap_lock_single(long int id) {
 // 适用于未声明协作组的普通线程调用
 // 返回值: true (找到), false (未找到)
 // =========================================================
+__device__ __forceinline__ int recb_hash_table_index(const GPUHashSet* set) {
+    if (set == g_MoRe_Hash) return 0;
+    if (set == g_MoMo_Hash) return 1;
+    if (set == g_Re_Hash) return 2;
+    if (set == g_V_Hash) return 3;
+    if (set == g_Busy_Set) return 4;
+    if (set == g_ghost_Hash) return 5;
+    if (set == g_surface_Hash) return 6;
+    return -1;
+}
+
+__device__ __forceinline__ void record_hash_query(GPUHashSet* set) {
+    if (!g_hash_stats_on) return;
+    const int idx = recb_hash_table_index(set);
+    if (idx >= 0) atomicAdd(&g_hash_query[idx], 1ULL);
+}
+
+__device__ __forceinline__ void record_hash_update(GPUHashSet* set) {
+    if (!g_hash_stats_on) return;
+    const int idx = recb_hash_table_index(set);
+    if (idx >= 0) atomicAdd(&g_hash_update[idx], 1ULL);
+}
+
+__device__ __forceinline__ void record_hash_probe(GPUHashSet* set,
+                                                   unsigned int probe_len) {
+    if (!g_hash_stats_on) return;
+    const int idx = recb_hash_table_index(set);
+    if (idx >= 0 && probe_len > g_probe_max[idx]) {
+      atomicMax(&g_probe_max[idx], probe_len);
+    }
+}
+
+__device__ __forceinline__ void record_more_insert(GPUHashSet* set,
+                                                    long int replaced_value) {
+    if (set != g_MoRe_Hash) return;
+    if (replaced_value == set->tombstone_flag) {
+      atomicSub(&g_more_occupancy[1], 1u);
+    } else {
+      atomicSub(&g_more_occupancy[0], 1u);
+    }
+    atomicAdd(&g_more_occupancy[2], 1u);
+}
+
+__device__ __forceinline__ void record_more_remove(GPUHashSet* set) {
+    if (set != g_MoRe_Hash) return;
+    atomicSub(&g_more_occupancy[2], 1u);
+    atomicAdd(&g_more_occupancy[1], 1u);
+}
+
 __device__ bool hash_set_contains(GPUHashSet* set, long int key) {
     if (set == nullptr || key <= 0) return false;
-    if (g_hash_stats_on) {
-      if (set == g_MoRe_Hash) atomicAdd(&g_hash_query[0], 1ULL);
-      else if (set == g_MoMo_Hash) atomicAdd(&g_hash_query[1], 1ULL);
-      else if (set == g_Re_Hash) atomicAdd(&g_hash_query[2], 1ULL);
-      else if (set == g_V_Hash) atomicAdd(&g_hash_query[3], 1ULL);
-    }
+    record_hash_query(set);
     unsigned int loop_count = 0;
     const unsigned int max_probe = hash_effective_max_probes(set->num_buckets);
     unsigned int buck_num = hash_probe_bucket(set->num_buckets, key, loop_count);
     while (loop_count <= max_probe ) {
-        if (loop_count >= 32) atomicMax(&g_probe_max, loop_count + 1);
+        const unsigned int probe_len = loop_count + 1;
+        record_hash_probe(set, probe_len);
         int base_index = buck_num * BUCKET_SIZE;
         bool has_empty = false;
 
@@ -472,13 +520,7 @@ __device__ bool hash_set_contains(GPUHashSet* set, long int key) {
 // 返回值: 1 (插入成功), 0 (已存在，未重复插入), -1 (表满失败)
 __device__ int hash_set_insert_atom_op(GPUHashSet* set, long int key) {
     if (set == nullptr || key <= 0) return -1;
-    if (g_hash_stats_on) {
-      if (set == g_MoMo_Hash) atomicAdd(&g_hash_update[0], 1ULL);
-      else if (set == g_MoRe_Hash) atomicAdd(&g_hash_update[1], 1ULL);
-      else if (set == g_Re_Hash) atomicAdd(&g_hash_update[2], 1ULL);
-      else if (set == g_ghost_Hash) atomicAdd(&g_hash_update[3], 1ULL);
-      else if (set == g_surface_Hash) atomicAdd(&g_hash_update[4], 1ULL);
-    }
+    record_hash_update(set);
     const unsigned int max_probe = hash_effective_max_probes(set->num_buckets);
     // CAS 被同 bucket 的其他 key 抢占时从头重查，避免在并发下制造重复 key。
     for (unsigned int retry = 0; retry < 64; ++retry) {
@@ -487,7 +529,8 @@ __device__ int hash_set_insert_atom_op(GPUHashSet* set, long int key) {
         unsigned int buck_num = hash_probe_bucket(set->num_buckets, key, loop_count);
 
         while (loop_count <= max_probe) {
-            if (loop_count >= 32) atomicMax(&g_probe_max, loop_count + 1);
+            const unsigned int probe_len = loop_count + 1;
+            record_hash_probe(set, probe_len);
             int base_index = buck_num * BUCKET_SIZE;
             long int* first_empty = nullptr;
 
@@ -514,7 +557,10 @@ __device__ int hash_set_insert_atom_op(GPUHashSet* set, long int key) {
                     reinterpret_cast<unsigned long long int*>(target_addr),
                     static_cast<unsigned long long int>(expected),
                     static_cast<unsigned long long int>(key));
-                if (old_val == static_cast<unsigned long long int>(expected)) return 1;
+                if (old_val == static_cast<unsigned long long int>(expected)) {
+                    record_more_insert(set, expected);
+                    return 1;
+                }
                 break; // candidate 被抢占，从 home bucket 重新验证 key 是否已存在
             }
 
@@ -530,7 +576,10 @@ __device__ int hash_set_insert_atom_op(GPUHashSet* set, long int key) {
                 reinterpret_cast<unsigned long long int*>(first_tombstone),
                 static_cast<unsigned long long int>(set->tombstone_flag),
                 static_cast<unsigned long long int>(key));
-            if (old_val == static_cast<unsigned long long int>(set->tombstone_flag)) return 1;
+            if (old_val == static_cast<unsigned long long int>(set->tombstone_flag)) {
+                record_more_insert(set, set->tombstone_flag);
+                return 1;
+            }
         } else if (loop_count > max_probe) {
             return -1;
         }
@@ -541,19 +590,14 @@ __device__ int hash_set_insert_atom_op(GPUHashSet* set, long int key) {
 // 返回值: 1 (删除成功), 0 (未找到该 Key)
 __device__ int hash_set_remove_atom_op(GPUHashSet* set, long int key) {
     if (set == nullptr || key <= 0) return 0;
-    if (g_hash_stats_on) {
-      if (set == g_MoMo_Hash) atomicAdd(&g_hash_update[0], 1ULL);
-      else if (set == g_MoRe_Hash) atomicAdd(&g_hash_update[1], 1ULL);
-      else if (set == g_Re_Hash) atomicAdd(&g_hash_update[2], 1ULL);
-      else if (set == g_ghost_Hash) atomicAdd(&g_hash_update[3], 1ULL);
-      else if (set == g_surface_Hash) atomicAdd(&g_hash_update[4], 1ULL);
-    }
+    record_hash_update(set);
     unsigned int loop_count = 0;
     const unsigned int max_probe = hash_effective_max_probes(set->num_buckets);
     unsigned int buck_num = hash_probe_bucket(set->num_buckets, key, loop_count);
 
     while (loop_count <= max_probe) {
-        if (loop_count >= 32) atomicMax(&g_probe_max, loop_count + 1);
+        const unsigned int probe_len = loop_count + 1;
+        record_hash_probe(set, probe_len);
         int base_index = buck_num * BUCKET_SIZE;
         bool has_empty = false;
 
@@ -573,7 +617,10 @@ __device__ int hash_set_remove_atom_op(GPUHashSet* set, long int key) {
                 );
 
                 // 抢占成功
-                if (old_val == (unsigned long long int)key) return 1;
+                if (old_val == (unsigned long long int)key) {
+                    record_more_remove(set);
+                    return 1;
+                }
 
                 // 抢占失败（说明就在这一瞬间，这个 Key 刚好被别的逻辑删了或改了）
                 i--; // 重新检查
@@ -604,6 +651,7 @@ __device__ __noinline__ int tiled_contains_op(GPUHashSet* set, long int key, Til
         long int leader_key = tile.shfl(key, leader); 
         
         int lane = tile.thread_rank();
+        if (lane == leader) record_hash_query(set);
 
         int loop_count = 0;
         unsigned int buck_num = hash_probe_bucket(set->num_buckets, leader_key, loop_count);
@@ -616,6 +664,7 @@ __device__ __noinline__ int tiled_contains_op(GPUHashSet* set, long int key, Til
         // }
 
         while(searching) {
+            if (lane == leader) record_hash_probe(set, static_cast<unsigned int>(loop_count + 1));
             // long int val = set->keys[buck_num * 64 + lane].load(hip::memory_order_relaxed);
             long int val = atomic_load_relaxed(&set->keys[buck_num * BUCKET_SIZE + lane]);
             
@@ -667,6 +716,7 @@ __device__ int tiled_insert_op(GPUHashSet* set, long int key, TileType tile, boo
         long int leader_key = (long int)tile.shfl((unsigned long long int)key, leader);
         
         int lane = tile.thread_rank();
+        if (lane == leader) record_hash_update(set);
         int loop_count = 0;
         unsigned int buck_num = hash_probe_bucket(set->num_buckets, leader_key, loop_count);
         int leader_result = 0;
@@ -675,6 +725,7 @@ __device__ int tiled_insert_op(GPUHashSet* set, long int key, TileType tile, boo
         // }
         int searching = 1;
         while(searching){
+          if (lane == leader) record_hash_probe(set, static_cast<unsigned int>(loop_count + 1));
           // long int val = set->keys[buck_num * 64 + lane].load(hip::memory_order_relaxed);
           long int val = atomic_load_relaxed(&set->keys[buck_num * BUCKET_SIZE + lane]);
           if (tile.ballot(val == leader_key) != 0) {
@@ -704,6 +755,7 @@ __device__ int tiled_insert_op(GPUHashSet* set, long int key, TileType tile, boo
                     unsigned long long int* addr = (unsigned long long int*)&set->keys[buck_num * BUCKET_SIZE + lane];
                     unsigned long long int old_val = atomicCAS(addr, (unsigned long long int)val, (unsigned long long int)leader_key);
                     cas_success = (old_val == (unsigned long long int)val) ? 1 : 0;
+                    if (cas_success) record_more_insert(set, val);
                     // #endif
                     // cas_success = do_safe_atomic_cas((long int*)&set->keys[buck_num * 64 + lane], val, leader_key);
                 }
@@ -748,6 +800,7 @@ __device__ int tiled_remove_op(GPUHashSet* set, long int key, TileType tile, boo
         long int leader_key = (long int)tile.shfl((unsigned long long int)key, leader);
         
         int lane = tile.thread_rank();
+        if (lane == leader) record_hash_update(set);
         int loop_count = 0;
         unsigned int buck_num = hash_probe_bucket(set->num_buckets, leader_key, loop_count);
         int leader_result = 0;
@@ -756,6 +809,7 @@ __device__ int tiled_remove_op(GPUHashSet* set, long int key, TileType tile, boo
         // }
         int searching = 1;
         while(searching){
+            if (lane == leader) record_hash_probe(set, static_cast<unsigned int>(loop_count + 1));
             // long int val = set->keys[buck_num * 64 + lane].load(hip::memory_order_relaxed);
             long int val = atomic_load_relaxed(&set->keys[buck_num * BUCKET_SIZE + lane]);
             uint64_t match_mask = tile.ballot(val == leader_key);
@@ -773,6 +827,7 @@ __device__ int tiled_remove_op(GPUHashSet* set, long int key, TileType tile, boo
                     unsigned long long int* addr = (unsigned long long int*)&set->keys[buck_num * BUCKET_SIZE + lane];
                     unsigned long long int old_val = atomicCAS(addr, (unsigned long long int)leader_key, (unsigned long long int)set->tombstone_flag);
                     cas_success = (old_val == (unsigned long long int)leader_key) ? 1 : 0;
+                    if (cas_success) record_more_remove(set);
                     // #endif
                     // cas_success = do_safe_atomic_cas((long int*)&set->keys[buck_num * 64 + lane], leader_key, set->tombstone_flag);
                 }
@@ -3095,11 +3150,13 @@ __device__ bool collective_bucket_contains(GPUHashSet* set, long int target_key,
     unsigned int loop_count = 0;
     unsigned int buck_num = valid_key ? hash_probe_bucket(set->num_buckets, target_key, loop_count) : 0;
     const int lane = tile.thread_rank();
+    if (lane == 0 && valid_key) record_hash_query(set);
     bool done = !valid_key;
     bool result = false;
     // const int MAX_PROBE_STEPS = 3;
 
     while (loop_count <= max_probe) {
+        if (lane == 0 && !done) record_hash_probe(set, loop_count + 1);
         long int val = GPU_HASH_EMPTY_KEY;
         if (!done) {
             val = atomic_load_relaxed(&set->keys[buck_num * BUCKET_SIZE + lane]);
@@ -3235,9 +3292,9 @@ __global__ void __launch_bounds__(128) calcExchangePairs(int sector_id,int arr_s
                                   const long int* __restrict__ sector_slots,
                                   bool verify_detail
 ){
-  #if KMC_RECB_DEVICE_PRINTF
-  printf("begin calcExchangePairs\n");
-#endif
+  if (verify_detail && blockIdx.x == 0 && threadIdx.x == 0) {
+    printf("begin calcExchangePairs\n");
+  }
   __shared__ unsigned int block_direction_counts[14];
   if (verify_detail) {
     if (threadIdx.x < 14) block_direction_counts[threadIdx.x] = 0;
@@ -4109,12 +4166,21 @@ __global__ void reset_validate_counters() {
   g_hash_occ[3] = 0; g_hash_occ[4] = 0; g_hash_occ[5] = 0;
 }
 
-// 清零哈希操作统计计数器（g_hash_query / g_hash_update / g_probe_max）
+// 清零每张表的哈希操作统计计数器。
 __global__ void reset_hash_stats() {
-  g_hash_query[0] = 0; g_hash_query[1] = 0; g_hash_query[2] = 0; g_hash_query[3] = 0;
-  g_hash_update[0] = 0; g_hash_update[1] = 0; g_hash_update[2] = 0;
-  g_hash_update[3] = 0; g_hash_update[4] = 0;
-  g_probe_max = 0;
+  for (int i = 0; i < RECB_HASH_TABLE_COUNT; ++i) {
+    g_hash_query[i] = 0;
+    g_hash_update[i] = 0;
+    g_probe_max[i] = 0;
+  }
+}
+
+__global__ void reset_more_occupancy(unsigned int capacity) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    g_more_occupancy[0] = capacity;
+    g_more_occupancy[1] = 0;
+    g_more_occupancy[2] = 0;
+  }
 }
 
 // 统计一个哈希表的有效 key 数，累加到 g_validate_counters[2]
@@ -4131,13 +4197,23 @@ __global__ void count_hash_keys_all(GPUHashSet* set) {
 // 用于 rebuild 前量化"离满载还有多少余量"：有效占用 = (live + tombstone) / capacity，
 // 它决定了开放寻址探测链的长度。idx: 0=MoMo, 1=MoRe。
 __global__ void count_hash_occupancy(GPUHashSet* set, int idx) {
+  __shared__ unsigned int block_counts[3];
+  if (threadIdx.x < 3) block_counts[threadIdx.x] = 0;
+  __syncthreads();
   if (!set) return;
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= set->capacity) return;
-  const long int key = set->keys[i];
-  if (key == set->empty_flag) atomicAdd(&g_hash_occ[idx * 3 + 0], 1u);
-  else if (key == set->tombstone_flag) atomicAdd(&g_hash_occ[idx * 3 + 1], 1u);
-  else atomicAdd(&g_hash_occ[idx * 3 + 2], 1u);
+  if (i < set->capacity) {
+    const long int key = set->keys[i];
+    if (key == set->empty_flag) atomicAdd(&block_counts[0], 1u);
+    else if (key == set->tombstone_flag) atomicAdd(&block_counts[1], 1u);
+    else atomicAdd(&block_counts[2], 1u);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    atomicAdd(&g_hash_occ[idx * 3 + 0], block_counts[0]);
+    atomicAdd(&g_hash_occ[idx * 3 + 1], block_counts[1]);
+    atomicAdd(&g_hash_occ[idx * 3 + 2], block_counts[2]);
+  }
 }
 
 // 统计花名册有效 slot 数，累加到 g_validate_counters[3]
@@ -4160,6 +4236,198 @@ __global__ void reinsert_from_roster(GPUHashSet* set, const long int* roster,
   hash_set_insert_atom_op(set, roster[idx]);
 }
 
+// recb 专用 MoRe 全表核验/压缩。每个 block 先在 shared memory 内归约，
+// 全局只提交 empty/tombstone/live 三个计数；LIVE scratch 也按 block 一次性
+// 预留连续区间，避免每个槽争抢全局计数器。
+__global__ void compact_more_for_refresh(GPUHashSet* set, long int* live_keys,
+                                         unsigned int* counts,
+                                         long int live_keys_capacity) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  __shared__ unsigned int block_counts[3];
+  __shared__ unsigned int block_live_write;
+  __shared__ unsigned int block_live_base;
+  if (threadIdx.x < 3) block_counts[threadIdx.x] = 0;
+  if (threadIdx.x == 0) {
+    block_live_write = 0;
+    block_live_base = 0;
+  }
+  __syncthreads();
+
+  bool is_live = false;
+  long int key = GPU_HASH_EMPTY_KEY;
+  if (set && live_keys && counts && i < set->capacity) {
+    key = set->keys[i];
+    if (key == set->empty_flag) {
+      atomicAdd(&block_counts[0], 1u);
+    } else if (key == set->tombstone_flag) {
+      atomicAdd(&block_counts[1], 1u);
+    } else {
+      is_live = true;
+      atomicAdd(&block_counts[2], 1u);
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0 && set && live_keys && counts) {
+    atomicAdd(&counts[0], block_counts[0]);
+    atomicAdd(&counts[1], block_counts[1]);
+    block_live_base = atomicAdd(&counts[2], block_counts[2]);
+  }
+  __syncthreads();
+
+  if (is_live) {
+    const unsigned int local_pos = atomicAdd(&block_live_write, 1u);
+    const unsigned int global_pos = block_live_base + local_pos;
+    if (static_cast<long int>(global_pos) < live_keys_capacity) {
+      live_keys[global_pos] = key;
+    }
+  }
+}
+
+__global__ void reinsert_more_after_refresh(GPUHashSet* set,
+                                            const long int* live_keys,
+                                            unsigned int live_count,
+                                            unsigned int* counts) {
+  const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (!set || !live_keys || !counts || i >= live_count) return;
+  if (hash_set_insert_atom_op(set, live_keys[i]) != 1) {
+    atomicAdd(&counts[3], 1u);
+  }
+}
+
+static void refreshMoReAfterRecb(unsigned int sector_id, int launch_n,
+                                 bool correctness_debug, bool hash_stats) {
+  using namespace gpuSimulate;
+  if (!MoRe_Hash || !MoRe_Hash->device_ptr() || !d_more_refresh_keys ||
+      !d_more_refresh_counts || pair_atoms_size <= 0) {
+    return;
+  }
+
+  const int block = 256;
+  const int capacity = MoRe_Hash->get_capacity();
+  unsigned int h_incremental[3] = {0, 0, 0};
+  HANDLE_HIP(hipMemcpyFromSymbol(h_incremental, HIP_SYMBOL(g_more_occupancy),
+                                 3 * sizeof(unsigned int)));
+
+  unsigned int h_counts[4] = {h_incremental[0], h_incremental[1],
+                              h_incremental[2], 0};
+  bool used_full_scan = correctness_debug || h_incremental[1] > 0;
+  const unsigned long long incremental_sum =
+      static_cast<unsigned long long>(h_incremental[0]) + h_incremental[1] +
+      h_incremental[2];
+  if (incremental_sum != static_cast<unsigned long long>(capacity)) {
+    used_full_scan = true;
+  }
+
+  if (used_full_scan) {
+    HANDLE_HIP(hipMemset(d_more_refresh_counts, 0, 4 * sizeof(unsigned int)));
+    const int grid = (capacity + block - 1) / block;
+    hipLaunchKernelGGL(compact_more_for_refresh, grid, block, 0, 0,
+                       MoRe_Hash->device_ptr(), d_more_refresh_keys,
+                       d_more_refresh_counts, pair_atoms_size);
+    CHECK_FOR_ERROR();
+    HANDLE_HIP(hipMemcpy(h_counts, d_more_refresh_counts,
+                         4 * sizeof(unsigned int), hipMemcpyDeviceToHost));
+  }
+
+  int rank = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  const double effective_load =
+      capacity > 0 ? (h_counts[1] + h_counts[2]) / static_cast<double>(capacity) : 0.0;
+  if (correctness_debug || hash_stats) {
+    kiwi::logs::v(" ", " [recb-more-occupancy] rank={} sect={} launch={} source={} cap={} empty={} tombstone={} live={} eff_load={:.3f} action={}.\n",
+                  rank, sector_id, launch_n,
+                  used_full_scan ? "full-scan" : "incremental", capacity,
+                  h_counts[0], h_counts[1], h_counts[2], effective_load,
+                  h_counts[1] == 0 ? "skip-clean" : "refresh");
+  }
+
+  if (used_full_scan &&
+      (h_counts[0] != h_incremental[0] || h_counts[1] != h_incremental[1] ||
+       h_counts[2] != h_incremental[2])) {
+    kiwi::logs::v(" ", " [recb-more-counter-mismatch] rank={} sect={} launch={} incremental={}/{}/{} scanned={}/{}/{}（empty/tombstone/live）.\n",
+                  rank, sector_id, launch_n, h_incremental[0], h_incremental[1],
+                  h_incremental[2], h_counts[0], h_counts[1], h_counts[2]);
+    HANDLE_HIP(hipMemcpyToSymbol(HIP_SYMBOL(g_more_occupancy), h_counts,
+                                 3 * sizeof(unsigned int)));
+  }
+
+  if (used_full_scan) {
+    const unsigned long long classified_slots =
+        static_cast<unsigned long long>(h_counts[0]) + h_counts[1] + h_counts[2];
+    if (classified_slots != static_cast<unsigned long long>(capacity)) {
+      kiwi::logs::v(" ", " [recb-more-refresh-fatal] rank={} sect={} launch={} occupancy_sum={} cap={}（占用统计不完整，禁止 clear）.\n",
+                    rank, sector_id, launch_n, classified_slots, capacity);
+      MPI_Abort(MPI_COMM_WORLD, 90);
+      return;
+    }
+
+    if (h_counts[2] > static_cast<unsigned int>(pair_atoms_size)) {
+      kiwi::logs::v(" ", " [recb-more-refresh-fatal] rank={} sect={} launch={} live={} scratch_capacity={}（LIVE key 尚未全部保存，禁止 clear 以免破坏哈希表）.\n",
+                    rank, sector_id, launch_n, h_counts[2], pair_atoms_size);
+      MPI_Abort(MPI_COMM_WORLD, 91);
+      return;
+    }
+  }
+
+  // 墓碑为零时无需 clear/reinsert；debug 模式虽然完成了全表核验，也直接返回。
+  if (h_counts[1] == 0) return;
+
+  // 此时所有 LIVE key 已完整保存。整表 clear 后再插回，墓碑转为 EMPTY，
+  // 不会产生“在原探测链中间直接清墓碑”导致的 contains 提前终止。
+  MoRe_Hash->clear();
+  hipLaunchKernelGGL(reset_more_occupancy, 1, 1, 0, 0,
+                     static_cast<unsigned int>(capacity));
+  CHECK_FOR_ERROR();
+  if (h_counts[2] > 0) {
+    const int reinsert_grid = (static_cast<int>(h_counts[2]) + block - 1) / block;
+    hipLaunchKernelGGL(reinsert_more_after_refresh, reinsert_grid, block, 0, 0,
+                       MoRe_Hash->device_ptr(), d_more_refresh_keys,
+                       h_counts[2], d_more_refresh_counts);
+    CHECK_FOR_ERROR();
+    HANDLE_HIP(hipDeviceSynchronize());
+    HANDLE_HIP(hipMemcpy(&h_counts[3], d_more_refresh_counts + 3,
+                         sizeof(unsigned int), hipMemcpyDeviceToHost));
+  }
+  if (h_counts[3] != 0) {
+    kiwi::logs::v(" ", " [recb-more-refresh-fatal] rank={} sect={} launch={} reinsert_failures={} live={} cap={}.\n",
+                  rank, sector_id, launch_n, h_counts[3], h_counts[2], capacity);
+    MPI_Abort(MPI_COMM_WORLD, 92);
+  }
+}
+
+static void initializeMoreOccupancyCounter() {
+  using namespace gpuSimulate;
+  if (!MoRe_Hash || !MoRe_Hash->device_ptr() || !d_more_refresh_keys ||
+      !d_more_refresh_counts || pair_atoms_size <= 0) return;
+
+  const int block = 256;
+  const int capacity = MoRe_Hash->get_capacity();
+  const int grid = (capacity + block - 1) / block;
+  HANDLE_HIP(hipMemset(d_more_refresh_counts, 0, 4 * sizeof(unsigned int)));
+  hipLaunchKernelGGL(compact_more_for_refresh, grid, block, 0, 0,
+                     MoRe_Hash->device_ptr(), d_more_refresh_keys,
+                     d_more_refresh_counts, pair_atoms_size);
+  CHECK_FOR_ERROR();
+  unsigned int h_counts[4] = {};
+  HANDLE_HIP(hipMemcpy(h_counts, d_more_refresh_counts,
+                       4 * sizeof(unsigned int), hipMemcpyDeviceToHost));
+  const unsigned long long sum = static_cast<unsigned long long>(h_counts[0]) +
+                                 h_counts[1] + h_counts[2];
+  if (sum != static_cast<unsigned long long>(capacity) ||
+      h_counts[2] > static_cast<unsigned int>(pair_atoms_size)) {
+    int rank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    kiwi::logs::v(" ", " [recb-more-counter-init-fatal] rank={} cap={} empty={} tombstone={} live={} scratch_capacity={}.\n",
+                  rank, capacity, h_counts[0], h_counts[1], h_counts[2],
+                  pair_atoms_size);
+    MPI_Abort(MPI_COMM_WORLD, 93);
+    return;
+  }
+  HANDLE_HIP(hipMemcpyToSymbol(HIP_SYMBOL(g_more_occupancy), h_counts,
+                               3 * sizeof(unsigned int)));
+}
+
 __global__ void validate_roster_all(long int roster_size, bool verify_detail) {
   long int slot = blockIdx.x * (long int)blockDim.x + threadIdx.x;
   if (slot >= roster_size) return;
@@ -4168,7 +4436,7 @@ __global__ void validate_roster_all(long int roster_size, bool verify_detail) {
   const LatticeTypes::lat_type type = getType(id);
   if (type != LatticeTypes::MoMo && type != LatticeTypes::MoRe) {
     // 兜底清理是正确性修复逻辑，始终执行；计数与 printf 仅为排查，收到
-    // KMC_RECB_VERIFY_DETAIL 开关里，关闭时零开销。
+    // KMC_RECB_CORRECTNESS_DEBUG 开关里，关闭时零开销。
     g_Pair_Atoms[slot] = -1;
     if (verify_detail) {
       unsigned int seq = atomicAdd(&g_validate_counters[0], 1u);
@@ -4293,9 +4561,17 @@ void recb_solver_GPU(
     // HANDLE_HIP(hipMemset(Pair_Atoms, -1,arr_size * sizeof(long int) * 2));
    
     // printf("starting recb solver with GPU sector_id:%d,arr_size:%d\n",sector_id,arr_size);
-    const bool do_profile = recbProfileEnabled();
-    const bool verify_detail = recbVerifyDetailEnabled();
+    const bool hash_stats = recbHashStatsEnabled();
+    const bool do_profile = hash_stats;
+    const bool verify_detail = recbCorrectnessDebugEnabled();
     if (do_profile) initRecbProfileEvents();
+
+    static int recb_launch_by_sector[8] = {};
+    static unsigned long long recb_capped_total = 0;
+    const unsigned int sid = sector_id < 8 ? sector_id : 0;
+    const int launch_n = ++recb_launch_by_sector[sid];
+    int recb_rank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &recb_rank);
 
     blockSize = 128;
     // print_Hash_and_Pair
@@ -4303,10 +4579,10 @@ void recb_solver_GPU(
     // printf("arr size is %ld\n",pair_atoms_size);
     // hipLaunchKernelGGL(print_Hash_and_Pair, 1, 1, 0, 0,arr_size,0);
 
-    if (!d_recb_verify_stats) {
+    if (verify_detail && !d_recb_verify_stats) {
       HANDLE_HIP(hipMalloc(reinterpret_cast<void**>(&d_recb_verify_stats), sizeof(RecbVerifyStats)));
     }
-    // 验证统计的清零/回读/全表计数只在 KMC_RECB_VERIFY_DETAIL=1 时启用；
+    // 验证统计的清零/回读/全表计数只在正确性 debug 模式启用；
     // 关闭时 kernel 收到 nullptr，内部所有统计 atomic 自动跳过。
     if (verify_detail) {
       HANDLE_HIP(hipMemset(d_recb_verify_stats, 0, sizeof(RecbVerifyStats)));
@@ -4326,9 +4602,10 @@ void recb_solver_GPU(
     //=============================================================
 
     if (do_profile) HANDLE_HIP(hipEventRecord(recb_evt_begin, 0));
-    // 哈希操作统计：清零计数器并开启统计开关（仅 verify_detail 时，正常跑零开销）
-    if (verify_detail) {
+    // query/update/probe 三类原子统计只在哈希统计模式开启。
+    if (hash_stats) {
       hipLaunchKernelGGL(reset_hash_stats, 1, 1, 0, 0);
+      CHECK_FOR_ERROR();
       const bool stats_on = true;
       HANDLE_HIP(hipMemcpyToSymbol(HIP_SYMBOL(g_hash_stats_on), &stats_on, sizeof(bool)));
     }
@@ -4340,15 +4617,15 @@ void recb_solver_GPU(
                         verify_detail
                         );
       CHECK_FOR_ERROR();
-      if (verify_detail) {
-        const bool stats_off = false;
-        HANDLE_HIP(hipMemcpyToSymbol(HIP_SYMBOL(g_hash_stats_on), &stats_off, sizeof(bool)));
-      }
       // 正确性清理不依赖详细日志开关；同一默认 stream 保证它在游走结束后执行。
       hipLaunchKernelGGL(validate_pair_slots, numBlocks, blockSize, 0, 0,
                          d_sector_slots, h_sector_count,
                          verify_detail ? d_recb_verify_stats : nullptr);
       CHECK_FOR_ERROR();
+    }
+    if (hash_stats) {
+      const bool stats_off = false;
+      HANDLE_HIP(hipMemcpyToSymbol(HIP_SYMBOL(g_hash_stats_on), &stats_off, sizeof(bool)));
     }
     if (verify_detail) {
       const int count_block = 256;
@@ -4375,16 +4652,14 @@ void recb_solver_GPU(
       }
       hipDeviceSynchronize();
     }
+    unsigned int h_probe_max[RECB_HASH_TABLE_COUNT] = {};
+    if (hash_stats) {
+      HANDLE_HIP(hipMemcpyFromSymbol(h_probe_max, HIP_SYMBOL(g_probe_max),
+                                     sizeof(h_probe_max)));
+    }
     if (do_profile) HANDLE_HIP(hipEventRecord(recb_evt_after_exchange, 0));
 
     if (verify_detail) {
-      static int recb_launch_by_sector[8] = {};
-      static unsigned long long recb_capped_total = 0; // 全程累计触发上限的 walker 数
-      const unsigned int sid = sector_id < 8 ? sector_id : 0;
-      recb_launch_by_sector[sid]++;
-      const int launch_n = recb_launch_by_sector[sid];
-      int recb_rank = 0;
-      MPI_Comm_rank(MPI_COMM_WORLD, &recb_rank);
       // 每次启动都取回统计（保险丝计数不能漏），但常规日志只打前 5 次
       RecbVerifyStats h_stats{};
       HANDLE_HIP(hipMemcpy(&h_stats, d_recb_verify_stats, sizeof(RecbVerifyStats), hipMemcpyDeviceToHost));
@@ -4450,23 +4725,26 @@ void recb_solver_GPU(
                       h_stats.unclassified_walkers, h_stats.roster_live_count,
                       h_stats.hash_pair_count);
       }
-      // 哈希操作统计：量化 recb 本次 launch 的哈希查询/更新次数与分布（访存负载）
-      {
-        unsigned long long h_query[4] = {0, 0, 0, 0};
-        unsigned long long h_update[5] = {0, 0, 0, 0, 0};
-        unsigned int h_probe_max = 0;
-        hipMemcpyFromSymbol(h_query, HIP_SYMBOL(g_hash_query), 4 * sizeof(unsigned long long));
-        hipMemcpyFromSymbol(h_update, HIP_SYMBOL(g_hash_update), 5 * sizeof(unsigned long long));
-        hipMemcpyFromSymbol(&h_probe_max, HIP_SYMBOL(g_probe_max), sizeof(unsigned int));
-        if (recb_rank == 0 && launch_n <= 5) {
-          kiwi::logs::v(" ", " [recb-hash] sect={} launch={} query(MoRe/MoMo/Re/V)={}/{}/{}/{} update(MoMo/MoRe/Re/ghost/surface)={}/{}/{}/{}/{} max_probe_len={}.\n",
-                        sid, launch_n,
-                        h_query[0], h_query[1], h_query[2], h_query[3],
-                        h_update[0], h_update[1], h_update[2], h_update[3], h_update[4],
-                        h_probe_max);
-        }
+    }
+
+    if (hash_stats) {
+      unsigned long long h_query[RECB_HASH_TABLE_COUNT] = {};
+      unsigned long long h_update[RECB_HASH_TABLE_COUNT] = {};
+      hipMemcpyFromSymbol(h_query, HIP_SYMBOL(g_hash_query), sizeof(h_query));
+      hipMemcpyFromSymbol(h_update, HIP_SYMBOL(g_hash_update), sizeof(h_update));
+      if (recb_rank == 0) {
+        kiwi::logs::v(" ", " [recb-hash] sect={} launch={} tables=MoRe/MoMo/Re/V/Busy/ghost/surface query={}/{}/{}/{}/{}/{}/{} update={}/{}/{}/{}/{}/{}/{} max_probe={}/{}/{}/{}/{}/{}/{}.\n",
+                      sid, launch_n,
+                      h_query[0], h_query[1], h_query[2], h_query[3], h_query[4], h_query[5], h_query[6],
+                      h_update[0], h_update[1], h_update[2], h_update[3], h_update[4], h_update[5], h_update[6],
+                      h_probe_max[0], h_probe_max[1], h_probe_max[2], h_probe_max[3],
+                      h_probe_max[4], h_probe_max[5], h_probe_max[6]);
       }
     }
+
+    // 与通信后的 roster rebuild 无关：这里只在 recb launch 边界清理 MoRe 墓碑。
+    // 先记录并保存全部 LIVE，再整表 clear+reinsert，不能原地把墓碑逐槽改成 EMPTY。
+    refreshMoReAfterRecb(sid, launch_n, verify_detail, hash_stats);
     // print_momo_and_more
     //  hipLaunchKernelGGL(print_momo_and_more, 1, 1, 0, 0
                       
@@ -4561,7 +4839,7 @@ void recb_solver_GPU(
       HANDLE_HIP(hipEventElapsedTime(&recb_ms_copy, recb_evt_after_type, recb_evt_after_copy));
       HANDLE_HIP(hipEventElapsedTime(&recb_ms_clear, recb_evt_after_copy, recb_evt_after_clear));
       // std::cout
-      //     << "[KMC_RECB_PROFILE] N=" << pair_atoms_size
+      //     << "[KMC_RECB_HASH_STATS] N=" << pair_atoms_size
       //     << " exchange_ms=" << recb_ms_exchange
       //     << " type_ms=" << recb_ms_type
       //     << " copy_ms=" << recb_ms_copy
@@ -4738,7 +5016,7 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
   {
     int hash_cfg_rank = 0;
     MPI_Comm_rank(MPI_COMM_WORLD, &hash_cfg_rank);
-    if (hash_cfg_rank == 0) {
+    if (hash_cfg_rank == 0 && recbHashStatsEnabled()) {
       kiwi::logs::v(" ", " [hash-config] BUCKET_SIZE={} TILE_SIZE={} PROBE_LIMIT=table_size(no cap) capacity=2x_keys | hash ops=single-threaded (recb & comm) | bucket=1 => classic linear-probing open addressing.\n",
                     (long long)BUCKET_SIZE, (long long)KMC_HASH_TILE_SIZE);
     }
@@ -4836,6 +5114,17 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
                                     0,meta,Pair_Atoms,
                                     MoRe_Hash,MoMo_Hash,Re_Hash,V_Hash,Busy_Set
                                     );
+  {
+    int hash_cfg_rank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &hash_cfg_rank);
+    if (hash_cfg_rank == 0 && recbHashStatsEnabled()) {
+      kiwi::logs::v(" ", " [more-hash-config] multiplier={} capacity={} scratch_capacity={} scratch_bytes={}.\n",
+                    KMC_MORE_HASH_CAPACITY_MULTIPLIER,
+                    MoRe_Hash ? MoRe_Hash->get_capacity() : 0,
+                    pair_atoms_size,
+                    pair_atoms_size * static_cast<long int>(sizeof(long int)));
+    }
+  }
   // printf("init gpu_info msg end\n");
   HANDLE_HIP(hipMemcpy(d_Pair_Atoms, Pair_Atoms,pair_atoms.size()*sizeof(long int), hipMemcpyHostToDevice));
 
@@ -4923,6 +5212,9 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
   //=======recb 前扇区筛选的工作缓冲区（槽位号列表 + 计数）=======
   HANDLE_HIP(hipMalloc((void**)&d_sector_slots, pair_atoms_size * sizeof(long int)));
   HANDLE_HIP(hipMalloc((void**)&d_sector_slot_count, sizeof(int)));
+  //=======MoRe recb 边界墓碑刷新：单表 + LIVE key scratch=======
+  HANDLE_HIP(hipMalloc((void**)&d_more_refresh_keys, pair_atoms_size * sizeof(long int)));
+  HANDLE_HIP(hipMalloc((void**)&d_more_refresh_counts, 4 * sizeof(unsigned int)));
   //=============================================================
   hipLaunchKernelGGL(setGlobalPointer, 1, 1, 0, 0,
       d_meta,
@@ -4931,6 +5223,7 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
   );
 
   hipDeviceSynchronize();
+  initializeMoreOccupancyCounter();
   // 各 rank 错开种子，保证进程间流也互相独立；固定 seed 可整跑复现
   int rng_rank = 0;
   MPI_Comm_rank(MPI_COMM_WORLD, &rng_rank);
@@ -5028,6 +5321,14 @@ if (d_Global_Bitmap_Lock != nullptr) {
   if (d_sector_slot_count) {
     HANDLE_HIP(hipFree(d_sector_slot_count));
     d_sector_slot_count = nullptr;
+  }
+  if (d_more_refresh_keys) {
+    HANDLE_HIP(hipFree(d_more_refresh_keys));
+    d_more_refresh_keys = nullptr;
+  }
+  if (d_more_refresh_counts) {
+    HANDLE_HIP(hipFree(d_more_refresh_counts));
+    d_more_refresh_counts = nullptr;
   }
   if (d_recb_verify_stats) {
     HANDLE_HIP(hipFree(d_recb_verify_stats));
@@ -5849,9 +6150,9 @@ void rebuildPairAtomsAfterComm() {
 
   const int max_out = static_cast<int>(pair_atoms_size);
 
-  // 排查统计（对照 key 数、validate 计数/打印）只在 KMC_RECB_VERIFY_DETAIL=1 时启用；
+  // 排查统计（对照 key 数、validate 计数/打印）只在正确性 debug 模式启用；
   // clear+reinsert 的修复逻辑不依赖它，始终执行。
-  const bool verify_detail = recbVerifyDetailEnabled();
+  const bool verify_detail = recbCorrectnessDebugEnabled();
 
   // 对照统计①：compact 之前统计 g_MoMo_Hash + g_MoRe_Hash 的有效 key 数（应 == 花名册应收录数）
   unsigned int h_hash_keys_before = 0;
@@ -5940,7 +6241,12 @@ void rebuildPairAtomsAfterComm() {
   // 否则 tombstone 会拉长开放寻址探测链，占用度逼近 1 时 hash_set_contains 误判为
   // “不存在”，validate_roster_all 因此误清 slot，造成 roster/hash 差值累积（间隙对漏游走）。
   if (MoMo_Hash) MoMo_Hash->clear();
-  if (MoRe_Hash) MoRe_Hash->clear();
+  if (MoRe_Hash) {
+    MoRe_Hash->clear();
+    hipLaunchKernelGGL(reset_more_occupancy, 1, 1, 0, 0,
+                       static_cast<unsigned int>(MoRe_Hash->get_capacity()));
+    CHECK_FOR_ERROR();
+  }
 
   const int r_block = 256;
   if (MoMo_Hash && MoMo_Hash->device_ptr() && n_momo > 0) {
@@ -5977,7 +6283,7 @@ void rebuildPairAtomsAfterComm() {
 
   // 兜底清理：rebuild 后全量校验花名册，清除仍指向"已不在哈希表的 id"（如游走到 y 通信边界、
   // 被 update_hash_set 移交给邻居而变 Mo 的陈旧 slot），保证 roster 与 g_MoMo_Hash/g_MoRe_Hash 一致。
-  // 清理逻辑始终执行（正确性修复）；计数与打印收进 KMC_RECB_VERIFY_DETAIL 开关。
+  // 清理逻辑始终执行（正确性修复）；计数与打印收进正确性 debug 开关。
   {
     const int v_block = 256;
     const int v_grid = static_cast<int>((pair_atoms_size + v_block - 1) / v_block);

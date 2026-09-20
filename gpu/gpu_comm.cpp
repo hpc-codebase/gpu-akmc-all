@@ -36,7 +36,7 @@ static bool g_profile_enabled = false;
 
 static bool profile_enabled() {
   if (g_profile_cached) return g_profile_enabled;
-  const char* v = std::getenv("KMC_RECB_PROFILE");
+  const char* v = std::getenv("KMC_RECB_HASH_STATS");
   g_profile_enabled = (v != nullptr && v[0] != '\0' && v[0] != '0');
   g_profile_cached = true;
   return g_profile_enabled;

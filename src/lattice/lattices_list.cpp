@@ -7,7 +7,9 @@
 #include "type_define.h"
 #include "utils/macros.h"
 #include <comm/domain/region.hpp>
+#include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <logs/logs.h>
 
@@ -195,13 +197,22 @@ void LatticesList::initGpuInfo_exchange(std::vector<long int> pair_atoms,
   for (const auto& pair : vac_hash) {
         vac_set.insert(pair.first); // 提取键并插入集合
   }
-  // MoMo 与 MoRe 是间隙对的两种互斥状态：最坏情况全部间隙对落在同一张表。
-  // 且模拟中间隙对总数会增长（本算例一个 step 内 8590 → 13000+），
-  // 故两张表都按"2 倍初始总对数"的 key 容量开（构造器再 ×2 预留空槽），
-  // 保证增长后仍有余量、探测链不因满载而拉长。
+  // MoMo 与 MoRe 是间隙对的两种互斥状态。MoRe 在一次 recb launch 内会发生
+  // 大量 remove/insert churn，因此只放大 MoRe；MoMo 保持原容量策略。
+  // HIPHashSet(size) 的 size 是 key 预算，构造器内部还会 ×2 生成实际槽位数，
+  // 所以这里对 key 预算乘 KMC_MORE_HASH_CAPACITY_MULTIPLIER，最终实际
+  // MoRe 槽位按同一倍率放大（当前默认 10 倍）。
   const std::size_t total_pairs = more_hash.size() + momo_hash.size();
   const int pair_capacity = static_cast<int>(2 * total_pairs);
-  MoRe_Hash = new HIPHashSet(more_hash, pair_capacity);
+  const long long more_key_capacity =
+      static_cast<long long>(pair_capacity) * KMC_MORE_HASH_CAPACITY_MULTIPLIER;
+  // 构造器内部还会把 key 预算乘 2，提前检查最终槽位不会溢出 int。
+  if (more_key_capacity > std::numeric_limits<int>::max() / 2LL) {
+    std::cerr << "Fatal Error: requested MoRe hash capacity exceeds int range: "
+              << more_key_capacity << std::endl;
+    std::abort();
+  }
+  MoRe_Hash = new HIPHashSet(more_hash, static_cast<int>(more_key_capacity));
   MoMo_Hash = new HIPHashSet(momo_hash, pair_capacity);
   Re_Hash = new HIPHashSet(re_hash);
   V_Hash = new HIPHashSet(vac_set);

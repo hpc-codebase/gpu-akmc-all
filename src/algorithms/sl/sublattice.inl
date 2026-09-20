@@ -283,7 +283,7 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
       const double avg_comm_ratio = comm_ratio_sum / SimulationDomain::comm_sim_pro.all_ranks;
       const double avg_eff = 1.0 - avg_comm_ratio;
       std::cout
-          << "[KMC_RECB_PROFILE] GPU_COMM bytes_send=" << bytes_send_sum
+          << "[KMC_RECB_HASH_STATS] GPU_COMM bytes_send=" << bytes_send_sum
           << " bytes_recv=" << bytes_recv_sum
           << " calls=" << calls_sum
           << " time_s=" << comm_time_sum
