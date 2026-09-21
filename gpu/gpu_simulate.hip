@@ -37,6 +37,18 @@ __device__ static hiprandStatePhilox4_32_10_t *g_rng_states;//每个 walker 线�
 // roster/hash 差值排查：validate_roster_all 本次 rebuild 清除的陈旧 slot 数
 // （区分"误清"还是"compact 漏 key"：清除数≈差值→validate 清；清除数≪差值→compact 漏）
 // [0]=validate_cleared [1]=validate_cleared_ghost [2]=hash_keys_before_compact [3]=roster_after_compact
+// A sector is stable only after a complete recb pass moves no pair. Stable
+// sectors reconsider only walkers whose 1NN shell intersects the latest KMC
+// event; communication/rebuild invalidates all sectors.
+__device__ static unsigned int g_recb_sector_stable[8];
+__device__ static unsigned int g_recb_pairs_changed;
+__device__ static unsigned int g_recb_was_full_pass;
+__device__ static long int g_recb_event_from = -1;
+__device__ static long int g_recb_event_to = -1;
+__device__ static unsigned int g_recb_event_valid;
+// event-local correctness audit: [0]=excluded pairs checked,
+// [1]=excluded but no longer captured (must never be silently skipped).
+__device__ static unsigned int g_recb_local_audit[2];
 __device__ static unsigned int g_validate_counters[4];
 
 // 哈希统计统一由 KMC_RECB_HASH_STATS=1 控制。
@@ -183,6 +195,7 @@ namespace gpuSimulate {
     unsigned long long *d_recb_walker_lengths = nullptr; // hash stats 专用：[extra_rng:32|attempts:32]
     hiprandStatePhilox4_32_10_t *d_rng_states = nullptr;
     long int rng_states_count = 0;
+    unsigned int *d_recb_work_head = nullptr;
     long int *d_sector_slots = nullptr;   // recb 前筛出的本扇区 walker 槽位号（g_Pair_Atoms 下标）
     int *d_sector_slot_count = nullptr;   // 本扇区 walker 数
     long int *d_more_refresh_keys = nullptr;       // MoRe 原地刷新时暂存全部 LIVE key
@@ -206,6 +219,8 @@ namespace gpuSimulate {
     // 只保留两类运行时开关：
     //   KMC_RECB_CORRECTNESS_DEBUG=1  正确性/不变量/全表核验
     //   KMC_RECB_HASH_STATS=1         哈希访问量、分类 probe、占用与性能计时
+    // Logging remains split into correctness and hash-statistics categories.
+    // KMC_RECB_EVENT_LOCAL is an algorithm A/B switch, not a logging switch.
     static bool recbHashStatsEnabled() {
       static int cached = -1;
       if (cached != -1) return cached != 0;
@@ -219,6 +234,16 @@ namespace gpuSimulate {
       if (cached != -1) return cached != 0;
       const char* v = std::getenv("KMC_RECB_CORRECTNESS_DEBUG");
       cached = (v != nullptr && v[0] != '\0' && v[0] != '0') ? 1 : 0;
+      return cached != 0;
+    }
+
+    // Algorithm A/B switch. Default keeps the optimized event-local schedule;
+    // KMC_RECB_EVENT_LOCAL=0 runs the same tile8 walker kernel with full passes.
+    static bool recbEventLocalEnabled() {
+      static int cached = -1;
+      if (cached != -1) return cached != 0;
+      const char* v = std::getenv("KMC_RECB_EVENT_LOCAL");
+      cached = (v == nullptr || v[0] == '\0' || v[0] != '0') ? 1 : 0;
       return cached != 0;
     }
 
@@ -1778,6 +1803,10 @@ __global__ void selectEventGPU(dev_Vacancy *deviceVacancyInfo, dev_nnLattice *de
               d_event->from_id = deviceVacancyInfo[i].id;
               d_event->to_id = deviceNeighbourInfo[i * NN_TOTAL + rate_index].id;
               d_event->to_type._type = deviceNeighbourInfo[i * NN_TOTAL + rate_index].type._type;
+              g_recb_event_from = d_event->from_id;
+              g_recb_event_to = d_event->to_id;
+              __threadfence();
+              g_recb_event_valid = 1u;
               tag = 0;
               break;
             }
@@ -3635,6 +3664,253 @@ __global__ void __launch_bounds__(128) calcExchangePairs(int sector_id,int arr_s
 }
 
 // 单独汇总完整 walker 长度，避免诊断归约增加主随机游走 kernel 的寄存器压力。
+template <typename Tile>
+__device__ __forceinline__ void check_neighbors_tile8(
+    _type_lattice_size x, _type_lattice_size y, _type_lattice_size z,
+    Tile tile, int& num_sia, int& num_re) {
+  const int lane = tile.thread_rank();
+  const int q = lane & 3;
+  const int dx = lane < 4 ? -1 : 1;
+  const bool even_x = (x & 1) == 0;
+  const int dy = even_x ? (q < 2 ? -1 : 0) : (q < 2 ? 0 : 1);
+  const int dz = even_x ? ((q & 1) ? 0 : -1) : ((q & 1) ? 1 : 0);
+  const _type_lattice_id nid = getId(x + dx, y + dy, z + dz);
+
+  int sia = 0;
+  int re = 0;
+  if (nid > 0) {
+    sia = hash_set_contains(g_MoRe_Hash, nid) ||
+          hash_set_contains(g_MoMo_Hash, nid);
+    re = !sia && hash_set_contains(g_Re_Hash, nid);
+  }
+  #pragma unroll
+  for (int offset = 4; offset > 0; offset >>= 1) {
+    sia += tile.shfl_down(sia, offset);
+    re += tile.shfl_down(re, offset);
+  }
+  num_sia = tile.shfl(sia, 0);
+  num_re = tile.shfl(re, 0);
+}
+
+template <typename Tile>
+__device__ void run_recb_walker_tile8(
+    int sector_id, int work_index, RecbVerifyStats* stats,
+    const long int* __restrict__ sector_slots, bool verify_detail,
+    bool collect_hash_stats,
+    unsigned long long* __restrict__ walker_lengths, Tile tile) {
+  const bool leader = tile.thread_rank() == 0;
+  long int slot = leader ? sector_slots[work_index] : 0;
+  slot = tile.shfl(slot, 0);
+  _type_lattice_id id = leader ? g_Pair_Atoms[slot] : 0;
+  id = tile.shfl(id, 0);
+
+  AtomTx tx = {0, 0, id > 0, false, 0};
+  _type_lattice_size x = id > 0 ? id % g_meta->size_x : 0;
+  _type_lattice_size y = id > 0 ? (id / g_meta->size_x) % g_meta->size_y : 0;
+  _type_lattice_size z = id > 0 ? id / (g_meta->size_x * g_meta->size_y) : 0;
+  LatticeTypes::lat_type cur_type = LatticeTypes::Mo;
+  if (leader && tx.active) cur_type = getType(id);
+  cur_type = static_cast<LatticeTypes::lat_type>(tile.shfl(static_cast<int>(cur_type), 0));
+
+  const long int x_min = 2 * g_meta->regions[sector_id * 6 + 0];
+  const long int x_max = 2 * g_meta->regions[sector_id * 6 + 1];
+  const long int y_min = g_meta->regions[sector_id * 6 + 2];
+  const long int y_max = g_meta->regions[sector_id * 6 + 3];
+  const long int z_min = g_meta->regions[sector_id * 6 + 4];
+  const long int z_max = g_meta->regions[sector_id * 6 + 5];
+
+  unsigned int attempts = 0, hops = 0, extra_rng = 0;
+  unsigned int target_mo = 0, target_re = 0, target_other = 0;
+  unsigned int lock_failures = 0, src_failures = 0;
+  unsigned int dst_mo_failures = 0, dst_re_failures = 0, dst_other_failures = 0;
+  unsigned int tx_failures = 0, captured = 0, exited = 0, capped = 0, stale = 0;
+  unsigned int captured_no_move = 0;
+
+  if (leader && tx.active && stats) atomicAdd(&stats->sector_pairs, 1u);
+  if (leader && tx.active && cur_type != LatticeTypes::MoMo && cur_type != LatticeTypes::MoRe) {
+    if (stats) {
+      atomicAdd(&stats->roster_type_mismatches, 1u);
+      atomicAdd(&stats->stale_at_start, 1u);
+      if (isGhostLat(id)) atomicAdd(&stats->stale_start_ghost, 1u);
+      if (cur_type == LatticeTypes::Re) atomicAdd(&stats->stale_start_is_re, 1u);
+      if (cur_type == LatticeTypes::V) atomicAdd(&stats->stale_start_is_v, 1u);
+    }
+    g_Pair_Atoms[slot] = -1;
+    stale = 1;
+    tx.active = false;
+  }
+  if (leader && tx.active) {
+    tx.src_id = id;
+  }
+
+  while (tile.shfl(leader && tx.active ? 1 : 0, 0)) {
+    if (leader) {
+      if (attempts >= KMC_RECB_MAX_ITERATIONS) {
+        capped = 1;
+        tx.active = false;
+        atomicExch(&g_recb_pairs_changed, 1u);
+      } else if (!(x_min <= x && x < x_max && y_min <= y && y < y_max &&
+                   z_min <= z && z < z_max)) {
+        exited = 1;
+        tx.active = false;
+      }
+    }
+    if (!tile.shfl(leader && tx.active ? 1 : 0, 0)) break;
+
+    x = tile.shfl(x, 0);
+    y = tile.shfl(y, 0);
+    z = tile.shfl(z, 0);
+    int num_sia = 0, num_re = 0;
+    check_neighbors_tile8(x, y, z, tile, num_sia, num_re);
+
+    if (leader) {
+      if (num_sia >= 2 || (cur_type == LatticeTypes::MoRe && num_re >= 5)) {
+        captured_no_move = hops == 0;
+        captured = 1;
+        tx.active = false;
+      } else {
+        ++attempts;
+        int direction = static_cast<int>(hiprand_uniform(&g_rng_states[slot]) * 14.0f);
+        if (direction > 13) direction = 13;
+        if (verify_detail && stats) atomicAdd(&stats->direction_counts[direction], 1ULL);
+
+        _type_lattice_size nx = 0, ny = 0, nz = 0;
+        getRandomLattice(x, y, z, nx, ny, nz, direction);
+        const _type_lattice_id dst_id = getId(nx, ny, nz);
+        const LatticeTypes::lat_type dst_type = getType(dst_id);
+        if (verify_detail) {
+          if (dst_type == LatticeTypes::Mo) ++target_mo;
+          else if (dst_type == LatticeTypes::Re) ++target_re;
+          else ++target_other;
+        }
+
+        tx.op_type = 0;
+        if (dst_type == LatticeTypes::Mo || dst_type == LatticeTypes::Re) {
+          bool accept = num_re == 0;
+          if (num_re > 0 && num_re < LatticesList::MAX_1NN) {
+            if (collect_hash_stats) ++extra_rng;
+            accept = hiprand_uniform(&g_rng_states[slot]) >
+                     static_cast<float>(num_re) / LatticesList::MAX_1NN;
+          }
+          tx.op_type = decide_op_type(cur_type, dst_type, accept);
+          tx.dst_id = dst_id;
+        }
+
+        bool locks_acquired = false;
+        if (tx.op_type != 0) {
+          locks_acquired = try_acquire_bitmap_locks(tx.src_id, tx.dst_id);
+          if (locks_acquired) __threadfence();
+          else {
+            ++lock_failures;
+            tx.op_type = 0;
+          }
+        }
+
+        const bool need_verify = locks_acquired && tx.op_type != 0;
+        const LatticeTypes::lat_type safe_src = need_verify ? getType(tx.src_id) : cur_type;
+        const LatticeTypes::lat_type safe_dst = need_verify ? getType(tx.dst_id) : dst_type;
+        const bool src_ok = !need_verify || safe_src == cur_type;
+        const bool dst_ok = !need_verify || safe_dst == dst_type;
+        if (need_verify) {
+          if (!src_ok) ++src_failures;
+          if (!dst_ok) {
+            if (dst_type == LatticeTypes::Mo) ++dst_mo_failures;
+            else if (dst_type == LatticeTypes::Re) ++dst_re_failures;
+            else ++dst_other_failures;
+          }
+          if (!src_ok) {
+            if (g_Pair_Atoms[slot] == tx.src_id) g_Pair_Atoms[slot] = -1;
+            stale = 1;
+            if (stats) atomicAdd(&stats->stale_src_changed, 1u);
+            tx.active = false;
+            tx.op_type = 0;
+          } else if (!dst_ok) {
+            tx.op_type = 0;
+          }
+        }
+
+        const bool transaction_attempted = need_verify && src_ok && dst_ok;
+        const int attempted_op = transaction_attempted ? tx.op_type : 0;
+        if (verify_detail && stats && attempted_op >= 1 && attempted_op <= 4)
+          atomicAdd(&stats->op_attempts[attempted_op - 1], 1ULL);
+        if (tx.op_type != 0) perform_batch_update_single(tx);
+        if (transaction_attempted && !tx.success) ++tx_failures;
+        if (verify_detail && stats && attempted_op >= 1 && attempted_op <= 4) {
+          if (tx.success) atomicAdd(&stats->op_successes[attempted_op - 1], 1ULL);
+          else atomicAdd(&stats->op_failures[attempted_op - 1], 1ULL);
+        }
+        if (locks_acquired) {
+          __threadfence();
+          release_bitmap_locks(tx.src_id, tx.dst_id);
+        }
+
+        if (tx.active && tx.op_type != 0 && tx.success) {
+          x = nx; y = ny; z = nz;
+          tx.src_id = id = dst_id;
+          if (tx.op_type == 2 || tx.op_type == 4) cur_type = LatticeTypes::MoRe;
+          ++hops;
+          atomicExch(&g_recb_pairs_changed, 1u);
+          g_Pair_Atoms[slot] = dst_id;
+          const bool in_sector = x_min <= x && x < x_max && y_min <= y && y < y_max &&
+                                 z_min <= z && z < z_max;
+          if (isGhostLat(dst_id) || !in_sector) {
+            exited = 1;
+            tx.active = false;
+          }
+        }
+        tx.op_type = 0;
+      }
+    }
+  }
+
+  if (!leader) return;
+  if (stats) {
+    if (attempts) atomicAdd(&stats->attempts, static_cast<unsigned long long>(attempts));
+    if (hops) atomicAdd(&stats->successful_hops, static_cast<unsigned long long>(hops));
+    atomicMax(&stats->max_successful_hops, hops);
+    if (hops >= 2) atomicAdd(&stats->multi_hop_pairs, 1u);
+    if (captured_no_move) atomicAdd(&stats->captured_no_move, 1u);
+    if (captured) atomicAdd(&stats->captured_walks, 1u);
+    if (exited) atomicAdd(&stats->exited_walks, 1u);
+    if (capped) atomicAdd(&stats->capped_walks, 1u);
+    if (stale) atomicAdd(&stats->stale_source_walkers, 1u);
+    if (!captured && !exited && !capped && !stale) atomicAdd(&stats->unclassified_walkers, 1u);
+    if (lock_failures) atomicAdd(&stats->lock_failures, static_cast<unsigned long long>(lock_failures));
+    if (src_failures) atomicAdd(&stats->src_check_failures, static_cast<unsigned long long>(src_failures));
+    if (dst_mo_failures) atomicAdd(&stats->dst_mo_check_failures, static_cast<unsigned long long>(dst_mo_failures));
+    if (dst_re_failures) atomicAdd(&stats->dst_re_check_failures, static_cast<unsigned long long>(dst_re_failures));
+    if (dst_other_failures) atomicAdd(&stats->dst_other_check_failures, static_cast<unsigned long long>(dst_other_failures));
+    if (tx_failures) atomicAdd(&stats->transaction_failures, static_cast<unsigned long long>(tx_failures));
+    if (verify_detail) {
+      if (target_mo) atomicAdd(&stats->target_mo, static_cast<unsigned long long>(target_mo));
+      if (target_re) atomicAdd(&stats->target_re, static_cast<unsigned long long>(target_re));
+      if (target_other) atomicAdd(&stats->target_other, static_cast<unsigned long long>(target_other));
+    }
+  }
+  if (collect_hash_stats && walker_lengths) {
+    walker_lengths[work_index] =
+        (static_cast<unsigned long long>(extra_rng) << 32) | attempts;
+  }
+}
+
+__global__ void __launch_bounds__(128) calcExchangePairsTile8(
+    int sector_id, int work_count, RecbVerifyStats* stats,
+    const long int* __restrict__ sector_slots, bool verify_detail,
+    bool collect_hash_stats, unsigned long long* __restrict__ walker_lengths,
+    unsigned int* __restrict__ work_head) {
+  cg::thread_block block = cg::this_thread_block();
+  auto tile = cg::tiled_partition<8>(block);
+  while (true) {
+    unsigned int work_index = 0;
+    if (tile.thread_rank() == 0) work_index = atomicAdd(work_head, 1u);
+    work_index = tile.shfl(work_index, 0);
+    if (work_index >= static_cast<unsigned int>(work_count)) break;
+    run_recb_walker_tile8(sector_id, static_cast<int>(work_index), stats,
+                          sector_slots, verify_detail, collect_hash_stats,
+                          walker_lengths, tile);
+  }
+}
+
 __global__ void collect_recb_walker_stats(
     const unsigned long long* __restrict__ walker_lengths, int count) {
   __shared__ unsigned int block_attempts[128];
@@ -4202,9 +4478,26 @@ __global__ void filter_ids_in_region(const long int* __restrict__ in_ids,
 // 存槽位号而非 id：calcExchangePairs 游走后会写回 g_Pair_Atoms[slot]（新位置或 -1），
 // 用槽位号保证写回永远对准自己的槽位。边界口径与 calcExchangePairs 完全一致：
 // x 为双倍坐标（2*regions），y/z 直接用 regions；id<=0 为无效槽（离扇区标记）跳过。
+__device__ __forceinline__ bool recb_event_affects_pair(long int pair_id) {
+  if (!g_recb_event_valid) return true;
+  if (pair_id == g_recb_event_from || pair_id == g_recb_event_to) return true;
+  const _type_lattice_id x = pair_id % g_meta->size_x;
+  const _type_lattice_id y = (pair_id / g_meta->size_x) % g_meta->size_y;
+  const _type_lattice_id z = pair_id / (g_meta->size_x * g_meta->size_y);
+  _type_lattice_id nn[8];
+  get1nn_ids(x, y, z, nn);
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    if (nn[i] == g_recb_event_from || nn[i] == g_recb_event_to) return true;
+  }
+  return false;
+}
+
 __global__ void filter_pair_slots_for_sector(int sector_id, long int roster_size,
                                              long int* __restrict__ out_slots,
-                                             int* __restrict__ out_count) {
+                                             int* __restrict__ out_count,
+                                             bool event_local_enabled,
+                                             bool audit_event_local) {
   long int slot = blockIdx.x * (long int)blockDim.x + threadIdx.x;
   if (slot >= roster_size) return;
   long int id = g_Pair_Atoms[slot];
@@ -4219,9 +4512,51 @@ __global__ void filter_pair_slots_for_sector(int sector_id, long int roster_size
   const long int z_min = g_meta->regions[sector_id * 6 + 4];
   const long int z_max = g_meta->regions[sector_id * 6 + 5];
   if (x_min <= x && x < x_max && y_min <= y && y < y_max && z_min <= z && z < z_max) {
+    const bool local_pass = event_local_enabled && g_recb_sector_stable[sector_id];
+    if (local_pass && !recb_event_affects_pair(id)) {
+      if (!audit_event_local) return;
+
+      // Debug-only full audit. A pair excluded by the locality predicate must
+      // still satisfy the exact capture predicate used by the tile8 walker.
+      atomicAdd(&g_recb_local_audit[0], 1u);
+      const LatticeTypes::lat_type type = getType(id);
+      int num_sia = 0, num_re = 0;
+      tiled_check_neighbors_single(x, y, z, num_sia, num_re);
+      const bool captured = num_sia >= 2 ||
+          (type == LatticeTypes::MoRe && num_re >= 5);
+      if (captured) return;
+
+      // Do not let a debug run silently continue with a missed active pair:
+      // recover it into this launch and force the following pass to be full.
+      atomicAdd(&g_recb_local_audit[1], 1u);
+      atomicExch(&g_recb_pairs_changed, 1u);
+    }
     int idx = atomicAdd(out_count, 1);
     out_slots[idx] = slot;
   }
+}
+
+__global__ void begin_recb_pass(int sector_id, bool event_local_enabled) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    g_recb_pairs_changed = 0u;
+    g_recb_was_full_pass = !event_local_enabled ||
+                           g_recb_sector_stable[sector_id] == 0u;
+    g_recb_local_audit[0] = 0u;
+    g_recb_local_audit[1] = 0u;
+  }
+}
+
+__global__ void finish_recb_pass(int sector_id) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  if (g_recb_pairs_changed) {
+    g_recb_sector_stable[sector_id] = 0u;
+  } else if (g_recb_was_full_pass) {
+    g_recb_sector_stable[sector_id] = 1u;
+  }
+}
+
+__global__ void invalidate_recb_stability() {
+  if (blockIdx.x == 0 && threadIdx.x < 8) g_recb_sector_stable[threadIdx.x] = 0u;
 }
 
 // 正确性校验：仍留在本地 roster 中的每个 slot，必须指向 MoMo 或 MoRe。
@@ -4237,7 +4572,7 @@ __global__ void validate_pair_slots(const long int* __restrict__ slots,
   if (id <= 0) return;
   const LatticeTypes::lat_type type = getType(id);
   if (type != LatticeTypes::MoMo && type != LatticeTypes::MoRe) {
-    atomicAdd(&stats->roster_type_mismatches, 1u);
+    if (stats) atomicAdd(&stats->roster_type_mismatches, 1u);
     g_Pair_Atoms[slot] = -1;
   }
 }
@@ -4696,6 +5031,7 @@ void recb_solver_GPU(
     const bool hash_stats = recbHashStatsEnabled();
     const bool do_profile = hash_stats;
     const bool verify_detail = recbCorrectnessDebugEnabled();
+    const bool event_local = recbEventLocalEnabled();
     if (do_profile) initRecbProfileEvents();
 
     static int recb_launch_by_sector[8] = {};
@@ -4704,6 +5040,16 @@ void recb_solver_GPU(
     const int launch_n = ++recb_launch_by_sector[sid];
     int recb_rank = 0;
     MPI_Comm_rank(MPI_COMM_WORLD, &recb_rank);
+    static bool recb_schedule_config_printed = false;
+    if (!recb_schedule_config_printed) {
+      if (recb_rank == 0) {
+        kiwi::logs::v(" ", " [recb-config] walker=tile8 schedule={} local_audit={} (KMC_RECB_EVENT_LOCAL={}).\n",
+                      event_local ? "event-local" : "full",
+                      verify_detail && event_local ? "on" : "off",
+                      event_local ? 1 : 0);
+      }
+      recb_schedule_config_printed = true;
+    }
 
     blockSize = 128;
     // print_Hash_and_Pair
@@ -4726,11 +5072,15 @@ void recb_solver_GPU(
 
     //=======recb 前筛选：把本扇区盒子内的 walker 槽位号压缩出来=======
     // 花名册 g_Pair_Atoms 混装全部 8 个扇区，这里先筛出本扇区，kernel 只启动所需线程。
+    hipLaunchKernelGGL(begin_recb_pass, 1, 1, 0, 0,
+                       static_cast<int>(sector_id), event_local);
     HANDLE_HIP(hipMemset(d_sector_slot_count, 0, sizeof(int)));
     {
       const long int filter_grid = (pair_atoms_size + blockSize - 1) / blockSize;
       hipLaunchKernelGGL(filter_pair_slots_for_sector, filter_grid, blockSize, 0, 0,
-                         (int)sector_id, pair_atoms_size, d_sector_slots, d_sector_slot_count);
+                         (int)sector_id, pair_atoms_size, d_sector_slots,
+                         d_sector_slot_count, event_local,
+                         verify_detail && event_local);
       CHECK_FOR_ERROR();
     }
     int h_sector_count = 0;
@@ -4746,12 +5096,15 @@ void recb_solver_GPU(
       HANDLE_HIP(hipMemcpyToSymbol(HIP_SYMBOL(g_hash_stats_on), &stats_on, sizeof(bool)));
     }
     if (h_sector_count > 0) {
-      numBlocks = (h_sector_count + blockSize - 1) / blockSize;
-      hipLaunchKernelGGL(calcExchangePairs, numBlocks, blockSize, 0, 0,
+      constexpr int walkers_per_block = 128 / 8;
+      numBlocks = (h_sector_count + walkers_per_block - 1) / walkers_per_block;
+      HANDLE_HIP(hipMemset(d_recb_work_head, 0, sizeof(unsigned int)));
+      hipLaunchKernelGGL(calcExchangePairsTile8, numBlocks, blockSize, 0, 0,
                         sector_id, h_sector_count,
                         verify_detail ? d_recb_verify_stats : nullptr, d_sector_slots,
                         verify_detail, hash_stats,
-                        hash_stats ? d_recb_walker_lengths : nullptr
+                        hash_stats ? d_recb_walker_lengths : nullptr,
+                        d_recb_work_head
                         );
       CHECK_FOR_ERROR();
       // 正确性清理不依赖详细日志开关；同一默认 stream 保证它在游走结束后执行。
@@ -4869,6 +5222,41 @@ void recb_solver_GPU(
       }
     }
 
+    hipLaunchKernelGGL(finish_recb_pass, 1, 1, 0, 0, static_cast<int>(sector_id));
+    if (verify_detail && event_local) {
+      unsigned int h_local_audit[2] = {};
+      unsigned int h_recb_was_full = 0;
+      HANDLE_HIP(hipMemcpyFromSymbol(h_local_audit, HIP_SYMBOL(g_recb_local_audit),
+                                     sizeof(h_local_audit)));
+      HANDLE_HIP(hipMemcpyFromSymbol(&h_recb_was_full,
+                                     HIP_SYMBOL(g_recb_was_full_pass),
+                                     sizeof(h_recb_was_full)));
+      if (recb_rank == 0 && h_recb_was_full == 0u) {
+        static unsigned long long local_launches = 0;
+        static unsigned long long positive_launches = 0;
+        static unsigned long long local_candidates = 0;
+        static unsigned long long audited_excluded = 0;
+        static unsigned long long missed_active = 0;
+        const unsigned int selected = h_sector_count >= static_cast<int>(h_local_audit[1])
+            ? static_cast<unsigned int>(h_sector_count) - h_local_audit[1] : 0u;
+        ++local_launches;
+        if (selected > 0) ++positive_launches;
+        local_candidates += selected;
+        audited_excluded += h_local_audit[0];
+        missed_active += h_local_audit[1];
+        if (selected > 0 || h_local_audit[1] > 0 || local_launches <= 5 ||
+            (local_launches % 100u) == 0u) {
+          kiwi::logs::v(" ", " [recb-local-audit] sect={} launch={} selected={} audited_excluded={} missed_active={} totals(local_launches/positive_launches/selected/audited/missed)={}/{}/{}/{}/{}.\n",
+                        sid, launch_n, selected, h_local_audit[0],
+                        h_local_audit[1], local_launches, positive_launches,
+                        local_candidates, audited_excluded, missed_active);
+        }
+        if (h_local_audit[1] > 0) {
+          kiwi::logs::v(" ", " [recb-local-miss] sect={} launch={} missed_active={} recovered_this_launch=1 next_pass_forced_full=1.\n",
+                        sid, launch_n, h_local_audit[1]);
+        }
+      }
+    }
     if (hash_stats) {
       unsigned long long h_query[RECB_HASH_TABLE_COUNT] = {};
       unsigned long long h_update[RECB_HASH_TABLE_COUNT] = {};
@@ -4878,6 +5266,8 @@ void recb_solver_GPU(
       unsigned int h_walker_attempt_max = 0;
       unsigned int h_recb_wave_size = 0;
       unsigned long long h_extra_rng_draws = 0;
+      unsigned int h_recb_was_full = 0;
+      unsigned int h_recb_changed = 0;
       hipMemcpyFromSymbol(h_query, HIP_SYMBOL(g_hash_query), sizeof(h_query));
       hipMemcpyFromSymbol(h_update, HIP_SYMBOL(g_hash_update), sizeof(h_update));
       hipMemcpyFromSymbol(h_re_probe_reach, HIP_SYMBOL(g_re_probe_reach),
@@ -4895,7 +5285,14 @@ void recb_solver_GPU(
       hipMemcpyFromSymbol(&h_extra_rng_draws,
                           HIP_SYMBOL(g_recb_extra_rng_draws),
                           sizeof(h_extra_rng_draws));
+      hipMemcpyFromSymbol(&h_recb_was_full, HIP_SYMBOL(g_recb_was_full_pass),
+                          sizeof(h_recb_was_full));
+      hipMemcpyFromSymbol(&h_recb_changed, HIP_SYMBOL(g_recb_pairs_changed),
+                          sizeof(h_recb_changed));
       if (recb_rank == 0) {
+        kiwi::logs::v(" ", " [recb-schedule] sect={} launch={} mode={} candidates={} group_size=8 changed={}\n",
+                      sid, launch_n, h_recb_was_full ? "full" : "event-local",
+                      h_sector_count, h_recb_changed);
         const double active_lane_eff = h_wave_tail[1] > 0
             ? static_cast<double>(h_wave_tail[0]) / h_wave_tail[1] : 1.0;
         const double full_wave_eff = h_wave_tail[2] > 0
@@ -5402,6 +5799,8 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
   //=======recb 前扇区筛选的工作缓冲区（槽位号列表 + 计数）=======
   HANDLE_HIP(hipMalloc((void**)&d_sector_slots, pair_atoms_size * sizeof(long int)));
   HANDLE_HIP(hipMalloc((void**)&d_sector_slot_count, sizeof(int)));
+  HANDLE_HIP(hipMalloc((void**)&d_recb_work_head, sizeof(unsigned int)));
+  hipLaunchKernelGGL(invalidate_recb_stability, 1, 8, 0, 0);
   //=======MoRe recb 边界墓碑刷新：单表 + LIVE key scratch=======
   HANDLE_HIP(hipMalloc((void**)&d_more_refresh_keys, pair_atoms_size * sizeof(long int)));
   HANDLE_HIP(hipMalloc((void**)&d_more_refresh_counts, 4 * sizeof(unsigned int)));
@@ -5511,6 +5910,10 @@ if (d_Global_Bitmap_Lock != nullptr) {
   if (d_sector_slot_count) {
     HANDLE_HIP(hipFree(d_sector_slot_count));
     d_sector_slot_count = nullptr;
+  }
+  if (d_recb_work_head) {
+    HANDLE_HIP(hipFree(d_recb_work_head));
+    d_recb_work_head = nullptr;
   }
   if (d_more_refresh_keys) {
     HANDLE_HIP(hipFree(d_more_refresh_keys));
@@ -6240,6 +6643,7 @@ using namespace gpuSimulate;
         neighbour_local_sub_box[1],
         neighbour_local_sub_box[2]
       );
+      hipLaunchKernelGGL(invalidate_recb_stability, 1, 8, 0, 0);
       hipDeviceSynchronize();
       gpuSimulate::comm_gpu_maintenance_profiler.hash_update_time += MPI_Wtime() - hash_update_start;
     hipFree(d_buffer);
@@ -6280,6 +6684,7 @@ using namespace gpuSimulate;
       neighbour_local_sub_box[1],
       neighbour_local_sub_box[2]
     );
+    hipLaunchKernelGGL(invalidate_recb_stability, 1, 8, 0, 0);
     hipDeviceSynchronize();
     gpuSimulate::comm_gpu_maintenance_profiler.hash_update_time += MPI_Wtime() - hash_update_start;
     hipFree(d_buffer);
@@ -6303,6 +6708,7 @@ void transferBufferToGPU_Device(ChangeLattice_GPU *d_buffer, int receive_len, co
         neighbour_local_sub_box[1],
         neighbour_local_sub_box[2]
       );
+      hipLaunchKernelGGL(invalidate_recb_stability, 1, 8, 0, 0);
       hipDeviceSynchronize();
       gpuSimulate::comm_gpu_maintenance_profiler.hash_update_time += MPI_Wtime() - hash_update_start;
 }
@@ -6325,6 +6731,7 @@ void transferBufferToGPU2_Device(ChangeLattice_GPU *d_buffer, int receive_len, c
       neighbour_local_sub_box[1],
       neighbour_local_sub_box[2]
     );
+    hipLaunchKernelGGL(invalidate_recb_stability, 1, 8, 0, 0);
     hipDeviceSynchronize();
     gpuSimulate::comm_gpu_maintenance_profiler.hash_update_time += MPI_Wtime() - hash_update_start;
 }
@@ -6507,6 +6914,8 @@ void rebuildPairAtomsAfterComm() {
     }
   }
 
+  hipLaunchKernelGGL(invalidate_recb_stability, 1, 8, 0, 0);
+  hipDeviceSynchronize();
   gpuSimulate::comm_gpu_maintenance_profiler.rebuild_cleanup_time += MPI_Wtime() - rebuild_cleanup_start;
 }
 
