@@ -47,6 +47,9 @@ void initialize_gpu(int process_rank);
 
 void gpu_final();
 
+bool recb_phase_timing_enabled();
+void gpuRecbPhaseAddHostBoundary(double seconds);
+
 void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain *_p_domain,
                 std::vector<long int> pair_atoms, unsigned long long rng_seed
                 );

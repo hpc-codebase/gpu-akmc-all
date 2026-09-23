@@ -76,7 +76,32 @@ __device__ static unsigned int g_more_dirty = 0;
 __device__ static unsigned int g_hash_occ[9];
 
 static long int arr_size;
+// pair_atoms_size is the fixed device allocation capacity.  The compact live
+// roster occupies [0, pair_roster_scan_size); keeping these values separate
+// avoids scanning the reserved half of the allocation on every ReCB call.
 static long int pair_atoms_size;
+static long int pair_roster_scan_size;
+
+// Correctness-only conflict-bias histogram.  Each eligible physical move is
+// classified four ways (direction/op/local Re/local SIA) and gets exactly one
+// terminal outcome.  This lets the final run summary show whether hardware
+// contention rejects particular physical environments disproportionately.
+enum RecbStratumOutcome {
+  RECB_ELIGIBLE = 0,
+  RECB_LOCK_FAIL,
+  RECB_SRC_CHANGED,
+  RECB_DST_CHANGED,
+  RECB_TX_FAIL,
+  RECB_SUCCESS,
+  RECB_STRATUM_OUTCOME_COUNT
+};
+static constexpr int RECB_DIRECTION_STRATA = 14;
+static constexpr int RECB_OP_STRATA = 4;
+static constexpr int RECB_NUM_RE_STRATA = 9;   // exact 1NN count: 0..8
+static constexpr int RECB_NUM_SIA_STRATA = 3;  // 0, 1, >=2
+static constexpr int RECB_STRATUM_COUNT =
+    RECB_DIRECTION_STRATA + RECB_OP_STRATA +
+    RECB_NUM_RE_STRATA + RECB_NUM_SIA_STRATA;
 
 struct RecbVerifyStats {
   unsigned long long attempts;
@@ -111,6 +136,7 @@ struct RecbVerifyStats {
   unsigned long long op_successes[4];
   unsigned long long op_failures[4];
   unsigned long long direction_counts[14];
+  unsigned long long strata[RECB_STRATUM_COUNT][RECB_STRATUM_OUTCOME_COUNT];
   unsigned int roster_type_mismatches;
   unsigned int roster_live_count;
   unsigned int hash_pair_count;
@@ -237,47 +263,292 @@ namespace gpuSimulate {
       return cached != 0;
     }
 
-    // Algorithm A/B switch. Default keeps the optimized event-local schedule;
-    // KMC_RECB_EVENT_LOCAL=0 runs the same tile8 walker kernel with full passes.
+    // Algorithm A/B switch. The default baseline uses full passes;
+    // KMC_RECB_EVENT_LOCAL=1 explicitly enables the locality optimization.
     static bool recbEventLocalEnabled() {
       static int cached = -1;
       if (cached != -1) return cached != 0;
       const char* v = std::getenv("KMC_RECB_EVENT_LOCAL");
-      cached = (v == nullptr || v[0] == '\0' || v[0] != '0') ? 1 : 0;
+      // The original->GPU baseline is a full pass. Event-local scheduling is
+      // an explicitly enabled optimization, not the default baseline.
+      cached = (v != nullptr && v[0] != '\0' && v[0] != '0') ? 1 : 0;
       return cached != 0;
     }
 
-    static hipEvent_t recb_evt_begin{};
-    static hipEvent_t recb_evt_after_exchange{};
-    static hipEvent_t recb_evt_after_type{};
-    static hipEvent_t recb_evt_after_copy{};
-    static hipEvent_t recb_evt_after_clear{};
-    static bool recb_evt_inited = false;
+    static bool recbPhaseTimingEnabled() {
+      static int cached = -1;
+      if (cached != -1) return cached != 0;
+      const char* v = std::getenv("KMC_RECB_PHASE_TIMING");
+      cached = (v != nullptr && v[0] != '\0' && v[0] != '0') ? 1 : 0;
+      return cached != 0;
+    }
 
-    static float recb_ms_exchange = 0.0f;
-    static float recb_ms_type = 0.0f;
-    static float recb_ms_copy = 0.0f;
-    static float recb_ms_clear = 0.0f;
+    enum RecbPhaseEvent {
+      RECB_PHASE_BEGIN = 0,
+      RECB_PHASE_AFTER_FILTER,
+      RECB_PHASE_AFTER_COUNT_D2H,
+      RECB_PHASE_AFTER_WALKER,
+      RECB_PHASE_AFTER_BOUNDARY_COMPACT,
+      RECB_PHASE_AFTER_REFRESH,
+      RECB_PHASE_AFTER_BOUNDARY_TYPE,
+      RECB_PHASE_AFTER_COPY,
+      RECB_PHASE_AFTER_CLEAR,
+      RECB_PHASE_EVENT_COUNT
+    };
+
+    static hipEvent_t recb_phase_events[RECB_PHASE_EVENT_COUNT]{};
+    static bool recb_phase_events_inited = false;
+    static double recb_phase_ms[RECB_PHASE_EVENT_COUNT - 1]{};
+    static unsigned long long recb_phase_calls = 0;
+    static unsigned long long recb_phase_zero_candidates = 0;
+    static unsigned long long recb_phase_positive_candidates = 0;
+    static double recb_phase_host_boundary_ms = 0.0;
+
+    enum RecbRunMetric {
+      RUN_LAUNCHES = 0, RUN_SECTOR_PAIRS, RUN_ATTEMPTS, RUN_HOPS,
+      RUN_MAX_HOPS_ONE_WALKER, RUN_MULTI_HOP, RUN_CAPTURED,
+      RUN_CAPTURED_NO_MOVE, RUN_EXITED, RUN_CAPPED, RUN_STALE,
+      RUN_UNCLASSIFIED, RUN_TARGET_MO, RUN_TARGET_RE, RUN_TARGET_OTHER,
+      RUN_LOCK_FAIL, RUN_SRC_CHANGED, RUN_DST_MO_CHANGED,
+      RUN_DST_RE_CHANGED, RUN_DST_OTHER_CHANGED, RUN_TX_FAIL,
+      RUN_ROSTER_TYPE_MISMATCH, RUN_STALE_AT_START, RUN_STALE_SRC_CHANGED,
+      RUN_CLASSIFICATION_BAD_LAUNCHES, RUN_ROSTER_HASH_BAD_LAUNCHES,
+      RUN_MAX_ROSTER_HASH_ABS_DIFF, RUN_METRIC_COUNT
+    };
+
+    struct RecbRunSummary {
+      unsigned long long metric[RUN_METRIC_COUNT]{};
+      unsigned long long op_attempts[RECB_OP_STRATA]{};
+      unsigned long long op_successes[RECB_OP_STRATA]{};
+      unsigned long long op_failures[RECB_OP_STRATA]{};
+      unsigned long long direction_counts[RECB_DIRECTION_STRATA]{};
+      unsigned long long strata[RECB_STRATUM_COUNT][RECB_STRATUM_OUTCOME_COUNT]{};
+    };
+
+    static RecbRunSummary recb_run_summary{};
+
+    static void accumulateRecbRunSummary(const RecbVerifyStats& s) {
+      RecbRunSummary& r = recb_run_summary;
+      ++r.metric[RUN_LAUNCHES];
+      r.metric[RUN_SECTOR_PAIRS] += s.sector_pairs;
+      r.metric[RUN_ATTEMPTS] += s.attempts;
+      r.metric[RUN_HOPS] += s.successful_hops;
+      if (s.max_successful_hops > r.metric[RUN_MAX_HOPS_ONE_WALKER])
+        r.metric[RUN_MAX_HOPS_ONE_WALKER] = s.max_successful_hops;
+      r.metric[RUN_MULTI_HOP] += s.multi_hop_pairs;
+      r.metric[RUN_CAPTURED] += s.captured_walks;
+      r.metric[RUN_CAPTURED_NO_MOVE] += s.captured_no_move;
+      r.metric[RUN_EXITED] += s.exited_walks;
+      r.metric[RUN_CAPPED] += s.capped_walks;
+      r.metric[RUN_STALE] += s.stale_source_walkers;
+      r.metric[RUN_UNCLASSIFIED] += s.unclassified_walkers;
+      r.metric[RUN_TARGET_MO] += s.target_mo;
+      r.metric[RUN_TARGET_RE] += s.target_re;
+      r.metric[RUN_TARGET_OTHER] += s.target_other;
+      r.metric[RUN_LOCK_FAIL] += s.lock_failures;
+      r.metric[RUN_SRC_CHANGED] += s.src_check_failures;
+      r.metric[RUN_DST_MO_CHANGED] += s.dst_mo_check_failures;
+      r.metric[RUN_DST_RE_CHANGED] += s.dst_re_check_failures;
+      r.metric[RUN_DST_OTHER_CHANGED] += s.dst_other_check_failures;
+      r.metric[RUN_TX_FAIL] += s.transaction_failures;
+      r.metric[RUN_ROSTER_TYPE_MISMATCH] += s.roster_type_mismatches;
+      r.metric[RUN_STALE_AT_START] += s.stale_at_start;
+      r.metric[RUN_STALE_SRC_CHANGED] += s.stale_src_changed;
+      const unsigned long long classified =
+          static_cast<unsigned long long>(s.captured_walks) + s.exited_walks +
+          s.capped_walks + s.stale_source_walkers;
+      if (s.unclassified_walkers != 0 ||
+          classified + s.unclassified_walkers != s.sector_pairs)
+        ++r.metric[RUN_CLASSIFICATION_BAD_LAUNCHES];
+      if (s.roster_live_count != s.hash_pair_count) {
+        ++r.metric[RUN_ROSTER_HASH_BAD_LAUNCHES];
+        const unsigned long long diff = s.roster_live_count > s.hash_pair_count
+            ? static_cast<unsigned long long>(s.roster_live_count - s.hash_pair_count)
+            : static_cast<unsigned long long>(s.hash_pair_count - s.roster_live_count);
+        if (diff > r.metric[RUN_MAX_ROSTER_HASH_ABS_DIFF])
+          r.metric[RUN_MAX_ROSTER_HASH_ABS_DIFF] = diff;
+      }
+      for (int i = 0; i < RECB_OP_STRATA; ++i) {
+        r.op_attempts[i] += s.op_attempts[i];
+        r.op_successes[i] += s.op_successes[i];
+        r.op_failures[i] += s.op_failures[i];
+      }
+      for (int i = 0; i < RECB_DIRECTION_STRATA; ++i)
+        r.direction_counts[i] += s.direction_counts[i];
+      for (int i = 0; i < RECB_STRATUM_COUNT; ++i)
+        for (int j = 0; j < RECB_STRATUM_OUTCOME_COUNT; ++j)
+          r.strata[i][j] += s.strata[i][j];
+    }
+
+    static void mergeRecbRunSummary(RecbRunSummary& dst,
+                                    const RecbRunSummary& src) {
+      for (int i = 0; i < RUN_METRIC_COUNT; ++i) {
+        if (i == RUN_MAX_HOPS_ONE_WALKER || i == RUN_MAX_ROSTER_HASH_ABS_DIFF) {
+          if (src.metric[i] > dst.metric[i]) dst.metric[i] = src.metric[i];
+        } else {
+          dst.metric[i] += src.metric[i];
+        }
+      }
+      for (int i = 0; i < RECB_OP_STRATA; ++i) {
+        dst.op_attempts[i] += src.op_attempts[i];
+        dst.op_successes[i] += src.op_successes[i];
+        dst.op_failures[i] += src.op_failures[i];
+      }
+      for (int i = 0; i < RECB_DIRECTION_STRATA; ++i)
+        dst.direction_counts[i] += src.direction_counts[i];
+      for (int i = 0; i < RECB_STRATUM_COUNT; ++i)
+        for (int j = 0; j < RECB_STRATUM_OUTCOME_COUNT; ++j)
+          dst.strata[i][j] += src.strata[i][j];
+    }
+
+    static void logRecbRunSummary() {
+      if (!recbCorrectnessDebugEnabled()) return;
+      int rank = 0, ranks = 1;
+      MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+      MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+      std::vector<RecbRunSummary> gathered(rank == 0 ? ranks : 0);
+      MPI_Gather(&recb_run_summary, static_cast<int>(sizeof(RecbRunSummary)), MPI_BYTE,
+                 rank == 0 ? gathered.data() : nullptr,
+                 static_cast<int>(sizeof(RecbRunSummary)), MPI_BYTE, 0, MPI_COMM_WORLD);
+      if (rank != 0) return;
+
+      RecbRunSummary all{};
+      for (int r = 0; r < ranks; ++r) {
+        const RecbRunSummary& x = gathered[r];
+        kiwi::logs::v(" ",
+            " [recb-rank-summary] rank={} launches={} sector_pairs={} attempts={} hops={} "
+            "lock_fail={} src_changed={} dst_changed={} tx_fail={} "
+            "classification_bad_launches={} roster_hash_bad_launches={}.\n",
+            r, x.metric[RUN_LAUNCHES], x.metric[RUN_SECTOR_PAIRS],
+            x.metric[RUN_ATTEMPTS], x.metric[RUN_HOPS], x.metric[RUN_LOCK_FAIL],
+            x.metric[RUN_SRC_CHANGED],
+            x.metric[RUN_DST_MO_CHANGED] + x.metric[RUN_DST_RE_CHANGED] +
+                x.metric[RUN_DST_OTHER_CHANGED],
+            x.metric[RUN_TX_FAIL], x.metric[RUN_CLASSIFICATION_BAD_LAUNCHES],
+            x.metric[RUN_ROSTER_HASH_BAD_LAUNCHES]);
+        mergeRecbRunSummary(all, x);
+      }
+      kiwi::logs::v(" ",
+          " [recb-run-summary] ranks={} launches={} sector_pairs={} attempts={} "
+          "successful_hops={} max_hops_one_walker={} multi_hop_walkers={} "
+          "captured={} captured_no_move={} exited={} capped={} stale={} unclassified={}.\n",
+          ranks, all.metric[RUN_LAUNCHES], all.metric[RUN_SECTOR_PAIRS],
+          all.metric[RUN_ATTEMPTS], all.metric[RUN_HOPS],
+          all.metric[RUN_MAX_HOPS_ONE_WALKER], all.metric[RUN_MULTI_HOP],
+          all.metric[RUN_CAPTURED], all.metric[RUN_CAPTURED_NO_MOVE],
+          all.metric[RUN_EXITED], all.metric[RUN_CAPPED], all.metric[RUN_STALE],
+          all.metric[RUN_UNCLASSIFIED]);
+      kiwi::logs::v(" ",
+          " [recb-run-integrity] classification_bad_launches={} "
+          "roster_hash_bad_launches={} max_roster_hash_abs_diff={} "
+          "roster_type_mismatches={} stale_at_start={} stale_src_changed={}.\n",
+          all.metric[RUN_CLASSIFICATION_BAD_LAUNCHES],
+          all.metric[RUN_ROSTER_HASH_BAD_LAUNCHES],
+          all.metric[RUN_MAX_ROSTER_HASH_ABS_DIFF],
+          all.metric[RUN_ROSTER_TYPE_MISMATCH], all.metric[RUN_STALE_AT_START],
+          all.metric[RUN_STALE_SRC_CHANGED]);
+      kiwi::logs::v(" ",
+          " [recb-run-conflicts] lock_fail={} src_changed={} dst_changed(mo/re/other)={}/{}/{} "
+          "tx_fail={} targets(mo/re/other)={}/{}/{}.\n",
+          all.metric[RUN_LOCK_FAIL], all.metric[RUN_SRC_CHANGED],
+          all.metric[RUN_DST_MO_CHANGED], all.metric[RUN_DST_RE_CHANGED],
+          all.metric[RUN_DST_OTHER_CHANGED], all.metric[RUN_TX_FAIL],
+          all.metric[RUN_TARGET_MO], all.metric[RUN_TARGET_RE],
+          all.metric[RUN_TARGET_OTHER]);
+      kiwi::logs::v(" ",
+          " [recb-run-strata-schema] eligible=hardware-conflict candidate before locking; "
+          "each eligible count must end in exactly one of lock_fail/src_changed/dst_changed/tx_fail/success.\n");
+      const char* group_name[4] = {"direction", "op", "num_re", "num_sia"};
+      const int group_begin[4] = {0, RECB_DIRECTION_STRATA,
+          RECB_DIRECTION_STRATA + RECB_OP_STRATA,
+          RECB_DIRECTION_STRATA + RECB_OP_STRATA + RECB_NUM_RE_STRATA};
+      const int group_size[4] = {RECB_DIRECTION_STRATA, RECB_OP_STRATA,
+                                RECB_NUM_RE_STRATA, RECB_NUM_SIA_STRATA};
+      unsigned int bad_partition_bins = 0;
+      for (int g = 0; g < 4; ++g) {
+        for (int i = 0; i < group_size[g]; ++i) {
+          const unsigned long long* v = all.strata[group_begin[g] + i];
+          const unsigned long long terminal = v[RECB_LOCK_FAIL] +
+              v[RECB_SRC_CHANGED] + v[RECB_DST_CHANGED] +
+              v[RECB_TX_FAIL] + v[RECB_SUCCESS];
+          if (terminal != v[RECB_ELIGIBLE]) ++bad_partition_bins;
+          kiwi::logs::v(" ",
+              " [recb-run-stratum] group={} bin={} eligible={} lock_fail={} "
+              "src_changed={} dst_changed={} tx_fail={} success={}.\n",
+              group_name[g], (g == 1 ? i + 1 : i), v[RECB_ELIGIBLE],
+              v[RECB_LOCK_FAIL], v[RECB_SRC_CHANGED], v[RECB_DST_CHANGED],
+              v[RECB_TX_FAIL], v[RECB_SUCCESS]);
+        }
+      }
+      kiwi::logs::v(" ",
+          " [recb-run-strata-check] bad_partition_bins={} (expected 0).\n",
+          bad_partition_bins);
+    }
 
     static void initRecbProfileEvents() {
-      if (recb_evt_inited) return;
-      HANDLE_HIP(hipEventCreate(&recb_evt_begin));
-      HANDLE_HIP(hipEventCreate(&recb_evt_after_exchange));
-      HANDLE_HIP(hipEventCreate(&recb_evt_after_type));
-      HANDLE_HIP(hipEventCreate(&recb_evt_after_copy));
-      HANDLE_HIP(hipEventCreate(&recb_evt_after_clear));
-      recb_evt_inited = true;
+      if (recb_phase_events_inited) return;
+      for (int i = 0; i < RECB_PHASE_EVENT_COUNT; ++i) {
+        HANDLE_HIP(hipEventCreate(&recb_phase_events[i]));
+      }
+      recb_phase_events_inited = true;
     }
 
     static void destroyRecbProfileEvents() {
-      if (!recb_evt_inited) return;
-      hipEventDestroy(recb_evt_begin);
-      hipEventDestroy(recb_evt_after_exchange);
-      hipEventDestroy(recb_evt_after_type);
-      hipEventDestroy(recb_evt_after_copy);
-      hipEventDestroy(recb_evt_after_clear);
-      recb_evt_inited = false;
+      if (!recb_phase_events_inited) return;
+      for (int i = 0; i < RECB_PHASE_EVENT_COUNT; ++i) {
+        hipEventDestroy(recb_phase_events[i]);
+      }
+      recb_phase_events_inited = false;
     }
+
+    static void accumulateRecbPhaseTimings(int candidate_count) {
+      HANDLE_HIP(hipEventSynchronize(recb_phase_events[RECB_PHASE_AFTER_CLEAR]));
+      for (int i = 0; i + 1 < RECB_PHASE_EVENT_COUNT; ++i) {
+        float elapsed_ms = 0.0f;
+        HANDLE_HIP(hipEventElapsedTime(&elapsed_ms, recb_phase_events[i],
+                                      recb_phase_events[i + 1]));
+        recb_phase_ms[i] += static_cast<double>(elapsed_ms);
+      }
+      ++recb_phase_calls;
+      if (candidate_count == 0) ++recb_phase_zero_candidates;
+      else ++recb_phase_positive_candidates;
+    }
+
+    static void logRecbPhaseTimings() {
+      if (!recbPhaseTimingEnabled() || recb_phase_calls == 0) return;
+      int rank = 0;
+      MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+      const double inv_calls = 1.0 / static_cast<double>(recb_phase_calls);
+      kiwi::logs::v(" ",
+          " [recb-phase-total] rank={} calls={} zero_candidates={} positive_candidates={} "
+          "scan_size={} capacity={} ms(filter/count_d2h/walker/boundary_compact/refresh/boundary_type/copy/clear/host_boundary)="
+          "{:.6f}/{:.6f}/{:.6f}/{:.6f}/{:.6f}/{:.6f}/{:.6f}/{:.6f}/{:.6f}.\n",
+          rank, recb_phase_calls, recb_phase_zero_candidates,
+          recb_phase_positive_candidates, pair_roster_scan_size, pair_atoms_size,
+          recb_phase_ms[0], recb_phase_ms[1], recb_phase_ms[2], recb_phase_ms[3],
+          recb_phase_ms[4], recb_phase_ms[5], recb_phase_ms[6], recb_phase_ms[7],
+          recb_phase_host_boundary_ms);
+      kiwi::logs::v(" ",
+          " [recb-phase-avg] rank={} us_per_call(filter/count_d2h/walker/boundary_compact/refresh/boundary_type/copy/clear/host_boundary)="
+          "{:.3f}/{:.3f}/{:.3f}/{:.3f}/{:.3f}/{:.3f}/{:.3f}/{:.3f}/{:.3f}.\n",
+          rank, recb_phase_ms[0] * 1000.0 * inv_calls,
+          recb_phase_ms[1] * 1000.0 * inv_calls,
+          recb_phase_ms[2] * 1000.0 * inv_calls,
+          recb_phase_ms[3] * 1000.0 * inv_calls,
+          recb_phase_ms[4] * 1000.0 * inv_calls,
+          recb_phase_ms[5] * 1000.0 * inv_calls,
+          recb_phase_ms[6] * 1000.0 * inv_calls,
+          recb_phase_ms[7] * 1000.0 * inv_calls,
+          recb_phase_host_boundary_ms * 1000.0 * inv_calls);
+    }
+}
+
+bool recb_phase_timing_enabled() {
+  return gpuSimulate::recbPhaseTimingEnabled();
+}
+
+void gpuRecbPhaseAddHostBoundary(double seconds) {
+  if (seconds > 0.0) gpuSimulate::recb_phase_host_boundary_ms += seconds * 1000.0;
 }
 
 void resetGpuCommMaintenanceProfiler() {
@@ -1938,7 +2209,8 @@ void selectAndPerformEventGPU(double excepted_rand, int rank, _type_lattice_coun
 
   CHECK_FOR_ERROR();
   if (gpu_comm_enabled()) {
-    hipLaunchKernelGGL(apply_selected_event_kernel, 1, 1, 0, 0, d_event, static_cast<int>(sector_id), pair_atoms_size);
+    hipLaunchKernelGGL(apply_selected_event_kernel, 1, 1, 0, 0, d_event,
+                       static_cast<int>(sector_id), pair_roster_scan_size);
     CHECK_FOR_ERROR();
     return;
   }
@@ -3692,12 +3964,31 @@ __device__ __forceinline__ void check_neighbors_tile8(
   num_re = tile.shfl(re, 0);
 }
 
+__device__ __forceinline__ void record_recb_stratum_outcome(
+    unsigned long long* block_strata, int direction, int op_type, int num_re,
+    int num_sia, RecbStratumOutcome outcome) {
+  if (!block_strata || op_type < 1 || op_type > RECB_OP_STRATA) return;
+  if (direction < 0) direction = 0;
+  if (direction >= RECB_DIRECTION_STRATA) direction = RECB_DIRECTION_STRATA - 1;
+  if (num_re < 0) num_re = 0;
+  if (num_re >= RECB_NUM_RE_STRATA) num_re = RECB_NUM_RE_STRATA - 1;
+  int sia_bin = num_sia < 0 ? 0 : (num_sia >= 2 ? 2 : num_sia);
+  const int op_base = RECB_DIRECTION_STRATA;
+  const int re_base = op_base + RECB_OP_STRATA;
+  const int sia_base = re_base + RECB_NUM_RE_STRATA;
+  atomicAdd(&block_strata[direction * RECB_STRATUM_OUTCOME_COUNT + outcome], 1ULL);
+  atomicAdd(&block_strata[(op_base + op_type - 1) * RECB_STRATUM_OUTCOME_COUNT + outcome], 1ULL);
+  atomicAdd(&block_strata[(re_base + num_re) * RECB_STRATUM_OUTCOME_COUNT + outcome], 1ULL);
+  atomicAdd(&block_strata[(sia_base + sia_bin) * RECB_STRATUM_OUTCOME_COUNT + outcome], 1ULL);
+}
+
 template <typename Tile>
 __device__ void run_recb_walker_tile8(
     int sector_id, int work_index, RecbVerifyStats* stats,
     const long int* __restrict__ sector_slots, bool verify_detail,
     bool collect_hash_stats,
-    unsigned long long* __restrict__ walker_lengths, Tile tile) {
+    unsigned long long* __restrict__ walker_lengths,
+    unsigned long long* block_strata, Tile tile) {
   const bool leader = tile.thread_rank() == 0;
   long int slot = leader ? sector_slots[work_index] : 0;
   slot = tile.shfl(slot, 0);
@@ -3795,6 +4086,11 @@ __device__ void run_recb_walker_tile8(
           tx.op_type = decide_op_type(cur_type, dst_type, accept);
           tx.dst_id = dst_id;
         }
+        const int candidate_op = tx.op_type;
+        if (candidate_op != 0) {
+          record_recb_stratum_outcome(block_strata, direction, candidate_op,
+                                      num_re, num_sia, RECB_ELIGIBLE);
+        }
 
         bool locks_acquired = false;
         if (tx.op_type != 0) {
@@ -3802,6 +4098,8 @@ __device__ void run_recb_walker_tile8(
           if (locks_acquired) __threadfence();
           else {
             ++lock_failures;
+            record_recb_stratum_outcome(block_strata, direction, candidate_op,
+                                        num_re, num_sia, RECB_LOCK_FAIL);
             tx.op_type = 0;
           }
         }
@@ -3819,12 +4117,16 @@ __device__ void run_recb_walker_tile8(
             else ++dst_other_failures;
           }
           if (!src_ok) {
+            record_recb_stratum_outcome(block_strata, direction, candidate_op,
+                                        num_re, num_sia, RECB_SRC_CHANGED);
             if (g_Pair_Atoms[slot] == tx.src_id) g_Pair_Atoms[slot] = -1;
             stale = 1;
             if (stats) atomicAdd(&stats->stale_src_changed, 1u);
             tx.active = false;
             tx.op_type = 0;
           } else if (!dst_ok) {
+            record_recb_stratum_outcome(block_strata, direction, candidate_op,
+                                        num_re, num_sia, RECB_DST_CHANGED);
             tx.op_type = 0;
           }
         }
@@ -3835,6 +4137,11 @@ __device__ void run_recb_walker_tile8(
           atomicAdd(&stats->op_attempts[attempted_op - 1], 1ULL);
         if (tx.op_type != 0) perform_batch_update_single(tx);
         if (transaction_attempted && !tx.success) ++tx_failures;
+        if (transaction_attempted) {
+          record_recb_stratum_outcome(block_strata, direction, candidate_op,
+                                      num_re, num_sia,
+                                      tx.success ? RECB_SUCCESS : RECB_TX_FAIL);
+        }
         if (verify_detail && stats && attempted_op >= 1 && attempted_op <= 4) {
           if (tx.success) atomicAdd(&stats->op_successes[attempted_op - 1], 1ULL);
           else atomicAdd(&stats->op_failures[attempted_op - 1], 1ULL);
@@ -3898,6 +4205,14 @@ __global__ void __launch_bounds__(128) calcExchangePairsTile8(
     const long int* __restrict__ sector_slots, bool verify_detail,
     bool collect_hash_stats, unsigned long long* __restrict__ walker_lengths,
     unsigned int* __restrict__ work_head) {
+  __shared__ unsigned long long
+      block_strata[RECB_STRATUM_COUNT * RECB_STRATUM_OUTCOME_COUNT];
+  if (verify_detail) {
+    for (int i = threadIdx.x;
+         i < RECB_STRATUM_COUNT * RECB_STRATUM_OUTCOME_COUNT;
+         i += blockDim.x) block_strata[i] = 0ULL;
+    __syncthreads();
+  }
   cg::thread_block block = cg::this_thread_block();
   auto tile = cg::tiled_partition<8>(block);
   while (true) {
@@ -3907,7 +4222,17 @@ __global__ void __launch_bounds__(128) calcExchangePairsTile8(
     if (work_index >= static_cast<unsigned int>(work_count)) break;
     run_recb_walker_tile8(sector_id, static_cast<int>(work_index), stats,
                           sector_slots, verify_detail, collect_hash_stats,
-                          walker_lengths, tile);
+                          walker_lengths, verify_detail ? block_strata : nullptr,
+                          tile);
+  }
+  if (verify_detail) {
+    __syncthreads();
+    for (int i = threadIdx.x;
+         i < RECB_STRATUM_COUNT * RECB_STRATUM_OUTCOME_COUNT;
+         i += blockDim.x) {
+      const unsigned long long value = block_strata[i];
+      if (value) atomicAdd(&stats->strata[0][0] + i, value);
+    }
   }
 }
 
@@ -5029,7 +5354,7 @@ void recb_solver_GPU(
    
     // printf("starting recb solver with GPU sector_id:%d,arr_size:%d\n",sector_id,arr_size);
     const bool hash_stats = recbHashStatsEnabled();
-    const bool do_profile = hash_stats;
+    const bool do_profile = recbPhaseTimingEnabled();
     const bool verify_detail = recbCorrectnessDebugEnabled();
     const bool event_local = recbEventLocalEnabled();
     if (do_profile) initRecbProfileEvents();
@@ -5043,9 +5368,11 @@ void recb_solver_GPU(
     static bool recb_schedule_config_printed = false;
     if (!recb_schedule_config_printed) {
       if (recb_rank == 0) {
-        kiwi::logs::v(" ", " [recb-config] walker=tile8 schedule={} local_audit={} (KMC_RECB_EVENT_LOCAL={}).\n",
+        kiwi::logs::v(" ", " [recb-config] walker=tile8 schedule={} local_audit={} phase_timing={} roster_scan={} roster_capacity={} (KMC_RECB_EVENT_LOCAL={}).\n",
                       event_local ? "event-local" : "full",
                       verify_detail && event_local ? "on" : "off",
+                      do_profile ? "on" : "off",
+                      pair_roster_scan_size, pair_atoms_size,
                       event_local ? 1 : 0);
       }
       recb_schedule_config_printed = true;
@@ -5072,22 +5399,30 @@ void recb_solver_GPU(
 
     //=======recb 前筛选：把本扇区盒子内的 walker 槽位号压缩出来=======
     // 花名册 g_Pair_Atoms 混装全部 8 个扇区，这里先筛出本扇区，kernel 只启动所需线程。
+    if (do_profile) {
+      HANDLE_HIP(hipEventRecord(recb_phase_events[RECB_PHASE_BEGIN], 0));
+    }
     hipLaunchKernelGGL(begin_recb_pass, 1, 1, 0, 0,
                        static_cast<int>(sector_id), event_local);
     HANDLE_HIP(hipMemset(d_sector_slot_count, 0, sizeof(int)));
-    {
-      const long int filter_grid = (pair_atoms_size + blockSize - 1) / blockSize;
+    if (pair_roster_scan_size > 0) {
+      const long int filter_grid = (pair_roster_scan_size + blockSize - 1) / blockSize;
       hipLaunchKernelGGL(filter_pair_slots_for_sector, filter_grid, blockSize, 0, 0,
-                         (int)sector_id, pair_atoms_size, d_sector_slots,
+                         (int)sector_id, pair_roster_scan_size, d_sector_slots,
                          d_sector_slot_count, event_local,
                          verify_detail && event_local);
       CHECK_FOR_ERROR();
     }
+    if (do_profile) {
+      HANDLE_HIP(hipEventRecord(recb_phase_events[RECB_PHASE_AFTER_FILTER], 0));
+    }
     int h_sector_count = 0;
     HANDLE_HIP(hipMemcpy(&h_sector_count, d_sector_slot_count, sizeof(int), hipMemcpyDeviceToHost));
+    if (do_profile) {
+      HANDLE_HIP(hipEventRecord(recb_phase_events[RECB_PHASE_AFTER_COUNT_D2H], 0));
+    }
     //=============================================================
 
-    if (do_profile) HANDLE_HIP(hipEventRecord(recb_evt_begin, 0));
     // query/update/probe 三类原子统计只在哈希统计模式开启。
     if (hash_stats) {
       hipLaunchKernelGGL(reset_hash_stats, 1, 1, 0, 0);
@@ -5152,12 +5487,15 @@ void recb_solver_GPU(
       HANDLE_HIP(hipMemcpyFromSymbol(h_probe_max, HIP_SYMBOL(g_probe_max),
                                      sizeof(h_probe_max)));
     }
-    if (do_profile) HANDLE_HIP(hipEventRecord(recb_evt_after_exchange, 0));
+    if (do_profile) {
+      HANDLE_HIP(hipEventRecord(recb_phase_events[RECB_PHASE_AFTER_WALKER], 0));
+    }
 
     if (verify_detail) {
       // 每次启动都取回统计（保险丝计数不能漏），但常规日志只打前 5 次
       RecbVerifyStats h_stats{};
       HANDLE_HIP(hipMemcpy(&h_stats, d_recb_verify_stats, sizeof(RecbVerifyStats), hipMemcpyDeviceToHost));
+      accumulateRecbRunSummary(h_stats);
       recb_capped_total += h_stats.capped_walks;
       if (recb_rank == 0 && launch_n <= 5) {
         kiwi::logs::v(" ", " [recb-verify] sect={} launch={} sector_pairs={} attempts={} successful_hops={} max_successful_hops_one_pair={} pairs_multi_hop={} captured_walks={} captured_no_move={} exited_walks={} capped_walks={} stale_source_walkers={} unclassified_walkers={} tx_fail={} roster_live={} hash_pairs={}.\n",
@@ -5358,11 +5696,17 @@ void recb_solver_GPU(
                        ghost_Hash->device_ptr()->keys, ghost_capacity, d_ghost_list, d_ghost_count);
     CHECK_FOR_ERROR();
     hipDeviceSynchronize();
+    if (do_profile) {
+      HANDLE_HIP(hipEventRecord(recb_phase_events[RECB_PHASE_AFTER_BOUNDARY_COMPACT], 0));
+    }
 
     // 复用上面的既有同步点后再读取 dirty，干净 launch 不再额外等待 GPU。
     // 该刷新只清理 MoRe 墓碑，与通信后的 roster rebuild 无关。
     refreshMoReAfterRecb(sid, launch_n, verify_detail, hash_stats);
     if (hash_stats) logReHashOccupancy(sid, launch_n, recb_rank);
+    if (do_profile) {
+      HANDLE_HIP(hipEventRecord(recb_phase_events[RECB_PHASE_AFTER_REFRESH], 0));
+    }
 
     int h_surface_count = 0;
     int h_ghost_count = 0;
@@ -5394,7 +5738,9 @@ void recb_solver_GPU(
       CHECK_FOR_ERROR();
     }
     hipDeviceSynchronize();
-    if (do_profile) HANDLE_HIP(hipEventRecord(recb_evt_after_type, 0));
+    if (do_profile) {
+      HANDLE_HIP(hipEventRecord(recb_phase_events[RECB_PHASE_AFTER_BOUNDARY_TYPE], 0));
+    }
 
     if (h_ghost_count > 0 && h_ghost_Hash && h_ghost_type) {
       HANDLE_HIP(hipMemcpy(h_ghost_Hash, d_ghost_list, h_ghost_count * sizeof(long int), hipMemcpyDeviceToHost));
@@ -5404,11 +5750,15 @@ void recb_solver_GPU(
       HANDLE_HIP(hipMemcpy(h_surface_Hash, d_surface_list, h_surface_count * sizeof(long int), hipMemcpyDeviceToHost));
       HANDLE_HIP(hipMemcpy(h_surface_type, d_surface_list_type, h_surface_count * sizeof(long int), hipMemcpyDeviceToHost));
     }
-    if (do_profile) HANDLE_HIP(hipEventRecord(recb_evt_after_copy, 0));
+    if (do_profile) {
+      HANDLE_HIP(hipEventRecord(recb_phase_events[RECB_PHASE_AFTER_COPY], 0));
+    }
 
     ghost_Hash->clear();
     surface_Hash->clear();
-    if (do_profile) HANDLE_HIP(hipEventRecord(recb_evt_after_clear, 0));
+    if (do_profile) {
+      HANDLE_HIP(hipEventRecord(recb_phase_events[RECB_PHASE_AFTER_CLEAR], 0));
+    }
     // for(int i=0;i<surface_Hash->device_ptr()->capacity;i++){
     //   printf("%ld-%ld\t",h_surface_Hash[i],h_surface_type[i]);
     //   if(i%20 == 0)
@@ -5419,20 +5769,7 @@ void recb_solver_GPU(
       sizes[1]= h_surface_count;
     }
 
-    if (do_profile) {
-      HANDLE_HIP(hipEventSynchronize(recb_evt_after_clear));
-      HANDLE_HIP(hipEventElapsedTime(&recb_ms_exchange, recb_evt_begin, recb_evt_after_exchange));
-      HANDLE_HIP(hipEventElapsedTime(&recb_ms_type, recb_evt_after_exchange, recb_evt_after_type));
-      HANDLE_HIP(hipEventElapsedTime(&recb_ms_copy, recb_evt_after_type, recb_evt_after_copy));
-      HANDLE_HIP(hipEventElapsedTime(&recb_ms_clear, recb_evt_after_copy, recb_evt_after_clear));
-      // std::cout
-      //     << "[KMC_RECB_HASH_STATS] N=" << pair_atoms_size
-      //     << " exchange_ms=" << recb_ms_exchange
-      //     << " type_ms=" << recb_ms_type
-      //     << " copy_ms=" << recb_ms_copy
-      //     << " clear_ms=" << recb_ms_clear
-      //     << std::endl;
-    }
+    if (do_profile) accumulateRecbPhaseTimings(h_sector_count);
     // printf("cal exchange finished \n");
 }
 
@@ -5690,7 +6027,8 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
     MoMo_Hash等等同理
     busy_set        host      忙碌队列
   */
-  pair_atoms_size = pair_atoms.size()*2;
+  pair_roster_scan_size = static_cast<long int>(pair_atoms.size());
+  pair_atoms_size = pair_roster_scan_size * 2;
   hipHostMalloc((void**)&Pair_Atoms,pair_atoms.size()*sizeof(long int));
   HANDLE_HIP(hipMalloc((void**)&d_Pair_Atoms,pair_atoms.size()*sizeof(long int)*2));
   HANDLE_HIP(hipMemset(d_Pair_Atoms, -1, pair_atoms.size() * sizeof(long int) * 2));
@@ -5862,6 +6200,8 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
 void gpu_final(){
   using namespace gpuSimulate;
 
+  logRecbRunSummary();
+  logRecbPhaseTimings();
   destroyRecbProfileEvents();
 
   // 释放GPU内存
@@ -6822,6 +7162,7 @@ void rebuildPairAtomsAfterComm() {
     int n_momo_int = 0;
     HANDLE_HIP(hipMemcpy(&n_momo_int, d_pair_compact_count, sizeof(int), hipMemcpyDeviceToHost));
     n_momo = n_momo_int;
+    n_total = n_momo;
   }
 
   // compact MoRe（接在 MoMo 后面，共享 d_pair_compact_count）
@@ -6836,6 +7177,14 @@ void rebuildPairAtomsAfterComm() {
     int n_total_int = 0;
     HANDLE_HIP(hipMemcpy(&n_total_int, d_pair_compact_count, sizeof(int), hipMemcpyDeviceToHost));
     n_total = n_total_int;
+  }
+
+  if (n_total > pair_atoms_size) {
+    int rank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    kiwi::logs::v(" ", " [pair-roster-capacity-fatal] rank={} live={} capacity={}.\n",
+                  rank, n_total, pair_atoms_size);
+    std::abort();
   }
 
   // 关键修复：clear 两个哈希表（清空有效 key 与长期累积的 tombstone），再按 compact 结果重新插入。
@@ -6916,6 +7265,10 @@ void rebuildPairAtomsAfterComm() {
 
   hipLaunchKernelGGL(invalidate_recb_stability, 1, 8, 0, 0);
   hipDeviceSynchronize();
+  // compactHashSetBoundedKernel writes every surviving pair into the prefix.
+  // Holes may appear later, but no live slot can exist beyond this scan bound
+  // until the next rebuild updates it again.
+  pair_roster_scan_size = n_total;
   gpuSimulate::comm_gpu_maintenance_profiler.rebuild_cleanup_time += MPI_Wtime() - rebuild_cleanup_start;
 }
 

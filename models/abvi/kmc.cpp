@@ -288,6 +288,8 @@ void ABVIModel::recb_solver(std::vector<_type_lattice_id>id, const lat_region& r
                   box->lattice_list->h_ghost_Hash_type,box->lattice_list->h_surface_Hash_type,
                   sizes
                 );
+    const bool phase_timing = recb_phase_timing_enabled();
+    const double host_boundary_start = phase_timing ? MPI_Wtime() : 0.0;
     //更新哈希表现在不用更新，最后一次更新就完了
     // printf("recb_solver_GPU finished\n");
     // printf("sizes:%ld,%ld\n",sizes[0],sizes[1]);
@@ -335,6 +337,9 @@ void ABVIModel::recb_solver(std::vector<_type_lattice_id>id, const lat_region& r
     memset(box->lattice_list->h_surface_Hash, -1, sizes[1]*sizeof(long int));
     memset(box->lattice_list->h_ghost_Hash_type, -1, sizes[0]*sizeof(long int));
     memset(box->lattice_list->h_surface_Hash_type, -1, sizes[1]*sizeof(long int));
+    if (phase_timing) {
+      gpuRecbPhaseAddHostBoundary(MPI_Wtime() - host_boundary_start);
+    }
     // printf("recb_solver finished\n");
     
 }
