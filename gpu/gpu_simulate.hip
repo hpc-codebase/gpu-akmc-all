@@ -136,6 +136,18 @@ struct RecbVerifyStats {
   unsigned long long op_successes[4];
   unsigned long long op_failures[4];
   unsigned long long direction_counts[14];
+  // Correctness audit for the unlocked 1NN read set.  A walker first reads
+  // the eight neighbours to decide capture/acceptance, but the production
+  // path only locks src/dst.  In debug mode we take a second snapshot before
+  // commit and count observations that changed in that window.
+  unsigned long long readset_checks;
+  unsigned long long readset_signature_changed;
+  unsigned long long readset_count_changed;
+  unsigned long long readset_decision_changed;
+  // MoRe acceptance audit.  Only bins 0..4 are normally reachable because a
+  // MoRe walker with numRe >= 5 is captured before proposing a move.
+  unsigned long long accept_trials_by_num_re[9];
+  unsigned long long accept_success_by_num_re[9];
   unsigned long long strata[RECB_STRATUM_COUNT][RECB_STRATUM_OUTCOME_COUNT];
   unsigned int roster_type_mismatches;
   unsigned int roster_live_count;
@@ -228,6 +240,9 @@ namespace gpuSimulate {
     unsigned int *d_more_refresh_counts = nullptr; // empty/tombstone/live/reinsert_fail
     unsigned int h_more_cached_counts[3] = {0, 0, 0};
     bool h_more_cache_initialized = false;
+    unsigned long long audit_owned_sites_local = 0;
+    unsigned long long state_audit_initial[10] = {};
+    bool state_audit_initial_valid = false;
 
     unsigned long long int* d_Global_Bitmap_Lock = nullptr;
     size_t bitmap_lock_bytes = 0;
@@ -313,7 +328,9 @@ namespace gpuSimulate {
       RUN_DST_RE_CHANGED, RUN_DST_OTHER_CHANGED, RUN_TX_FAIL,
       RUN_ROSTER_TYPE_MISMATCH, RUN_STALE_AT_START, RUN_STALE_SRC_CHANGED,
       RUN_CLASSIFICATION_BAD_LAUNCHES, RUN_ROSTER_HASH_BAD_LAUNCHES,
-      RUN_MAX_ROSTER_HASH_ABS_DIFF, RUN_METRIC_COUNT
+      RUN_MAX_ROSTER_HASH_ABS_DIFF, RUN_READSET_CHECKS,
+      RUN_READSET_SIGNATURE_CHANGED, RUN_READSET_COUNT_CHANGED,
+      RUN_READSET_DECISION_CHANGED, RUN_METRIC_COUNT
     };
 
     struct RecbRunSummary {
@@ -322,6 +339,8 @@ namespace gpuSimulate {
       unsigned long long op_successes[RECB_OP_STRATA]{};
       unsigned long long op_failures[RECB_OP_STRATA]{};
       unsigned long long direction_counts[RECB_DIRECTION_STRATA]{};
+      unsigned long long accept_trials_by_num_re[RECB_NUM_RE_STRATA]{};
+      unsigned long long accept_success_by_num_re[RECB_NUM_RE_STRATA]{};
       unsigned long long strata[RECB_STRATUM_COUNT][RECB_STRATUM_OUTCOME_COUNT]{};
     };
 
@@ -354,6 +373,10 @@ namespace gpuSimulate {
       r.metric[RUN_ROSTER_TYPE_MISMATCH] += s.roster_type_mismatches;
       r.metric[RUN_STALE_AT_START] += s.stale_at_start;
       r.metric[RUN_STALE_SRC_CHANGED] += s.stale_src_changed;
+      r.metric[RUN_READSET_CHECKS] += s.readset_checks;
+      r.metric[RUN_READSET_SIGNATURE_CHANGED] += s.readset_signature_changed;
+      r.metric[RUN_READSET_COUNT_CHANGED] += s.readset_count_changed;
+      r.metric[RUN_READSET_DECISION_CHANGED] += s.readset_decision_changed;
       const unsigned long long classified =
           static_cast<unsigned long long>(s.captured_walks) + s.exited_walks +
           s.capped_walks + s.stale_source_walkers;
@@ -375,6 +398,10 @@ namespace gpuSimulate {
       }
       for (int i = 0; i < RECB_DIRECTION_STRATA; ++i)
         r.direction_counts[i] += s.direction_counts[i];
+      for (int i = 0; i < RECB_NUM_RE_STRATA; ++i) {
+        r.accept_trials_by_num_re[i] += s.accept_trials_by_num_re[i];
+        r.accept_success_by_num_re[i] += s.accept_success_by_num_re[i];
+      }
       for (int i = 0; i < RECB_STRATUM_COUNT; ++i)
         for (int j = 0; j < RECB_STRATUM_OUTCOME_COUNT; ++j)
           r.strata[i][j] += s.strata[i][j];
@@ -396,6 +423,10 @@ namespace gpuSimulate {
       }
       for (int i = 0; i < RECB_DIRECTION_STRATA; ++i)
         dst.direction_counts[i] += src.direction_counts[i];
+      for (int i = 0; i < RECB_NUM_RE_STRATA; ++i) {
+        dst.accept_trials_by_num_re[i] += src.accept_trials_by_num_re[i];
+        dst.accept_success_by_num_re[i] += src.accept_success_by_num_re[i];
+      }
       for (int i = 0; i < RECB_STRATUM_COUNT; ++i)
         for (int j = 0; j < RECB_STRATUM_OUTCOME_COUNT; ++j)
           dst.strata[i][j] += src.strata[i][j];
@@ -455,6 +486,42 @@ namespace gpuSimulate {
           all.metric[RUN_DST_OTHER_CHANGED], all.metric[RUN_TX_FAIL],
           all.metric[RUN_TARGET_MO], all.metric[RUN_TARGET_RE],
           all.metric[RUN_TARGET_OTHER]);
+      kiwi::logs::v(" ",
+          " [recb-run-readset] checks={} signature_changed={} count_changed={} "
+          "decision_changed={} (expected 0 for serializable read decisions).\n",
+          all.metric[RUN_READSET_CHECKS],
+          all.metric[RUN_READSET_SIGNATURE_CHANGED],
+          all.metric[RUN_READSET_COUNT_CHANGED],
+          all.metric[RUN_READSET_DECISION_CHANGED]);
+      kiwi::logs::v(" ",
+          " [recb-run-accept] num_re=0/1/2/3/4/5/6/7/8 "
+          "trials={}/{}/{}/{}/{}/{}/{}/{}/{} "
+          "accepted={}/{}/{}/{}/{}/{}/{}/{}/{}.\n",
+          all.accept_trials_by_num_re[0], all.accept_trials_by_num_re[1],
+          all.accept_trials_by_num_re[2], all.accept_trials_by_num_re[3],
+          all.accept_trials_by_num_re[4], all.accept_trials_by_num_re[5],
+          all.accept_trials_by_num_re[6], all.accept_trials_by_num_re[7],
+          all.accept_trials_by_num_re[8], all.accept_success_by_num_re[0],
+          all.accept_success_by_num_re[1], all.accept_success_by_num_re[2],
+          all.accept_success_by_num_re[3], all.accept_success_by_num_re[4],
+          all.accept_success_by_num_re[5], all.accept_success_by_num_re[6],
+          all.accept_success_by_num_re[7], all.accept_success_by_num_re[8]);
+      kiwi::logs::v(" ",
+          " [recb-run-ops] attempts=[{},{},{},{}] successes=[{},{},{},{}] "
+          "failures=[{},{},{},{}].\n",
+          all.op_attempts[0], all.op_attempts[1], all.op_attempts[2],
+          all.op_attempts[3], all.op_successes[0], all.op_successes[1],
+          all.op_successes[2], all.op_successes[3], all.op_failures[0],
+          all.op_failures[1], all.op_failures[2], all.op_failures[3]);
+      kiwi::logs::v(" ",
+          " [recb-run-directions] counts=[{},{},{},{},{},{},{},{},{},{},{},{},{},{}].\n",
+          all.direction_counts[0], all.direction_counts[1],
+          all.direction_counts[2], all.direction_counts[3],
+          all.direction_counts[4], all.direction_counts[5],
+          all.direction_counts[6], all.direction_counts[7],
+          all.direction_counts[8], all.direction_counts[9],
+          all.direction_counts[10], all.direction_counts[11],
+          all.direction_counts[12], all.direction_counts[13]);
       kiwi::logs::v(" ",
           " [recb-run-strata-schema] eligible=hardware-conflict candidate before locking; "
           "each eligible count must end in exactly one of lock_fail/src_changed/dst_changed/tx_fail/success.\n");
@@ -3939,7 +4006,7 @@ __global__ void __launch_bounds__(128) calcExchangePairs(int sector_id,int arr_s
 template <typename Tile>
 __device__ __forceinline__ void check_neighbors_tile8(
     _type_lattice_size x, _type_lattice_size y, _type_lattice_size z,
-    Tile tile, int& num_sia, int& num_re) {
+    Tile tile, int& num_sia, int& num_re, unsigned int& signature) {
   const int lane = tile.thread_rank();
   const int q = lane & 3;
   const int dx = lane < 4 ? -1 : 1;
@@ -3955,13 +4022,44 @@ __device__ __forceinline__ void check_neighbors_tile8(
           hash_set_contains(g_MoMo_Hash, nid);
     re = !sia && hash_set_contains(g_Re_Hash, nid);
   }
+  // Two bits per 1NN position: 0=other, 1=SIA, 2=Re.  Counts alone can stay
+  // unchanged when two neighbours exchange identities, so keep the exact
+  // decision-read signature as well.
+  unsigned int sig = static_cast<unsigned int>(sia ? 1 : (re ? 2 : 0))
+                     << (2 * lane);
   #pragma unroll
   for (int offset = 4; offset > 0; offset >>= 1) {
     sia += tile.shfl_down(sia, offset);
     re += tile.shfl_down(re, offset);
+    sig |= tile.shfl_down(sig, offset);
   }
   num_sia = tile.shfl(sia, 0);
   num_re = tile.shfl(re, 0);
+  signature = tile.shfl(sig, 0);
+}
+
+// Debug-only serial snapshot used after src/dst locks are acquired.  It does
+// not make the read set safe: it only measures whether the unlocked 1NN data
+// used for the decision changed before commit.
+__device__ __forceinline__ void snapshot_neighbors_single(
+    _type_lattice_size x, _type_lattice_size y, _type_lattice_size z,
+    int& num_sia, int& num_re, unsigned int& signature) {
+  num_sia = 0;
+  num_re = 0;
+  signature = 0;
+  _type_lattice_id nn_ids[8];
+  get1nn_ids(x, y, z, nn_ids);
+  #pragma unroll 1
+  for (int i = 0; i < 8; ++i) {
+    const _type_lattice_id nid = nn_ids[i];
+    if (nid <= 0) continue;
+    const bool sia = hash_set_contains(g_MoRe_Hash, nid) ||
+                     hash_set_contains(g_MoMo_Hash, nid);
+    const bool re = !sia && hash_set_contains(g_Re_Hash, nid);
+    if (sia) ++num_sia;
+    if (re) ++num_re;
+    signature |= static_cast<unsigned int>(sia ? 1 : (re ? 2 : 0)) << (2 * i);
+  }
 }
 
 __device__ __forceinline__ void record_recb_stratum_outcome(
@@ -4016,6 +4114,8 @@ __device__ void run_recb_walker_tile8(
   unsigned int dst_mo_failures = 0, dst_re_failures = 0, dst_other_failures = 0;
   unsigned int tx_failures = 0, captured = 0, exited = 0, capped = 0, stale = 0;
   unsigned int captured_no_move = 0;
+  unsigned int readset_checks = 0, readset_signature_changed = 0;
+  unsigned int readset_count_changed = 0, readset_decision_changed = 0;
 
   if (leader && tx.active && stats) atomicAdd(&stats->sector_pairs, 1u);
   if (leader && tx.active && cur_type != LatticeTypes::MoMo && cur_type != LatticeTypes::MoRe) {
@@ -4052,10 +4152,22 @@ __device__ void run_recb_walker_tile8(
     y = tile.shfl(y, 0);
     z = tile.shfl(z, 0);
     int num_sia = 0, num_re = 0;
-    check_neighbors_tile8(x, y, z, tile, num_sia, num_re);
+    unsigned int read_signature = 0;
+    check_neighbors_tile8(x, y, z, tile, num_sia, num_re, read_signature);
 
     if (leader) {
       if (num_sia >= 2 || (cur_type == LatticeTypes::MoRe && num_re >= 5)) {
+        if (verify_detail) {
+          int check_sia = 0, check_re = 0;
+          unsigned int check_signature = 0;
+          snapshot_neighbors_single(x, y, z, check_sia, check_re, check_signature);
+          ++readset_checks;
+          if (check_signature != read_signature) ++readset_signature_changed;
+          if (check_sia != num_sia || check_re != num_re) ++readset_count_changed;
+          const bool still_captured = check_sia >= 2 ||
+              (cur_type == LatticeTypes::MoRe && check_re >= 5);
+          if (!still_captured) ++readset_decision_changed;
+        }
         captured_no_move = hops == 0;
         captured = 1;
         tx.active = false;
@@ -4076,12 +4188,22 @@ __device__ void run_recb_walker_tile8(
         }
 
         tx.op_type = 0;
+        float accept_draw = 1.0f;
+        bool accept_draw_valid = false;
         if (dst_type == LatticeTypes::Mo || dst_type == LatticeTypes::Re) {
           bool accept = num_re == 0;
           if (num_re > 0 && num_re < LatticesList::MAX_1NN) {
             if (collect_hash_stats) ++extra_rng;
-            accept = hiprand_uniform(&g_rng_states[slot]) >
-                     static_cast<float>(num_re) / LatticesList::MAX_1NN;
+            accept_draw = hiprand_uniform(&g_rng_states[slot]);
+            accept_draw_valid = true;
+            accept = accept_draw > static_cast<float>(num_re) /
+                     LatticesList::MAX_1NN;
+          }
+          if (verify_detail && stats && cur_type == LatticeTypes::MoRe) {
+            const int accept_bin = num_re < 0 ? 0 :
+                (num_re >= RECB_NUM_RE_STRATA ? RECB_NUM_RE_STRATA - 1 : num_re);
+            atomicAdd(&stats->accept_trials_by_num_re[accept_bin], 1ULL);
+            if (accept) atomicAdd(&stats->accept_success_by_num_re[accept_bin], 1ULL);
           }
           tx.op_type = decide_op_type(cur_type, dst_type, accept);
           tx.dst_id = dst_id;
@@ -4090,6 +4212,33 @@ __device__ void run_recb_walker_tile8(
         if (candidate_op != 0) {
           record_recb_stratum_outcome(block_strata, direction, candidate_op,
                                       num_re, num_sia, RECB_ELIGIBLE);
+        } else if (verify_detail) {
+          // Rejected/no-op proposals never acquire src/dst locks.  Re-read
+          // immediately so the audit also covers a stale read that could have
+          // changed a rejection into a legal move or a capture.
+          int check_sia = 0, check_re = 0;
+          unsigned int check_signature = 0;
+          snapshot_neighbors_single(x, y, z, check_sia, check_re, check_signature);
+          ++readset_checks;
+          if (check_signature != read_signature) ++readset_signature_changed;
+          if (check_sia != num_sia || check_re != num_re) ++readset_count_changed;
+          bool decision_changed = check_sia >= 2 ||
+              (cur_type == LatticeTypes::MoRe && check_re >= 5);
+          if (!decision_changed &&
+              (dst_type == LatticeTypes::Mo || dst_type == LatticeTypes::Re)) {
+            bool check_accept = check_re == 0;
+            if (check_re > 0 && check_re < LatticesList::MAX_1NN) {
+              if (accept_draw_valid) {
+                check_accept = accept_draw > static_cast<float>(check_re) /
+                               LatticesList::MAX_1NN;
+              } else if (cur_type == LatticeTypes::MoRe) {
+                decision_changed = true;
+              }
+            }
+            if (decide_op_type(cur_type, dst_type, check_accept) != candidate_op)
+              decision_changed = true;
+          }
+          if (decision_changed) ++readset_decision_changed;
         }
 
         bool locks_acquired = false;
@@ -4105,6 +4254,35 @@ __device__ void run_recb_walker_tile8(
         }
 
         const bool need_verify = locks_acquired && tx.op_type != 0;
+        if (need_verify && verify_detail) {
+          int check_sia = 0, check_re = 0;
+          unsigned int check_signature = 0;
+          snapshot_neighbors_single(x, y, z, check_sia, check_re, check_signature);
+          ++readset_checks;
+          if (check_signature != read_signature) ++readset_signature_changed;
+          if (check_sia != num_sia || check_re != num_re) ++readset_count_changed;
+
+          const bool now_captured = check_sia >= 2 ||
+              (cur_type == LatticeTypes::MoRe && check_re >= 5);
+          bool decision_changed = now_captured;
+          if (!now_captured) {
+            bool check_accept = check_re == 0;
+            if (check_re > 0 && check_re < LatticesList::MAX_1NN) {
+              if (accept_draw_valid) {
+                check_accept = accept_draw > static_cast<float>(check_re) /
+                               LatticesList::MAX_1NN;
+              } else if (cur_type == LatticeTypes::MoRe) {
+                // The original snapshot needed no conditional draw.  If the
+                // new snapshot needs one, the original proposal cannot be
+                // justified from the same random inputs.
+                decision_changed = true;
+              }
+            }
+            const int check_op = decide_op_type(cur_type, dst_type, check_accept);
+            if (check_op != candidate_op) decision_changed = true;
+          }
+          if (decision_changed) ++readset_decision_changed;
+        }
         const LatticeTypes::lat_type safe_src = need_verify ? getType(tx.src_id) : cur_type;
         const LatticeTypes::lat_type safe_dst = need_verify ? getType(tx.dst_id) : dst_type;
         const bool src_ok = !need_verify || safe_src == cur_type;
@@ -4188,6 +4366,10 @@ __device__ void run_recb_walker_tile8(
     if (dst_re_failures) atomicAdd(&stats->dst_re_check_failures, static_cast<unsigned long long>(dst_re_failures));
     if (dst_other_failures) atomicAdd(&stats->dst_other_check_failures, static_cast<unsigned long long>(dst_other_failures));
     if (tx_failures) atomicAdd(&stats->transaction_failures, static_cast<unsigned long long>(tx_failures));
+    if (readset_checks) atomicAdd(&stats->readset_checks, static_cast<unsigned long long>(readset_checks));
+    if (readset_signature_changed) atomicAdd(&stats->readset_signature_changed, static_cast<unsigned long long>(readset_signature_changed));
+    if (readset_count_changed) atomicAdd(&stats->readset_count_changed, static_cast<unsigned long long>(readset_count_changed));
+    if (readset_decision_changed) atomicAdd(&stats->readset_decision_changed, static_cast<unsigned long long>(readset_decision_changed));
     if (verify_detail) {
       if (target_mo) atomicAdd(&stats->target_mo, static_cast<unsigned long long>(target_mo));
       if (target_re) atomicAdd(&stats->target_re, static_cast<unsigned long long>(target_re));
@@ -5264,6 +5446,121 @@ __global__ void count_hash_local_pairs_kernel(GPUHashSet* set, RecbVerifyStats* 
   atomicAdd(&stats->hash_pair_count, 1u);
 }
 
+enum SparseStateAuditSlot {
+  AUDIT_ALL_MOMO = 0, AUDIT_ALL_MORE, AUDIT_ALL_RE, AUDIT_ALL_V,
+  AUDIT_OWNED_MOMO, AUDIT_OWNED_MORE, AUDIT_OWNED_RE, AUDIT_OWNED_V,
+  AUDIT_TYPE_MISMATCH, AUDIT_CROSS_TABLE_OVERLAP, AUDIT_SLOT_COUNT
+};
+
+__global__ void audit_sparse_state_kernel(GPUHashSet* set, int table_index,
+                                          int expected_type,
+                                          unsigned long long* counters) {
+  if (!set || !counters) return;
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= set->capacity) return;
+  const long int key = set->keys[i];
+  if (key == set->empty_flag || key == set->tombstone_flag) return;
+
+  atomicAdd(&counters[table_index], 1ULL);
+  if (!isGhostLat(key)) atomicAdd(&counters[AUDIT_OWNED_MOMO + table_index], 1ULL);
+  if (static_cast<int>(getType(key)) != expected_type)
+    atomicAdd(&counters[AUDIT_TYPE_MISMATCH], 1ULL);
+
+  int memberships = 0;
+  memberships += hash_set_contains(g_MoMo_Hash, key) ? 1 : 0;
+  memberships += hash_set_contains(g_MoRe_Hash, key) ? 1 : 0;
+  memberships += hash_set_contains(g_Re_Hash, key) ? 1 : 0;
+  memberships += hash_set_contains(g_V_Hash, key) ? 1 : 0;
+  if (memberships != 1) atomicAdd(&counters[AUDIT_CROSS_TABLE_OVERLAP], 1ULL);
+}
+
+static void logSparseStateAudit(const char* phase) {
+  using namespace gpuSimulate;
+  if (!recbCorrectnessDebugEnabled()) return;
+
+  unsigned long long* d_counts = nullptr;
+  HANDLE_HIP(hipMalloc(reinterpret_cast<void**>(&d_counts),
+                       AUDIT_SLOT_COUNT * sizeof(unsigned long long)));
+  HANDLE_HIP(hipMemset(d_counts, 0,
+                       AUDIT_SLOT_COUNT * sizeof(unsigned long long)));
+  GPUHashSet* sets[4] = {
+      MoMo_Hash ? MoMo_Hash->device_ptr() : nullptr,
+      MoRe_Hash ? MoRe_Hash->device_ptr() : nullptr,
+      Re_Hash ? Re_Hash->device_ptr() : nullptr,
+      V_Hash ? V_Hash->device_ptr() : nullptr};
+  const int expected[4] = {
+      static_cast<int>(LatticeTypes::MoMo),
+      static_cast<int>(LatticeTypes::MoRe),
+      static_cast<int>(LatticeTypes::Re),
+      static_cast<int>(LatticeTypes::V)};
+  const int capacities[4] = {
+      MoMo_Hash ? MoMo_Hash->get_capacity() : 0,
+      MoRe_Hash ? MoRe_Hash->get_capacity() : 0,
+      Re_Hash ? Re_Hash->get_capacity() : 0,
+      V_Hash ? V_Hash->get_capacity() : 0};
+  constexpr int block = 256;
+  for (int table = 0; table < 4; ++table) {
+    const int grid = (capacities[table] + block - 1) / block;
+    if (sets[table] && grid > 0) {
+      hipLaunchKernelGGL(audit_sparse_state_kernel, grid, block, 0, 0,
+                         sets[table], table, expected[table], d_counts);
+    }
+  }
+  CHECK_FOR_ERROR();
+  unsigned long long local[AUDIT_SLOT_COUNT] = {};
+  unsigned long long global[AUDIT_SLOT_COUNT] = {};
+  HANDLE_HIP(hipMemcpy(local, d_counts, sizeof(local), hipMemcpyDeviceToHost));
+  HANDLE_HIP(hipFree(d_counts));
+  MPI_Allreduce(local, global, AUDIT_SLOT_COUNT, MPI_UNSIGNED_LONG_LONG,
+                MPI_SUM, MPI_COMM_WORLD);
+  unsigned long long owned_sites = 0;
+  MPI_Allreduce(&audit_owned_sites_local, &owned_sites, 1,
+                MPI_UNSIGNED_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+
+  int rank = 0, ranks = 1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+  if (rank != 0) return;
+  const unsigned long long pair_count =
+      global[AUDIT_OWNED_MOMO] + global[AUDIT_OWNED_MORE];
+  const unsigned long long re_atoms =
+      global[AUDIT_OWNED_RE] + global[AUDIT_OWNED_MORE];
+  const unsigned long long total_atoms =
+      owned_sites - global[AUDIT_OWNED_V] + pair_count;
+  const unsigned long long mo_atoms = total_atoms - re_atoms;
+  const long long defect_charge = static_cast<long long>(pair_count) -
+                                  static_cast<long long>(global[AUDIT_OWNED_V]);
+
+  long long delta_mo = 0, delta_re = 0, delta_atoms = 0, delta_charge = 0;
+  if (state_audit_initial_valid) {
+    delta_mo = static_cast<long long>(mo_atoms) -
+               static_cast<long long>(state_audit_initial[0]);
+    delta_re = static_cast<long long>(re_atoms) -
+               static_cast<long long>(state_audit_initial[1]);
+    delta_atoms = static_cast<long long>(total_atoms) -
+                  static_cast<long long>(state_audit_initial[2]);
+    delta_charge = defect_charge - static_cast<long long>(state_audit_initial[3]);
+  } else {
+    state_audit_initial[0] = mo_atoms;
+    state_audit_initial[1] = re_atoms;
+    state_audit_initial[2] = total_atoms;
+    state_audit_initial[3] = static_cast<unsigned long long>(defect_charge);
+    state_audit_initial_valid = true;
+  }
+  kiwi::logs::v(" ",
+      " [state-audit] phase={} ranks={} owned_sites={} "
+      "owned(momo/more/re/v)={}/{}/{}/{} all_with_ghost={}/{}/{}/{} "
+      "atoms(mo/re/total)={}/{}/{} defect_charge={} "
+      "delta(mo/re/total/charge)={}/{}/{}/{} type_mismatch={} cross_table_overlap={} "
+      "(expected all deltas/mismatch/overlap=0 for a closed system).\n",
+      phase, ranks, owned_sites, global[AUDIT_OWNED_MOMO],
+      global[AUDIT_OWNED_MORE], global[AUDIT_OWNED_RE], global[AUDIT_OWNED_V],
+      global[AUDIT_ALL_MOMO], global[AUDIT_ALL_MORE], global[AUDIT_ALL_RE],
+      global[AUDIT_ALL_V], mo_atoms, re_atoms, total_atoms, defect_charge,
+      delta_mo, delta_re, delta_atoms, delta_charge,
+      global[AUDIT_TYPE_MISMATCH], global[AUDIT_CROSS_TABLE_OVERLAP]);
+}
+
 __global__ void build_nn_info_from_vac_list(const long int* __restrict__ vac_ids,
                                            int vac_count,
                                            dev_Vacancy* __restrict__ out_vac,
@@ -5530,11 +5827,33 @@ void recb_solver_GPU(
                         h_stats.direction_counts[8], h_stats.direction_counts[9],
                         h_stats.direction_counts[10], h_stats.direction_counts[11],
                         h_stats.direction_counts[12], h_stats.direction_counts[13]);
+          kiwi::logs::v(" ", " [recb-readset] sect={} launch={} checks={} signature_changed={} count_changed={} decision_changed={} (expected decision_changed=0).\n",
+                        sid, launch_n, h_stats.readset_checks,
+                        h_stats.readset_signature_changed,
+                        h_stats.readset_count_changed,
+                        h_stats.readset_decision_changed);
+          kiwi::logs::v(" ", " [recb-accept] sect={} launch={} num_re=0/1/2/3/4/5/6/7/8 trials={}/{}/{}/{}/{}/{}/{}/{}/{} accepted={}/{}/{}/{}/{}/{}/{}/{}/{}.\n",
+                        sid, launch_n,
+                        h_stats.accept_trials_by_num_re[0], h_stats.accept_trials_by_num_re[1],
+                        h_stats.accept_trials_by_num_re[2], h_stats.accept_trials_by_num_re[3],
+                        h_stats.accept_trials_by_num_re[4], h_stats.accept_trials_by_num_re[5],
+                        h_stats.accept_trials_by_num_re[6], h_stats.accept_trials_by_num_re[7],
+                        h_stats.accept_trials_by_num_re[8], h_stats.accept_success_by_num_re[0],
+                        h_stats.accept_success_by_num_re[1], h_stats.accept_success_by_num_re[2],
+                        h_stats.accept_success_by_num_re[3], h_stats.accept_success_by_num_re[4],
+                        h_stats.accept_success_by_num_re[5], h_stats.accept_success_by_num_re[6],
+                        h_stats.accept_success_by_num_re[7], h_stats.accept_success_by_num_re[8]);
         }
       }
       if (h_stats.capped_walks > 0) {
         kiwi::logs::v(" ", " [recb-cap] rank={} sect={} launch={} 触发跳跃上限的 walker 数={} 全程累计={}（疑似病态轨迹，请检查！）.\n",
                       recb_rank, sid, launch_n, h_stats.capped_walks, recb_capped_total);
+      }
+      if (h_stats.readset_decision_changed > 0) {
+        kiwi::logs::v(" ", " [recb-readset-violation] rank={} sect={} launch={} decision_changed={} signature_changed={} count_changed={}（无锁邻域读取已影响物理决策）.\n",
+                      recb_rank, sid, launch_n, h_stats.readset_decision_changed,
+                      h_stats.readset_signature_changed,
+                      h_stats.readset_count_changed);
       }
       // roster/hash 不守恒排查：出现 stale 时打印触发场景分类，直接定位根因。
       // at_start 占满 → 花名册 slot 在 recb 前已陈旧（跨扇区通信/rebuild 嫌疑）；
@@ -5973,6 +6292,13 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
 
   lattice_list = p_list;
   p_domain = _p_domain;
+  {
+    const auto& owned = p_domain->local_sub_box_lattice_region;
+    audit_owned_sites_local =
+        2ULL * static_cast<unsigned long long>(owned.x_high - owned.x_low) *
+        static_cast<unsigned long long>(owned.y_high - owned.y_low) *
+        static_cast<unsigned long long>(owned.z_high - owned.z_low);
+  }
   h_config[0] = v;   // v
   h_config[1] = T;   // T
   std::vector<long int> region_msg(8 * 6);
@@ -6150,6 +6476,7 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
   );
 
   hipDeviceSynchronize();
+  logSparseStateAudit("initial");
   initializeMoreOccupancyCounter();
   // 各 rank 错开种子，保证进程间流也互相独立；固定 seed 可整跑复现
   int rng_rank = 0;
@@ -6200,6 +6527,7 @@ void gpu_prepare(double& v, double& T, LatticesList *p_list, comm::ColoredDomain
 void gpu_final(){
   using namespace gpuSimulate;
 
+  logSparseStateAudit("final");
   logRecbRunSummary();
   logRecbPhaseTimings();
   destroyRecbProfileEvents();

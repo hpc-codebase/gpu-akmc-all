@@ -82,7 +82,7 @@ void SubLattice::startTimeLoop(Ins pk_inst, ModelAdapter<E> *p_model, EventHooks
 
       // for(int ir = 0; ir < 1; ir++) {
         //TODO:对这个地方的代码GPU化
-        while (sector_time < step_threshold_time) { // note: step_threshold_time may be less then 0.0
+      while (sector_time < step_threshold_time) { // note: step_threshold_time may be less then 0.0
         // 各个方向的迁移机率，并将其累加
         time_start = MPI_Wtime();
         const double total_rates = calcRatesWrapper(p_model, (*sec_meta.sector_itl).id, sect);
